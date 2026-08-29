@@ -20,5 +20,5 @@ mkdir -p "$SC_BUILD"
   -o "$SC_BUILD/beanstalkd.wasm"
 chmod +x "$SC_BUILD/beanstalkd.wasm"
 
-sc_assemble beanstalkd "$SERIES" "$SC_BUILD/beanstalkd.wasm"
+sc_assemble "$SC_BUILD/beanstalkd.wasm"
 sc_write_build_info

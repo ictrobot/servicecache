@@ -4,7 +4,7 @@ set -euo pipefail
 source "$(dirname "$0")/../../../toolchain/lib.sh"
 sc_init beanstalkd "${1:?usage: $0 version}"
 
-module="$SC_OUT/beanstalkd-$SERIES/beanstalkd.wasm"
+module="$SC_OUT/beanstalkd-$SC_VERSION/beanstalkd.wasm"
 address="${BEANSTALKD_WASIX_ADDRESS:-127.0.0.1}"
 port="${BEANSTALKD_WASIX_PORT:-11300}"
 

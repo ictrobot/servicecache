@@ -123,16 +123,12 @@ sc_apply_series() {
 }
 
 sc_assemble() {
-  if [[ $# -lt 3 ]]; then
-    sc_fail "usage: sc_assemble service series artifact..."
+  if [[ $# -lt 1 ]]; then
+    sc_fail "usage: sc_assemble artifact..."
     return 1
   fi
 
-  local service="$1"
-  local series="$2"
-  shift 2
-
-  SC_OUT_DIR="$SC_OUT/$service-$series"
+  SC_OUT_DIR="$SC_OUT/$SC_SERVICE-$SC_VERSION"
   local manifest="$SC_SERVICE_DIR/service.toml"
   if [[ -f "$SC_VERSION_DIR/service.toml" ]]; then
     manifest="$SC_VERSION_DIR/service.toml"

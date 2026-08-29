@@ -28,10 +28,10 @@ The manager and its guests are designed to be independent programs. Their only i
 
 ## Services
 
-A service is a directory of artifacts plus a manifest. The directory `make services` produces (`work/services/<name>-<series>/`) is byte-for-byte the layout an installed package uses. For an imaginary service `exampledb`:
+A service is a directory of artifacts plus a manifest. The directory `make services` produces (`work/services/<name>-<version>/`) is byte-for-byte the layout an installed package uses. For an imaginary service `exampledb`:
 
 ```text
-exampledb-1.2/
+exampledb-1.2.3/
 ├── service.toml
 ├── exampledbd.wasm      server
 ├── exampledb-cli.wasm   upstream client, used as the initializer
