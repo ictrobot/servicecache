@@ -9,7 +9,7 @@ SMOKE_SERVICE_TARGETS := $(addprefix smoke-,$(SERVICE_TARGETS))
 CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
 PURGE_SERVICE_TARGETS := $(addprefix purge-,$(SERVICE_TARGETS))
 
-.PHONY: help bootstrap build test lint check services smoke smoke-toolchain smoke-services
+.PHONY: help bootstrap build test lint check services services-list smoke smoke-toolchain smoke-services
 .PHONY: clean clean-services purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS)
 
@@ -24,6 +24,7 @@ help:
 	@echo "build                           cargo build"
 	@echo "test                            cargo test"
 	@echo "lint                            cargo fmt --check and cargo clippy"
+	@echo "services-list                   list services assembled under work/services"
 	@echo "check                           lint, test and smoke-toolchain"
 	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
 	@echo "clean-services                  remove every service's build and output; keep source checkouts"
@@ -46,8 +47,12 @@ test:
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	! grep -rniE 'mysql|valkey|beanstalkd' crates/servicecache
 
 check: lint test smoke-toolchain
+
+services-list:
+	SERVICECACHE_SERVICES_DIR=work/services cargo run -- services list
 
 clean: clean-services
 	cargo clean

@@ -167,6 +167,12 @@ run_smoke() {
   expected=$'WASIX C++ exception works\nWASIX pthread works'
   [[ "$output" == "$expected" ]] || fail "WASIX smoke test returned unexpected output"
   printf '%s\n' "$output"
+
+  # A second module, for the manager's own tests: it reports what it sees
+  # of stdin and of the network, so the embedded runtime can be checked
+  # without any service.
+  "$WASIXCC_DIR/bin/wasixcc" -O2 \
+    "$SC_ROOT/toolchain/smoke/stdio-net.c" -o "$build_dir/stdio-net.wasm"
 }
 
 install_current_set() {

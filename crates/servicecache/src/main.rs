@@ -1,3 +1,6 @@
 fn main() {
-    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    if let Err(error) = servicecache::run_cli() {
+        eprintln!("error: {error:#}");
+        std::process::exit(1);
+    }
 }
