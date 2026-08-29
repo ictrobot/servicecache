@@ -1,0 +1,47 @@
+Subject: [PATCH 6/7] myisam: disable unsupported cross-process file locks
+
+WASIX does not currently provide the advisory record-locking API used by
+MyISAM. Retain MyISAM's in-process table locks and document the single-server
+datadir invariant shared with the InnoDB adaptation.
+
+diff --git a/include/my_io.h b/include/my_io.h
+index baf6e696..52f84980 100644
+--- a/include/my_io.h
++++ b/include/my_io.h
+@@ -55,6 +55,14 @@
+ 
+ #endif  // _WIN32
+ 
++/* WASIX's default fcntl.h omits the advisory-lock constants even though its
++   libc implements fcntl locking. Keep the POSIX values used by musl/WASIX. */
++#if defined(__wasm__) && !defined(F_UNLCK)
++#define F_RDLCK 0
++#define F_WRLCK 1
++#define F_UNLCK 2
++#endif
++
+ /* file create flags */
+ 
+ #ifdef _WIN32
+diff --git a/storage/myisam/my_lock.cc b/storage/myisam/my_lock.cc
+index bff881fa..a5501a4d 100644
+--- a/storage/myisam/my_lock.cc
++++ b/storage/myisam/my_lock.cc
+@@ -161,7 +161,16 @@ int my_lock(File fd, int locktype, myf MyFlags) {
+   DBUG_PRINT("my", ("fd: %d  Op: %d  MyFlags: %d", fd, locktype, MyFlags));
+   if (my_disable_locking) return 0;
+ 
+-#if defined(_WIN32)
++#if defined(__wasm__)
++  /* WASIX currently exposes neither POSIX record-lock commands nor a flock()
++     implementation. MyISAM still has its in-process table locks; the wasm
++     server is run as a single instance for this port, so there is no second
++     process with which to coordinate an external file lock. */
++  (void)fd;
++  (void)locktype;
++  (void)MyFlags;
++  return 0;
++#elif defined(_WIN32)
+   {
+     int timeout_sec;
+     if (MyFlags & MY_DONT_WAIT)

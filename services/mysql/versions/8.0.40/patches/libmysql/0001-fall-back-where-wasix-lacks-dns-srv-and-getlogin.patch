@@ -1,0 +1,74 @@
+Subject: [PATCH] libmysql: fall back where WASIX lacks DNS SRV and getlogin
+
+DNS SRV lookup and getlogin are unavailable on WASIX, so use explicit
+fallbacks for those optional paths.
+
+diff --git a/libmysql/CMakeLists.txt b/libmysql/CMakeLists.txt
+index f3669e2a..6b12afc2 100644
+--- a/libmysql/CMakeLists.txt
++++ b/libmysql/CMakeLists.txt
+@@ -249,7 +249,9 @@ LIST(APPEND LIBS_TO_LINK ${SSL_LIBRARIES})
+ UNSET(HAVE_WIN32_DNS_SRV)
+ UNSET(HAVE_UNIX_DNS_SRV)
+ SET(HAVE_DNS_SRV 0)
+-IF(WIN32)
++IF(WASIX)
++  MESSAGE(STATUS "DNS SRV lookups are not available on WASIX")
++ELSEIF(WIN32)
+   LIST(APPEND LIBS_TO_LINK dnsapi)
+   SET(HAVE_WIN32_DNS_SRV 1 PARENT_SCOPE)
+   SET(HAVE_DNS_SRV 1)
+@@ -268,7 +270,7 @@ ELSE()
+   ENDIF()
+ ENDIF()
+ 
+-IF(HAVE_DNS_SRV EQUAL 0)
++IF(HAVE_DNS_SRV EQUAL 0 AND NOT WASIX)
+   MESSAGE(FATAL_ERROR "Can't find neither Win32 nor Unix DNS SRV APIs")
+ ENDIF()
+ #
+diff --git a/libmysql/dns_srv.cc b/libmysql/dns_srv.cc
+index 6be61f34..ec95e07a 100644
+--- a/libmysql/dns_srv.cc
++++ b/libmysql/dns_srv.cc
+@@ -30,7 +30,15 @@
+ #include <sql_common.h>
+ #include "dns_srv_data.h"
+ 
+-#ifdef HAVE_UNIX_DNS_SRV
++#if defined(__wasi__)
++
++static bool get_dns_srv(Dns_srv_data &data [[maybe_unused]],
++                        const char *dnsname [[maybe_unused]], int &error) {
++  error = -1;
++  return true;
++}
++
++#elif defined(HAVE_UNIX_DNS_SRV)
+ 
+ #ifdef __FreeBSD__
+ #include <netinet/in.h>
+diff --git a/libmysql/libmysql.cc b/libmysql/libmysql.cc
+index 109147ab..86995031 100644
+--- a/libmysql/libmysql.cc
++++ b/libmysql/libmysql.cc
+@@ -335,6 +335,11 @@ char *getlogin(void);
+ 
+ void read_user_name(char *name) {
+   DBUG_TRACE;
++#if defined(__wasi__)
++  const char *str = getenv("USER");
++  if (str == nullptr) str = getenv("LOGNAME");
++  strmake(name, str != nullptr ? str : "UNKNOWN_USER", USERNAME_LENGTH);
++#else
+   if (geteuid() == 0)
+     (void)my_stpcpy(name, "root"); /* allow use of surun */
+   else {
+@@ -355,6 +360,7 @@ void read_user_name(char *name) {
+     my_stpcpy(name, "UNKNOWN_USER");
+ #endif
+   }
++#endif
+ }
+ 
+ #else /* If Windows */

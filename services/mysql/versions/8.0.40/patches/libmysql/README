@@ -1,0 +1,12 @@
+These patches modify the MySQL C API client library (libmysqlclient) in
+MySQL 8.0.40 for WASIX.
+
+Copyright (c) 2026 Ethan Jones
+
+The patches are licensed under the GNU General Public License, version 2
+(LICENSE), with the additional permission in LICENSE-ADDITIONAL-PERMISSION,
+and, like upstream's libmysqlclient, are also subject to the Universal FOSS
+Exception, version 1.0 (LICENSE-Universal-FOSS-exception-1.0).
+
+Context lines are from upstream and remain the copyright of their authors
+under upstream's terms.

@@ -18,6 +18,7 @@ ServiceCache is designed to be generic: the manager knows how to run, freeze, sn
 
 | Service    | Version |
 |------------|---------|
+| MySQL      | 8.0.40  |
 | Valkey     | 9.1.1   |
 | beanstalkd | 1.13    |
 
@@ -33,6 +34,7 @@ This repository distributes patches and build scripts, not built binaries. A gue
 
 ServiceCache is an independent project. It is not affiliated with, sponsored by, or endorsed by the trademark owners noted below, or by the maintainers of the software it builds and depends on.
 
+- Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its affiliates.
 - Valkey and the Valkey logo are trademarks of LF Projects, LLC.
 - Wasmer is a trademark of Wasmer, Inc.
 - Other names may be trademarks of their respective owners.

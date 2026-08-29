@@ -1,0 +1,399 @@
+Subject: [PATCH 3/7] platform: add WASIX runtime services
+
+Provide the platform pieces required by a static, threaded WASIX server:
+pthread-backed statement timers, a static dynamic-loader compatibility shim,
+and resource-group stubs for unsupported affinity and priority operations.
+
+diff --git a/config.h.cmake b/config.h.cmake
+index 603df790..11926a3d 100644
+--- a/config.h.cmake
++++ b/config.h.cmake
+@@ -140,6 +140,7 @@
+ #cmakedefine HAVE_SETNS 1
+ #cmakedefine HAVE_KQUEUE_TIMERS 1
+ #cmakedefine HAVE_POSIX_TIMERS 1
++#cmakedefine HAVE_WASIX_TIMERS 1
+ 
+ /* Endianess */
+ #cmakedefine WORDS_BIGENDIAN 1
+diff --git a/configure.cmake b/configure.cmake
+index c874d8f2..4389a760 100644
+--- a/configure.cmake
++++ b/configure.cmake
+@@ -331,9 +331,12 @@ IF(HAVE_KQUEUE AND HAVE_EVFILT_TIMER)
+   SET(HAVE_KQUEUE_TIMERS 1 CACHE INTERNAL "Have kqueue timer-related filter")
+ ELSEIF(HAVE_TIMER_CREATE AND HAVE_TIMER_SETTIME)
+   SET(HAVE_POSIX_TIMERS 1 CACHE INTERNAL "Have POSIX timer-related functions")
++ELSEIF(WASIX)
++  SET(HAVE_WASIX_TIMERS 1 CACHE INTERNAL "Use pthread-based WASIX timers")
+ ENDIF()
+ 
+-IF(NOT HAVE_POSIX_TIMERS AND NOT HAVE_KQUEUE_TIMERS AND NOT WIN32)
++IF(NOT HAVE_POSIX_TIMERS AND NOT HAVE_KQUEUE_TIMERS AND
++   NOT HAVE_WASIX_TIMERS AND NOT WIN32)
+   MESSAGE(FATAL_ERROR "No mysys timer support detected!")
+ ENDIF()
+ 
+diff --git a/include/dlfcn.h b/include/dlfcn.h
+new file mode 100644
+index 00000000..275133e3
+--- /dev/null
++++ b/include/dlfcn.h
+@@ -0,0 +1,91 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (c) 2026 Ethan Jones
++
++   This file is designed to work with certain software (including but not
++   limited to OpenSSL) that is licensed under separate terms, as designated
++   by the authors of MySQL in a particular file or component or in included
++   license documentation. Without limiting your rights under the GPLv2, the
++   copyright holder of this file hereby grants you an additional permission
++   to link this file, and any program or derivative work containing it, with
++   the separately licensed software that the authors of MySQL have either
++   included with the program or referenced in the documentation. */
++
++/*
++  WASIX compatibility for the non-PIC exception-enabled sysroot.
++
++  That sysroot does not ship dlfcn.h, and this server build is fully static.
++  Keep MySQL's existing dynamic-plugin error paths linkable while reporting
++  that runtime loading is unsupported.
++*/
++#ifndef MYSQL_WASIX_DLFCN_H
++#define MYSQL_WASIX_DLFCN_H
++
++#if !defined(__wasm__)
++
++/* This compatibility header is earlier on MySQL's include path. Native Unix
++   builds must continue to use their platform's real dynamic-loader API. */
++#include_next <dlfcn.h>
++
++#else
++
++#include <errno.h>
++#include <stddef.h>
++
++#define RTLD_LAZY 1
++#define RTLD_NOW 2
++#define RTLD_NOLOAD 4
++#define RTLD_NODELETE 8
++#define RTLD_GLOBAL 16
++#define RTLD_LOCAL 0
++#define RTLD_DEFAULT ((void *)0)
++
++#ifdef __cplusplus
++extern "C" {
++#define MYSQL_WASIX_THREAD_LOCAL thread_local
++#else
++#define MYSQL_WASIX_THREAD_LOCAL _Thread_local
++#endif
++
++static inline int *mysql_wasix_dlerror_pending(void) {
++  static MYSQL_WASIX_THREAD_LOCAL int pending;
++  return &pending;
++}
++
++static inline void *dlopen(const char *path, int mode) {
++  (void)path;
++  (void)mode;
++  errno = ENOSYS;
++  *mysql_wasix_dlerror_pending() = 1;
++  return NULL;
++}
++
++static inline void *dlsym(void *handle, const char *symbol) {
++  (void)handle;
++  (void)symbol;
++  errno = ENOSYS;
++  *mysql_wasix_dlerror_pending() = 1;
++  return NULL;
++}
++
++static inline int dlclose(void *handle) {
++  (void)handle;
++  return 0;
++}
++
++static inline char *dlerror(void) {
++  static char unsupported[] = "dynamic loading is unavailable in this static WASIX build";
++  int *pending = mysql_wasix_dlerror_pending();
++  if (!*pending) return NULL;
++  *pending = 0;
++  return unsupported;
++}
++
++#ifdef __cplusplus
++}
++#endif
++
++#undef MYSQL_WASIX_THREAD_LOCAL
++
++#endif /* __wasm__ */
++
++#endif /* MYSQL_WASIX_DLFCN_H */
+diff --git a/include/my_timer.h b/include/my_timer.h
+index 0a2da9c0..81cfc090 100644
+--- a/include/my_timer.h
++++ b/include/my_timer.h
+@@ -39,6 +39,8 @@ typedef timer_t os_timer_t;
+ #include <sys/types.h> /* uintptr_t */
+ 
+ typedef uintptr_t os_timer_t;
++#elif defined(HAVE_WASIX_TIMERS)
++typedef void *os_timer_t;
+ #elif defined(_WIN32)
+ struct os_timer_t {
+   HANDLE timer_handle;
+diff --git a/mysys/CMakeLists.txt b/mysys/CMakeLists.txt
+index bd8fc3a6..83607be7 100644
+--- a/mysys/CMakeLists.txt
++++ b/mysys/CMakeLists.txt
+@@ -170,6 +170,10 @@ IF(HAVE_KQUEUE_TIMERS)
+   LIST(APPEND MYSYS_SOURCES kqueue_timers.cc)
+ ENDIF()
+ 
++IF(HAVE_WASIX_TIMERS)
++  LIST(APPEND MYSYS_SOURCES wasix_timers.cc)
++ENDIF()
++
+ IF(HAVE_GETPWNAM)
+   SET(MYSYS_SOURCES ${MYSYS_SOURCES} my_getpwnam.cc)
+ ENDIF()
+diff --git a/mysys/wasix_timers.cc b/mysys/wasix_timers.cc
+new file mode 100644
+index 00000000..eb470045
+--- /dev/null
++++ b/mysys/wasix_timers.cc
+@@ -0,0 +1,165 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (c) 2026 Ethan Jones
++
++   This file is designed to work with certain software (including but not
++   limited to OpenSSL) that is licensed under separate terms, as designated
++   by the authors of MySQL in a particular file or component or in included
++   license documentation. Without limiting your rights under the GPLv2, the
++   copyright holder of this file hereby grants you an additional permission
++   to link this file, and any program or derivative work containing it, with
++   the separately licensed software that the authors of MySQL have either
++   included with the program or referenced in the documentation. */
++
++/*
++
++   WASIX does not expose POSIX timer_create(), but it does provide pthreads,
++   condition variables, and monotonic clocks. Implement the small timer API
++   required by MySQL with one sleeping worker per timer object. */
++
++#include "my_timer.h"
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <time.h>
++
++namespace {
++
++struct Wasix_timer {
++  pthread_mutex_t mutex;
++  pthread_cond_t cond;
++  pthread_t thread;
++  my_timer_t *owner;
++  struct timespec deadline;
++  uint64_t generation;
++  bool armed;
++  bool shutdown;
++};
++
++static void add_milliseconds(struct timespec *value, unsigned long millis) {
++  value->tv_sec += static_cast<time_t>(millis / 1000);
++  value->tv_nsec += static_cast<long>((millis % 1000) * 1000000UL);
++  if (value->tv_nsec >= 1000000000L) {
++    ++value->tv_sec;
++    value->tv_nsec -= 1000000000L;
++  }
++}
++
++static void *timer_worker(void *argument) {
++  auto *state = static_cast<Wasix_timer *>(argument);
++  pthread_mutex_lock(&state->mutex);
++
++  while (!state->shutdown) {
++    while (!state->armed && !state->shutdown)
++      pthread_cond_wait(&state->cond, &state->mutex);
++
++    if (state->shutdown) break;
++
++    const uint64_t generation = state->generation;
++    const struct timespec deadline = state->deadline;
++    const int status =
++        pthread_cond_timedwait(&state->cond, &state->mutex, &deadline);
++
++    if (status == ETIMEDOUT && state->armed &&
++        state->generation == generation) {
++      state->armed = false;
++      my_timer_t *owner = state->owner;
++      pthread_mutex_unlock(&state->mutex);
++      owner->notify_function(owner);
++      pthread_mutex_lock(&state->mutex);
++    }
++  }
++
++  pthread_mutex_unlock(&state->mutex);
++  return nullptr;
++}
++
++}  // namespace
++
++int my_timer_initialize() { return 0; }
++
++void my_timer_deinitialize() {}
++
++int my_timer_create(my_timer_t *timer) {
++  auto *state = static_cast<Wasix_timer *>(calloc(1, sizeof(Wasix_timer)));
++  if (state == nullptr) {
++    errno = ENOMEM;
++    return -1;
++  }
++
++  state->owner = timer;
++  if (pthread_mutex_init(&state->mutex, nullptr) != 0) {
++    free(state);
++    return -1;
++  }
++
++  pthread_condattr_t attr;
++  if (pthread_condattr_init(&attr) != 0) {
++    pthread_mutex_destroy(&state->mutex);
++    free(state);
++    return -1;
++  }
++  pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
++  const int cond_status = pthread_cond_init(&state->cond, &attr);
++  pthread_condattr_destroy(&attr);
++  if (cond_status != 0) {
++    pthread_mutex_destroy(&state->mutex);
++    free(state);
++    return -1;
++  }
++
++  const int thread_status =
++      pthread_create(&state->thread, nullptr, timer_worker, state);
++  if (thread_status != 0) {
++    pthread_cond_destroy(&state->cond);
++    pthread_mutex_destroy(&state->mutex);
++    free(state);
++    errno = thread_status;
++    return -1;
++  }
++
++  timer->id = state;
++  return 0;
++}
++
++int my_timer_set(my_timer_t *timer, unsigned long time) {
++  auto *state = static_cast<Wasix_timer *>(timer->id);
++  pthread_mutex_lock(&state->mutex);
++  clock_gettime(CLOCK_MONOTONIC, &state->deadline);
++  add_milliseconds(&state->deadline, time);
++  ++state->generation;
++  state->armed = true;
++  pthread_cond_signal(&state->cond);
++  pthread_mutex_unlock(&state->mutex);
++  return 0;
++}
++
++int my_timer_cancel(my_timer_t *timer, int *state_at_cancel) {
++  auto *state = static_cast<Wasix_timer *>(timer->id);
++  pthread_mutex_lock(&state->mutex);
++  *state_at_cancel = state->armed ? 1 : 0;
++  state->armed = false;
++  ++state->generation;
++  pthread_cond_signal(&state->cond);
++  pthread_mutex_unlock(&state->mutex);
++  return 0;
++}
++
++void my_timer_delete(my_timer_t *timer) {
++  auto *state = static_cast<Wasix_timer *>(timer->id);
++  if (state == nullptr) return;
++
++  pthread_mutex_lock(&state->mutex);
++  state->shutdown = true;
++  state->armed = false;
++  ++state->generation;
++  pthread_cond_signal(&state->cond);
++  pthread_mutex_unlock(&state->mutex);
++
++  pthread_join(state->thread, nullptr);
++  pthread_cond_destroy(&state->cond);
++  pthread_mutex_destroy(&state->mutex);
++  free(state);
++  timer->id = nullptr;
++}
+diff --git a/sql/CMakeLists.txt b/sql/CMakeLists.txt
+index 9253975d..fa802a26 100644
+--- a/sql/CMakeLists.txt
++++ b/sql/CMakeLists.txt
+@@ -741,6 +741,9 @@ ENDIF()
+ IF(LINUX)
+   LIST(APPEND SQL_SHARED_SOURCES
+     resourcegroups/platform/thread_attrs_api_linux.cc)
++ELSEIF(WASIX)
++  LIST(APPEND SQL_SHARED_SOURCES
++    resourcegroups/platform/thread_attrs_api_wasix.cc)
+ ELSEIF(APPLE)
+   LIST(APPEND SQL_SHARED_SOURCES
+     resourcegroups/platform/thread_attrs_api_apple.cc)
+diff --git a/sql/resourcegroups/platform/thread_attrs_api_wasix.cc b/sql/resourcegroups/platform/thread_attrs_api_wasix.cc
+new file mode 100644
+index 00000000..f236144f
+--- /dev/null
++++ b/sql/resourcegroups/platform/thread_attrs_api_wasix.cc
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (c) 2026 Ethan Jones
++
++   This file is designed to work with certain software (including but not
++   limited to OpenSSL) that is licensed under separate terms, as designated
++   by the authors of MySQL in a particular file or component or in included
++   license documentation. Without limiting your rights under the GPLv2, the
++   copyright holder of this file hereby grants you an additional permission
++   to link this file, and any program or derivative work containing it, with
++   the separately licensed software that the authors of MySQL have either
++   included with the program or referenced in the documentation. */
++
++/* WASIX platform support for MySQL resource groups. */
++
++#include "sql/resourcegroups/platform/thread_attrs_api.h"
++
++#include <unistd.h>
++
++namespace resourcegroups {
++namespace platform {
++
++/* WASIX does not currently expose per-thread affinity or priority controls. */
++bool is_platform_supported() { return false; }
++
++bool bind_to_cpu(cpu_id_t) { return true; }
++bool bind_to_cpu(cpu_id_t, my_thread_os_id_t) { return true; }
++bool bind_to_cpus(const std::vector<cpu_id_t> &) { return true; }
++bool bind_to_cpus(const std::vector<cpu_id_t> &, my_thread_os_id_t) {
++  return true;
++}
++bool unbind_thread() { return true; }
++bool unbind_thread(my_thread_os_id_t) { return true; }
++int thread_priority(my_thread_os_id_t) { return 0; }
++bool set_thread_priority(int) { return true; }
++bool set_thread_priority(int, my_thread_os_id_t) { return true; }
++
++uint32_t num_vcpus_using_affinity() { return 0; }
++
++uint32_t num_vcpus_using_config() {
++  const long count = sysconf(_SC_NPROCESSORS_ONLN);
++  return count > 0 ? static_cast<uint32_t>(count) : 1;
++}
++
++bool can_thread_priority_be_set() { return false; }
++
++}  // namespace platform
++}  // namespace resourcegroups

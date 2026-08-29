@@ -1,0 +1,182 @@
+Subject: [PATCH 2/7] libc++: add explicit unsigned char traits
+
+libc++ 21 no longer provides the non-standard char_traits<unsigned char>
+specialization. Define the byte-string operations MySQL needs and use them in
+the three affected basic_string/basic_string_view aliases.
+
+diff --git a/include/mysql/unsigned_char_traits.h b/include/mysql/unsigned_char_traits.h
+new file mode 100644
+index 00000000..e352110f
+--- /dev/null
++++ b/include/mysql/unsigned_char_traits.h
+@@ -0,0 +1,103 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (c) 2026 Ethan Jones
++
++   This file is designed to work with certain software (including but not
++   limited to OpenSSL) that is licensed under separate terms, as designated
++   by the authors of MySQL in a particular file or component or in included
++   license documentation. Without limiting your rights under the GPLv2, the
++   copyright holder of this file hereby grants you an additional permission
++   to link this file, and any program or derivative work containing it, with
++   the separately licensed software that the authors of MySQL have either
++   included with the program or referenced in the documentation. */
++
++/*
++
++   std::char_traits is only required to support the standard character types.
++   New libc++ releases leave char_traits<unsigned char> undefined, so MySQL's
++   byte-oriented basic_string aliases need an explicit traits implementation. */
++
++#ifndef MYSQL_UNSIGNED_CHAR_TRAITS_INCLUDED
++#define MYSQL_UNSIGNED_CHAR_TRAITS_INCLUDED
++
++#include <cstring>
++#include <cwchar>
++#include <ios>
++#include <limits>
++
++namespace mysql_wasix {
++
++struct Unsigned_char_traits {
++  using char_type = unsigned char;
++  using int_type = unsigned int;
++  using off_type = std::streamoff;
++  using pos_type = std::streampos;
++  using state_type = std::mbstate_t;
++
++  static void assign(char_type &destination, const char_type &source) {
++    destination = source;
++  }
++
++  static constexpr bool eq(char_type left, char_type right) {
++    return left == right;
++  }
++
++  static constexpr bool lt(char_type left, char_type right) {
++    return left < right;
++  }
++
++  static int compare(const char_type *left, const char_type *right,
++                     std::size_t count) {
++    return std::memcmp(left, right, count);
++  }
++
++  static std::size_t length(const char_type *value) {
++    const char_type *end = value;
++    while (*end != 0) ++end;
++    return static_cast<std::size_t>(end - value);
++  }
++
++  static const char_type *find(const char_type *value, std::size_t count,
++                               const char_type &character) {
++    for (std::size_t index = 0; index < count; ++index) {
++      if (eq(value[index], character)) return value + index;
++    }
++    return nullptr;
++  }
++
++  static char_type *move(char_type *destination, const char_type *source,
++                         std::size_t count) {
++    return static_cast<char_type *>(std::memmove(destination, source, count));
++  }
++
++  static char_type *copy(char_type *destination, const char_type *source,
++                         std::size_t count) {
++    return static_cast<char_type *>(std::memcpy(destination, source, count));
++  }
++
++  static char_type *assign(char_type *destination, std::size_t count,
++                           char_type character) {
++    return static_cast<char_type *>(std::memset(destination, character, count));
++  }
++
++  static constexpr char_type to_char_type(int_type value) {
++    return static_cast<char_type>(value);
++  }
++
++  static constexpr int_type to_int_type(char_type value) { return value; }
++
++  static constexpr bool eq_int_type(int_type left, int_type right) {
++    return left == right;
++  }
++
++  static constexpr int_type eof() {
++    return std::numeric_limits<int_type>::max();
++  }
++
++  static constexpr int_type not_eof(int_type value) {
++    return eq_int_type(value, eof()) ? 0 : value;
++  }
++};
++
++}  // namespace mysql_wasix
++
++#endif  // MYSQL_UNSIGNED_CHAR_TRAITS_INCLUDED
+diff --git a/sql/mdl_context_backup.h b/sql/mdl_context_backup.h
+index 89e7e23d..67645b3a 100644
+--- a/sql/mdl_context_backup.h
++++ b/sql/mdl_context_backup.h
+@@ -28,6 +28,7 @@
+ #include <map>
+ #include <memory>
+ 
++#include "mysql/unsigned_char_traits.h"
+ #include "sql/malloc_allocator.h"
+ #include "sql/mdl.h"
+ 
+@@ -47,7 +48,8 @@ class MDL_context_backup_manager {
+   /**
+     Key for uniquely identifying MDL_context in the MDL_context_backup map.
+   */
+-  typedef std::basic_string<uchar> MDL_context_backup_key;
++  typedef std::basic_string<uchar, mysql_wasix::Unsigned_char_traits>
++      MDL_context_backup_key;
+ 
+   class MDL_context_backup;
+ 
+diff --git a/sql/range_optimizer/index_range_scan_plan.cc b/sql/range_optimizer/index_range_scan_plan.cc
+index 4822303b..470d395e 100644
+--- a/sql/range_optimizer/index_range_scan_plan.cc
++++ b/sql/range_optimizer/index_range_scan_plan.cc
+@@ -33,6 +33,7 @@
+ #include "my_base.h"
+ #include "my_inttypes.h"
+ #include "my_sys.h"
++#include "mysql/unsigned_char_traits.h"
+ #include "sql/join_optimizer/access_path.h"
+ #include "sql/key.h"
+ #include "sql/mem_root_array.h"
+@@ -1020,8 +1021,8 @@ static bool null_part_in_key(KEY_PART *key_part, const uchar *key,
+ 
+ // TODO(sgunders): This becomes a bit simpler with C++20's string_view
+ // constructors.
+-static inline std::basic_string_view<uchar> make_string_view(const uchar *start,
+-                                                             const uchar *end) {
++static inline std::basic_string_view<uchar, mysql_wasix::Unsigned_char_traits>
++make_string_view(const uchar *start, const uchar *end) {
+   return {start, static_cast<size_t>(end - start)};
+ }
+ 
+diff --git a/sql/stream_cipher.h b/sql/stream_cipher.h
+index 606d4064..2cc35468 100644
+--- a/sql/stream_cipher.h
++++ b/sql/stream_cipher.h
+@@ -27,6 +27,7 @@
+ #include <openssl/evp.h>
+ #include <memory>
+ #include <string>
++#include "mysql/unsigned_char_traits.h"
+ 
+ /**
+   @file stream_cipher.h
+@@ -35,7 +36,8 @@
+          binary log files.
+ */
+ 
+-typedef std::basic_string<unsigned char> Key_string;
++typedef std::basic_string<unsigned char, mysql_wasix::Unsigned_char_traits>
++    Key_string;
+ 
+ /**
+   @class Stream_cipher

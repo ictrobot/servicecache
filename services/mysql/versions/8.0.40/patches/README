@@ -1,0 +1,19 @@
+These patches modify MySQL 8.0.40 for WASIX.
+
+Copyright (c) 2026 Ethan Jones
+
+The patches in this directory are licensed under the GNU General Public
+License, version 2 (LICENSE), with the additional permission in
+LICENSE-ADDITIONAL-PERMISSION.
+
+Two subdirectories hold separate series with their own terms; see the README
+in each:
+
+- protobuf/ changes the protobuf sources bundled with MySQL. It is licensed
+  like them, under the BSD 3-Clause License.
+- libmysql/ changes the MySQL C API client library. Its terms are those of
+  this directory plus the Universal FOSS Exception, matching upstream's terms
+  for libmysqlclient.
+
+Context lines are from upstream and remain the copyright of their authors
+under upstream's terms.

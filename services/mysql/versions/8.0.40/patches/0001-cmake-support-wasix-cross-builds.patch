@@ -1,0 +1,128 @@
+Subject: [PATCH 1/7] cmake: support WASIX cross-builds
+
+Avoid probing host-only authentication and editline dependencies, build
+Protobuf statically, and make cross-built helper programs available through
+CMake's configured Wasmer emulator.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 829c844f..c9b289ab 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1837,17 +1837,28 @@ IF(ALTERNATIVE_SYSTEM_SSL)
+   MESSAGE(STATUS "Disabling all authentication plugins.")
+ ENDIF()
+ 
+-# Add Kerberos library
+-MYSQL_CHECK_KERBEROS()
+-MYSQL_CHECK_KERBEROS_DLLS()
++# These libraries only serve optional authentication plugins and do not have
++# WASIX ports. Avoid host-library discovery for the WASIX cross build.
++IF(WASIX)
++  SET(WITH_KERBEROS "none" CACHE STRING "Kerberos disabled for WASIX" FORCE)
++  SET(WITH_SASL "none" CACHE STRING "SASL disabled for WASIX" FORCE)
++  SET(WITH_LDAP "none" CACHE STRING "LDAP disabled for WASIX" FORCE)
++  SET(KERBEROS_FOUND 0)
++  SET(SASL_FOUND 0)
++  SET(LDAP_FOUND 0)
++ELSE()
++  # Add Kerberos library
++  MYSQL_CHECK_KERBEROS()
++  MYSQL_CHECK_KERBEROS_DLLS()
+ 
+-# Add SASL library
+-MYSQL_CHECK_SASL()
+-MYSQL_CHECK_SASL_DLLS()
++  # Add SASL library
++  MYSQL_CHECK_SASL()
++  MYSQL_CHECK_SASL_DLLS()
+ 
+-# Add LDAP library
+-MYSQL_CHECK_LDAP()
+-MYSQL_CHECK_LDAP_DLLS()
++  # Add LDAP library
++  MYSQL_CHECK_LDAP()
++  MYSQL_CHECK_LDAP_DLLS()
++ENDIF()
+ 
+ # Add Windows specific jemalloc DLL
+ IF(WIN32)
+@@ -1925,15 +1936,17 @@ IF(WITH_AUTHENTICATION_KERBEROS)
+   ENDIF()
+ ENDIF()
+ 
+-# Add system/bundled editline.
+-MYSQL_CHECK_EDITLINE()
+-SET(EDITLINE_WARN_GIVEN)
+-WARN_MISSING_SYSTEM_EDITLINE(EDITLINE_WARN_GIVEN)
+-IF(EDITLINE_WARN_GIVEN)
+-  MESSAGE(FATAL_ERROR
+-    "-DWITH_EDITLINE=system, but missing system libraries.\n"
+-    "You can use -DWITH_EDITLINE=bundled instead."
+-    )
++# The WASIX mysql client is batch-only and does not use terminal editing.
++IF(NOT WASIX)
++  MYSQL_CHECK_EDITLINE()
++  SET(EDITLINE_WARN_GIVEN)
++  WARN_MISSING_SYSTEM_EDITLINE(EDITLINE_WARN_GIVEN)
++  IF(EDITLINE_WARN_GIVEN)
++    MESSAGE(FATAL_ERROR
++      "-DWITH_EDITLINE=system, but missing system libraries.\n"
++      "You can use -DWITH_EDITLINE=bundled instead."
++      )
++  ENDIF()
+ ENDIF()
+ 
+ # Add libevent
+diff --git a/extra/icu/CMakeLists.txt b/extra/icu/CMakeLists.txt
+index 9ed9a576..85a9bc28 100644
+--- a/extra/icu/CMakeLists.txt
++++ b/extra/icu/CMakeLists.txt
+@@ -632,6 +632,17 @@ TARGET_INCLUDE_DIRECTORIES(icuuc PRIVATE
+   )
+ TARGET_LINK_LIBRARIES(icuuc PRIVATE ${CMAKE_DL_LIBS})
+ 
++IF(WASIX)
++  # WASIX has tzset/localtime but no POSIX timezone/tzname globals.  It also
++  # deliberately omits dlfcn.h from the static exception-enabled sysroot.
++  TARGET_COMPILE_DEFINITIONS(icuuc PRIVATE
++    HAVE_DLFCN_H=0
++    HAVE_DLOPEN=0
++    U_HAVE_TIMEZONE=0
++    U_HAVE_TZNAME=0
++    )
++ENDIF()
++
+ ADD_LIBRARY(icui18n STATIC ${ICU_I18N_SOURCES})
+ TARGET_COMPILE_DEFINITIONS(icui18n PRIVATE -DU_I18N_IMPLEMENTATION)
+ TARGET_INCLUDE_DIRECTORIES(icui18n PRIVATE
+diff --git a/extra/protobuf/CMakeLists.txt b/extra/protobuf/CMakeLists.txt
+index 3ed4b910..2ba5288c 100644
+--- a/extra/protobuf/CMakeLists.txt
++++ b/extra/protobuf/CMakeLists.txt
+@@ -162,7 +162,10 @@ SET(protobuf_BUILD_EXAMPLES OFF CACHE INTERNAL "")
+ # Look for: Force running AddDescriptors() at dynamic initialization time.
+ # Hangs at src/google/protobuf/compiler/plugin.pb.cc:193
+ # cmake/abseil-cpp.cmake assumes abseil is also a .dll
+-IF(SOLARIS OR WIN32_CLANG)
++IF(SOLARIS OR WIN32_CLANG OR WASIX)
++  # The WASIX server is one static WebAssembly module.  Building Protobuf as
++  # a shared wasm library would require every Abseil dependency to be PIC and
++  # would introduce runtime side modules that mysqld does not need.
+   SET(protobuf_BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
+ ELSE()
+   # With static C/C++ libraries, protoc with shared libs will segfault,
+diff --git a/utilities/CMakeLists.txt b/utilities/CMakeLists.txt
+index 621a8e14..f9f4dea4 100644
+--- a/utilities/CMakeLists.txt
++++ b/utilities/CMakeLists.txt
+@@ -25,7 +25,9 @@ ADD_WSHADOW_WARNING()
+ DISABLE_MISSING_PROFILE_WARNING()
+ MSVC_CPPCHECK_DISABLE()
+ 
+-IF(NOT CMAKE_CROSSCOMPILING)
++# WASIX build tools can be executed by CMake through
++# CMAKE_CROSSCOMPILING_EMULATOR (the workspace-local Wasmer runner).
++IF(NOT CMAKE_CROSSCOMPILING OR WASIX)
+   MYSQL_ADD_EXECUTABLE(comp_err
+     comp_err.cc
+     COMPONENT Test

@@ -1,0 +1,95 @@
+Subject: [PATCH 5/7] innodb: adapt filesystem assumptions for WASIX
+
+Enable the Clang atomic fence skipped by cross-compilation probes and account
+for mounted-volume behavior observed under Wasmer: no process advisory locks,
+no directory fsync, zero st_blksize metadata, and no useful madvise dump flags.
+Regular file fsync/fdatasync and InnoDB's internal locking remain enabled.
+
+diff --git a/storage/innobase/buf/buf0buf.cc b/storage/innobase/buf/buf0buf.cc
+index 6b330837..54760d69 100644
+--- a/storage/innobase/buf/buf0buf.cc
++++ b/storage/innobase/buf/buf0buf.cc
+@@ -838,7 +838,7 @@ static bool buf_pool_should_madvise = false;
+ Emits a warning to the log if could not succeed.
+ @return true iff succeeded, false if no OS support or failed */
+ bool buf_chunk_t::madvise_dump() {
+-#ifdef HAVE_MADV_DONTDUMP
++#if defined(HAVE_MADV_DONTDUMP) && !defined(__wasm__)
+   const auto low_level_info =
+       ut::large_page_low_level_info(this->mem, ut::fallback_to_normal_page_t{});
+   if (madvise(low_level_info.base_ptr, low_level_info.allocation_size,
+@@ -858,7 +858,7 @@ bool buf_chunk_t::madvise_dump() {
+ Emits a warning to the log if could not succeed.
+ @return true iff succeeded, false if no OS support or failed */
+ bool buf_chunk_t::madvise_dont_dump() {
+-#ifdef HAVE_MADV_DONTDUMP
++#if defined(HAVE_MADV_DONTDUMP) && !defined(__wasm__)
+   const auto low_level_info =
+       ut::large_page_low_level_info(this->mem, ut::fallback_to_normal_page_t{});
+   if (madvise(low_level_info.base_ptr, low_level_info.allocation_size,
+diff --git a/storage/innobase/innodb.cmake b/storage/innobase/innodb.cmake
+index 84df570e..4d9d82ae 100644
+--- a/storage/innobase/innodb.cmake
++++ b/storage/innobase/innodb.cmake
+@@ -181,6 +181,12 @@ IF(NOT CMAKE_CROSSCOMPILING)
+   )
+ ENDIF()
+ 
++# The upstream runtime probes are skipped for cross-compilation. WASIX builds
++# use shared-memory threads and Clang provides the required atomic fence.
++IF(WASIX)
++  SET(HAVE_IB_GCC_ATOMIC_THREAD_FENCE 1)
++ENDIF()
++
+ IF(HAVE_IB_GCC_SYNC_SYNCHRONISE)
+  ADD_DEFINITIONS(-DHAVE_IB_GCC_SYNC_SYNCHRONISE=1)
+ ENDIF()
+diff --git a/storage/innobase/os/os0file.cc b/storage/innobase/os/os0file.cc
+index 006645c8..7a23b9f4 100644
+--- a/storage/innobase/os/os0file.cc
++++ b/storage/innobase/os/os0file.cc
+@@ -1482,12 +1482,13 @@ static bool os_aio_validate_skip() {
+ 
+ #undef USE_FILE_LOCK
+ #define USE_FILE_LOCK
+-#if defined(UNIV_HOTBACKUP) || defined(_WIN32)
++#if defined(UNIV_HOTBACKUP) || defined(_WIN32) || defined(__wasm__)
+ /* InnoDB Hot Backup does not lock the data files.
+- On Windows, mandatory locking is used.
++ On Windows, mandatory locking is used. WASIX does not provide POSIX advisory
++ file locking, so a WASIX datadir must be owned by a single server instance.
+  */
+ #undef USE_FILE_LOCK
+-#endif /* UNIV_HOTBACKUP || _WIN32 */
++#endif /* UNIV_HOTBACKUP || _WIN32 || __wasm__ */
+ #ifdef USE_FILE_LOCK
+ /** Obtain an exclusive lock on a file.
+ @param[in]      fd              file descriptor
+@@ -2905,8 +2906,10 @@ static void os_parent_dir_fsync_posix(const char *path) {
+   /** Using fsync even when --innodb_use_fdatasync=ON
+   since this operation is not very frequent, but WSL1 does
+   not support fdatasync on directories. */
++#ifndef __wasm__
+   auto ret = ::fsync(dir_fd);
+   ut_a(ret == 0);
++#endif
+ 
+   ::close(dir_fd);
+ }
+@@ -3508,6 +3511,16 @@ static dberr_t os_file_get_status_posix(const char *path,
+ 
+   stat_info->size = statinfo->st_size;
+   stat_info->block_size = statinfo->st_blksize;
++#if defined(__wasm__)
++  /*
++    Wasmer's mounted-volume stat implementation can report st_blksize as
++    zero. InnoDB requires a non-zero filesystem block size for redo-log I/O
++    alignment, so use the conventional POSIX fallback when it is unavailable.
++  */
++  if (stat_info->block_size == 0) {
++    stat_info->block_size = 4096;
++  }
++#endif
+   stat_info->alloc_size = statinfo->st_blocks * 512;
+ 
+   if (check_rw_perm && (stat_info->type == OS_FILE_TYPE_FILE ||
