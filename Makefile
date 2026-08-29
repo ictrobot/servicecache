@@ -2,20 +2,20 @@
 # every script runs on its own.
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap check-toolchain build test lint check
+.PHONY: help bootstrap smoke-toolchain build test lint check
 
 help:
 	@echo "bootstrap        install the pinned WASIX toolchain into work/toolchains"
-	@echo "check-toolchain  bootstrap, then build and run the toolchain smoke test"
+	@echo "smoke-toolchain  build and run the toolchain smoke test"
 	@echo "build            cargo build"
 	@echo "test             cargo test"
 	@echo "lint             cargo fmt --check and cargo clippy"
-	@echo "check            lint, test and check-toolchain"
+	@echo "check            lint, test and smoke-toolchain"
 
 bootstrap:
 	toolchain/bootstrap.sh --all
 
-check-toolchain:
+smoke-toolchain:
 	toolchain/bootstrap.sh --all --check
 
 build:
@@ -28,4 +28,4 @@ lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 
-check: lint test check-toolchain
+check: lint test smoke-toolchain

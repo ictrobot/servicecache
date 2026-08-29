@@ -20,7 +20,7 @@ sc_init() {
   SC_VERSION_DIR="$SC_SERVICE_DIR/versions/$SC_VERSION"
   SC_SRC="$SC_WORK/src/$SC_SERVICE/$SC_VERSION"
   SC_BUILD="$SC_WORK/build/$SC_SERVICE/$SC_VERSION"
-  SC_STAGE="$SC_WORK/stage"
+  SC_OUT="$SC_WORK/services"
 
   if [[ ! -f "$SC_VERSION_DIR/version.env" ]]; then
     sc_fail "version configuration not found: $SC_VERSION_DIR/version.env"
@@ -35,7 +35,7 @@ sc_init() {
   source "$SC_TOOLCHAIN/env.sh"
 
   export SC_SERVICE SC_VERSION SC_ROOT SC_WORK SC_TOOLCHAIN
-  export SC_SERVICE_DIR SC_VERSION_DIR SC_SRC SC_BUILD SC_STAGE
+  export SC_SERVICE_DIR SC_VERSION_DIR SC_SRC SC_BUILD SC_OUT
 }
 
 sc_clone_tag() {
@@ -122,9 +122,9 @@ sc_apply_series() {
   done < "$series_file"
 }
 
-sc_stage() {
+sc_assemble() {
   if [[ $# -lt 3 ]]; then
-    sc_fail "usage: sc_stage service series artifact..."
+    sc_fail "usage: sc_assemble service series artifact..."
     return 1
   fi
 
@@ -132,7 +132,7 @@ sc_stage() {
   local series="$2"
   shift 2
 
-  SC_STAGE_DIR="$SC_STAGE/services/$service-$series"
+  SC_OUT_DIR="$SC_OUT/$service-$series"
   local manifest="$SC_SERVICE_DIR/service.toml"
   if [[ -f "$SC_VERSION_DIR/service.toml" ]]; then
     manifest="$SC_VERSION_DIR/service.toml"
@@ -142,23 +142,23 @@ sc_stage() {
     return 1
   fi
 
-  rm -rf "$SC_STAGE_DIR"
-  mkdir -p "$SC_STAGE_DIR"
+  rm -rf "$SC_OUT_DIR"
+  mkdir -p "$SC_OUT_DIR"
 
   local artifact
   for artifact in "$@"; do
     if [[ ! -e "$artifact" ]]; then
-      sc_fail "stage artifact not found: $artifact"
+      sc_fail "artifact not found: $artifact"
       return 1
     fi
-    cp -a "$artifact" "$SC_STAGE_DIR/"
+    cp -a "$artifact" "$SC_OUT_DIR/"
   done
-  sed "s/{version}/$SC_VERSION/g" "$manifest" > "$SC_STAGE_DIR/service.toml"
-  export SC_STAGE_DIR
+  sed "s/{version}/$SC_VERSION/g" "$manifest" > "$SC_OUT_DIR/service.toml"
+  export SC_OUT_DIR
 }
 
 sc_write_build_info() {
-  local stage_dir="${SC_STAGE_DIR:?sc_stage must run before sc_write_build_info}"
+  local out_dir="${SC_OUT_DIR:?sc_assemble must run before sc_write_build_info}"
   local upstream_tag="${SC_UPSTREAM_TAG:?sc_clone_tag must run before sc_write_build_info}"
   local servicecache_commit
   servicecache_commit="$(git -C "$SC_ROOT" rev-parse HEAD)"
@@ -173,5 +173,5 @@ sc_write_build_info() {
     echo "WASIX LLVM: $WASIX_LLVM_TAG"
     echo "Binaryen: $BINARYEN_TAG"
     echo "Wasmer: $WASMER_VERSION"
-  } > "$stage_dir/BUILD-INFO"
+  } > "$out_dir/BUILD-INFO"
 }
