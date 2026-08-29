@@ -73,7 +73,12 @@ define service_version_rules
 service-$(1)-$(2): bootstrap
 	services/$(1)/build.sh $(2)
 
-smoke-service-$(1)-$(2): service-$(1)-$(2)
+work/services/$(1)-$(2)/BUILD-INFO: services/$(1)/build.sh services/$(1)/service.toml \
+    $$(wildcard services/$(1)/deps.sh) services/$(1)/versions/$(2)/version.env \
+    $$(shell find services/$(1)/versions/$(2)/patches -type f) | bootstrap
+	services/$(1)/build.sh $(2)
+
+smoke-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO
 	services/$(1)/smoke/smoke.sh $(2)
 
 clean-service-$(1)-$(2):
