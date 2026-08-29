@@ -6,27 +6,35 @@
 SERVICE_VERSION_FILES := $(wildcard services/*/versions/*/version.env)
 SERVICE_TARGETS := $(foreach file,$(SERVICE_VERSION_FILES),service-$(word 2,$(subst /, ,$(file)))-$(word 4,$(subst /, ,$(file))))
 SMOKE_SERVICE_TARGETS := $(addprefix smoke-,$(SERVICE_TARGETS))
+CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
+PURGE_SERVICE_TARGETS := $(addprefix purge-,$(SERVICE_TARGETS))
 
 .PHONY: help bootstrap build test lint check services smoke smoke-toolchain smoke-services
-.PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS)
+.PHONY: clean clean-services purge
+.PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS)
 
 help:
 	@echo "bootstrap                       install the pinned WASIX toolchain into work/toolchains"
 	@echo "services                        build every service version into work/services"
-	@echo "service-<name>-<version>        build one service version"
+	@echo "service-<name>-<version>        bootstrap if needed, then build one service version"
 	@echo "smoke                           run every smoke test"
 	@echo "smoke-toolchain                 build and run the toolchain smoke test"
 	@echo "smoke-services                  smoke-test every built service version"
-	@echo "smoke-service-<name>-<version>  smoke-test one service version"
+	@echo "smoke-service-<name>-<version>  build if needed, then smoke-test one service version"
 	@echo "build                           cargo build"
 	@echo "test                            cargo test"
 	@echo "lint                            cargo fmt --check and cargo clippy"
 	@echo "check                           lint, test and smoke-toolchain"
+	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
+	@echo "clean-services                  remove every service's build and output; keep source checkouts"
+	@echo "clean-service-<name>-<version>  the same for one service version"
+	@echo "purge-service-<name>-<version>  also remove its source checkout"
+	@echo "purge                           remove work/ and target/ entirely, including the toolchain"
 
 bootstrap:
 	toolchain/bootstrap.sh --all
 
-smoke-toolchain:
+smoke-toolchain: bootstrap
 	toolchain/bootstrap.sh --all --check
 
 build:
@@ -41,6 +49,15 @@ lint:
 
 check: lint test smoke-toolchain
 
+clean: clean-services
+	cargo clean
+	rm -rf work/build/toolchain-smoke
+
+clean-services: $(CLEAN_SERVICE_TARGETS)
+
+purge:
+	rm -rf work target
+
 services: $(SERVICE_TARGETS)
 
 smoke: smoke-toolchain smoke-services
@@ -48,11 +65,17 @@ smoke: smoke-toolchain smoke-services
 smoke-services: $(SMOKE_SERVICE_TARGETS)
 
 define service_version_rules
-service-$(1)-$(2):
+service-$(1)-$(2): bootstrap
 	services/$(1)/build.sh $(2)
 
-smoke-service-$(1)-$(2):
+smoke-service-$(1)-$(2): service-$(1)-$(2)
 	services/$(1)/smoke/smoke.sh $(2)
+
+clean-service-$(1)-$(2):
+	toolchain/clean.sh $(1) $(2)
+
+purge-service-$(1)-$(2):
+	toolchain/clean.sh --sources $(1) $(2)
 endef
 
 $(foreach file,$(SERVICE_VERSION_FILES),$(eval $(call service_version_rules,$(word 2,$(subst /, ,$(file))),$(word 4,$(subst /, ,$(file))))))

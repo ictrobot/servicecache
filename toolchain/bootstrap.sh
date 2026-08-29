@@ -207,19 +207,37 @@ done
 
 mkdir -p "$SC_ROOT/work/downloads/toolchain"
 
+set_key() {
+  printf '%s|%s|%s|%s|%s' "$WASIXCC_VERSION" "$WASIX_SYSROOT_TAG" \
+    "$WASIX_LLVM_TAG" "$BINARYEN_TAG" "$WASMER_VERSION"
+}
+
+# Sets are identified by their five pins; a set already handled is skipped so
+# services that share the default pins do not repeat its checks and smoke test.
+declare -A handled_sets=()
+
 (
   load_default_set
   install_current_set
 )
+handled_sets["$(load_default_set; set_key)"]=default
 
 if [[ "$SC_ALL" -eq 1 ]]; then
   shopt -s nullglob
   version_files=("$SC_ROOT"/services/*/versions/*/version.env)
   for version_file in "${version_files[@]}"; do
+    key="$(load_service_set "$version_file"; set_key)"
+    label="${version_file#"$SC_ROOT"/services/}"
+    label="${label%/version.env}"
+    if [[ -n "${handled_sets[$key]:-}" ]]; then
+      echo "$label: same toolchain set as ${handled_sets[$key]}"
+      continue
+    fi
     (
       load_service_set "$version_file"
       install_current_set
     )
+    handled_sets["$key"]="$label"
   done
 fi
 
