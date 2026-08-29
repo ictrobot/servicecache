@@ -1,0 +1,123 @@
+diff --git a/net.c b/net.c
+index a9d2056..56e288e 100644
+--- a/net.c
++++ b/net.c
+@@ -76,12 +76,17 @@ make_inet_socket(char *host, char *port)
+             close(fd);
+             continue;
+         }
++#ifndef __wasi__
+         r = setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof linger);
+         if (r == -1) {
+             twarn("setting SO_LINGER on fd %d", fd);
+             close(fd);
+             continue;
+         }
++#else
++        /* SO_LINGER is not implemented by the WASIX socket layer. */
++        (void)linger;
++#endif
+         r = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flags, sizeof flags);
+         if (r == -1) {
+             twarn("setting TCP_NODELAY on fd %d", fd);
+diff --git a/walg.c b/walg.c
+index 32f2144..e7b8e7e 100644
+--- a/walg.c
++++ b/walg.c
+@@ -397,9 +397,13 @@ walresvupdate(Wal *w)
+ int
+ waldirlock(Wal *w)
+ {
++#ifndef __wasi__
+     int r;
++#endif
+     int fd;
++#ifndef __wasi__
+     struct flock lk;
++#endif
+     char *path;
+     size_t path_length;
+ 
+@@ -417,6 +421,14 @@ waldirlock(Wal *w)
+         return 0;
+     }
+ 
++#ifdef __wasi__
++    /*
++     * WASIX does not currently expose POSIX advisory record locking. Keep
++     * the lock file open for the process lifetime, but callers must ensure
++     * that a WAL directory is mounted by only one server instance.
++     */
++    (void)fd;
++#else
+     lk.l_type = F_WRLCK;
+     lk.l_whence = SEEK_SET;
+     lk.l_start = 0;
+@@ -426,6 +438,7 @@ waldirlock(Wal *w)
+         twarn("fcntl");
+         return 0;
+     }
++#endif
+ 
+     // intentionally leak fd, since we never want to close it
+     // and we'll never need it again
+diff --git a/prot.c b/prot.c
+index 297e772..d2fb6a7 100644
+--- a/prot.c
++++ b/prot.c
+@@ -2203,12 +2203,12 @@ h_accept(const int fd, const short which, Server *s)
+     UNUSED_PARAMETER(which);
+     struct sockaddr_storage addr;
+ 
++    for (;;) {
+     socklen_t addrlen = sizeof addr;
+     int cfd = accept(fd, (struct sockaddr *)&addr, &addrlen);
+     if (cfd == -1) {
+         if (errno != EAGAIN && errno != EWOULDBLOCK) twarn("accept()");
+-        epollq_apply();
+-        return;
++        break;
+     }
+     if (verbose) {
+         printf("accept %d\n", cfd);
+@@ -2221,8 +2221,7 @@ h_accept(const int fd, const short which, Server *s)
+         if (verbose) {
+             printf("close %d\n", cfd);
+         }
+-        epollq_apply();
+-        return;
++        break;
+     }
+ 
+     int r = fcntl(cfd, F_SETFL, flags | O_NONBLOCK);
+@@ -2232,8 +2231,7 @@ h_accept(const int fd, const short which, Server *s)
+         if (verbose) {
+             printf("close %d\n", cfd);
+         }
+-        epollq_apply();
+-        return;
++        break;
+     }
+ 
+     Conn *c = make_conn(cfd, STATE_WANT_COMMAND, default_tube, default_tube);
+@@ -2243,8 +2241,7 @@ h_accept(const int fd, const short which, Server *s)
+         if (verbose) {
+             printf("close %d\n", cfd);
+         }
+-        epollq_apply();
+-        return;
++        break;
+     }
+     c->srv = s;
+     c->sock.x = c;
+@@ -2259,6 +2256,10 @@ h_accept(const int fd, const short which, Server *s)
+             printf("close %d\n", cfd);
+         }
+     }
++#ifndef __wasi__
++    break;
++#endif
++    }
+     epollq_apply();
+ }
+ 

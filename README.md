@@ -11,3 +11,26 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design.
 ## Status
 
 Early development.
+
+## Services
+
+ServiceCache is designed to be generic: the manager knows how to run, freeze, snapshot and clone a WASIX guest, not what the guest is. It is currently tested against:
+
+| Service    | Version |
+|------------|---------|
+| beanstalkd | 1.13    |
+
+Each service is built from an exact upstream release plus a small patch series for WASIX.
+
+## License
+
+Except where otherwise noted, ServiceCache's original code, scripts and documentation are licensed under the [MIT License](LICENSE). Patch series modifying third-party software are licensed as documented in their respective patch directories.
+
+This repository distributes patches and build scripts, not built binaries. A guest built from these sources is licensed under the terms of the software it was built from.
+
+## Trademarks
+
+ServiceCache is an independent project. It is not affiliated with, sponsored by, or endorsed by the trademark owners noted below, or by the maintainers of the software it builds and depends on.
+
+- Wasmer is a trademark of Wasmer, Inc.
+- Other names may be trademarks of their respective owners.

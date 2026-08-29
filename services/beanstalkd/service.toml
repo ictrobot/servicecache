@@ -1,0 +1,8 @@
+[service]
+name = "beanstalkd"
+version = "{version}"
+
+[guest]
+module = "beanstalkd.wasm"
+args = ["-l", "127.0.0.1", "-p", "11300"]
+listen_port = 11300
