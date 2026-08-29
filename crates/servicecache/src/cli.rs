@@ -30,6 +30,17 @@ enum Command {
         #[command(subcommand)]
         command: ServicesCommand,
     },
+    /// Run one guest, driven by the manager over an inherited control
+    /// channel (internal).
+    #[command(hide = true)]
+    Host {
+        /// The service manifest to run.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+        /// The descriptor of the control channel.
+        #[arg(long, value_name = "FD")]
+        control_fd: i32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,6 +77,13 @@ fn run_with(cli: Cli, environment_dirs: Option<OsString>) -> Result<()> {
                 ServicesCommand::Check => check_services(&services),
             }
         }
+        Command::Host {
+            manifest,
+            control_fd,
+        } => crate::host::run(&crate::host::HostArgs {
+            manifest,
+            control_fd,
+        }),
     }
 }
 

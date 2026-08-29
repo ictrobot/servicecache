@@ -4,7 +4,7 @@ version = "{version}"
 
 [guest]
 module = "valkey-server.wasm"
-args = ["--bind", "127.0.0.1", "--port", "6380", "--protected-mode", "no", "--daemonize", "no", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction", "--dir", "/data"]
+args = ["--bind", "127.0.0.1", "--port", "6380", "--protected-mode", "no", "--daemonize", "no", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction", "--dir", "/"]
 listen_port = 6380
 
 [initializer]

@@ -8,15 +8,22 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+nix = { version = "0.29", features = ["fs", "poll", "process", "signal", "socket", "uio"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 sha2 = "0.10"
-tokio = { version = "1.39", features = ["rt-multi-thread"] }
+tokio = { version = "1.39", features = ["rt-multi-thread", "time"] }
 toml = "0.9"
 # TODO(upstream): Track Wasmer's migration from the unmaintained proc-macro-error2 crate:
 # https://github.com/wasmerio/wasmer/issues/6692
 wasmer = { version = "=7.3.0", default-features = false, features = ["cranelift"] }
-wasmer-wasix = { version = "=0.703.0", default-features = false, features = ["host-fs", "sys-minimal"] }
+wasmer-wasix = { version = "=0.703.0", default-features = false, features = ["host-fs", "host-vnet", "sys-minimal"] }
+virtual-fs = { version = "=0.703.0", default-features = false, features = ["host-fs"] }
+virtual-mio = { version = "=0.703.0", default-features = false, features = ["sys"] }
+virtual-net = { version = "=0.703.0", default-features = false, features = ["host-net"] }
 
 [lints]
 workspace = true

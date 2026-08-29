@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Test adapter for MySQL, over the wire protocol of mysql-probe.py.
+
+usage: adapter recipe
+       adapter check-initialized HOST PORT
+
+Every verb exits 0 on success and non-zero with a message on stderr
+otherwise. `recipe` prints the initializer's stdin: a table of ROWS rows
+of about 230 bytes, well over the guest's 16 MB buffer pool, so that
+reads reach the data files.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+ROWS = 100_000
+
+_spec = importlib.util.spec_from_loader(
+    "mysql_probe",
+    importlib.machinery.SourceFileLoader(
+        "mysql_probe", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mysql-probe.py")
+    ),
+)
+probe = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(probe)
+
+
+class Session:
+    """One connection; `rows(sql)` returns the result rows as lists."""
+
+    def __init__(self, host, port):
+        self.sock = probe.connect(host, int(port), "root")
+
+    def rows(self, sql):
+        result = probe.query(self.sock, sql)
+        # An OK packet (no result set) comes back as an empty list.
+        return result[1] if result else []
+
+    def scalar(self, sql):
+        rows = self.rows(sql)
+        if not rows or not rows[0]:
+            raise SystemExit(f"no value for {sql}")
+        return rows[0][0]
+
+    def close(self):
+        try:
+            probe.write_packet(self.sock, 0, b"\x01")
+        finally:
+            self.sock.close()
+
+
+def expect(actual, expected, what):
+    if actual != expected:
+        raise SystemExit(f"{what}: expected {expected!r}, got {actual!r}")
+
+
+def recipe():
+    out = sys.stdout
+    out.write("CREATE DATABASE adapter;\n")
+    out.write(
+        "CREATE TABLE adapter.t (id INT PRIMARY KEY, v VARCHAR(64), pad CHAR(200)) ENGINE=InnoDB;\n"
+    )
+    for chunk in range(ROWS // 1000):
+        values = ",".join(
+            f"({i}, 'row-{i}', 'p')" for i in range(chunk * 1000, chunk * 1000 + 1000)
+        )
+        out.write(f"INSERT INTO adapter.t VALUES {values};\n")
+
+
+def check_initialized(host, port):
+    s = Session(host, port)
+    expect(s.scalar("SELECT COUNT(*) FROM adapter.t WHERE id < 1000000"), str(ROWS), "row count")
+    version = s.scalar("SELECT VERSION()")
+    if not version.endswith("-servicecache"):
+        raise SystemExit(f"unexpected server: {version}")
+    s.close()
+
+
+def main(argv):
+    if not argv:
+        raise SystemExit(__doc__)
+    verb, args = argv[0], argv[1:]
+    if verb == "recipe":
+        return recipe()
+    if verb == "check-initialized":
+        return check_initialized(*args)
+    raise SystemExit(f"unknown verb {verb}\n{__doc__}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

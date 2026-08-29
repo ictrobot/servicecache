@@ -1,18 +1,21 @@
 # ServiceCache architecture
 
-ServiceCache is a generic manager for disposable test services. It runs server software as WASIX guests, snapshots initialized instances, and clones them on demand. It knows how to run WebAssembly modules, wire up virtual networks, freeze, snapshot and clone; it does not know what a database is.
+ServiceCache is a generic manager for disposable test services. It runs server software as WASIX guests, freezes initialized instances, and clones them on demand. It knows how to run WebAssembly modules, hand them network sockets, freeze and fork; it does not know what a database is.
 
 ## Core model
 
-1. Start a server as a WASIX guest on a clean filesystem.
+1. Start a server as a WASIX guest on a clean filesystem, in a host process of its own.
 2. Optionally initialize it through the service's own client — itself a WASIX module run by the same runtime — speaking the ordinary application protocol.
-3. Freeze the guest at a quiescent safepoint: idle, after the initializer has disconnected.
-4. Snapshot its live VM state: linear memory plus the virtual filesystem.
-5. Cache the snapshot in memory under a key derived from the service and the exact initialization recipe.
-6. Serve later requests for the same recipe by cloning the snapshot copy-on-write.
-7. Give each clone its own network endpoint; destroy it after it has been idle.
+3. Freeze the host at a quiescent point: idle, after the initializer has disconnected. A frozen host is a template; it never runs again.
+4. Serve requests for the same recipe by forking the template. The kernel shares its memory and its in-memory filesystem copy-on-write.
+5. Give each clone its own network endpoint; destroy it after use.
 
-Snapshots are layered. The prepared, started and idle state of a service — the same for every recipe — is the cache entry for the empty recipe; a miss for a real recipe clones that base and runs the initializer on the clone.
+## Processes
+
+- **The manager never runs a guest.** It spawns one host process per guest, creates each guest's listening socket itself — loopback TCP with a kernel-assigned port — and passes it to the host, and hands out endpoints. It is not on the data path: clients connect to a clone's socket directly, and guest memory is opaque bytes to it.
+- **A host (`servicecache host`) runs exactly one guest** on the embedded runtime: the guest's linear memory and an in-memory filesystem with the manifest's read-only mounts.
+- **A control thread drives the host.** It runs a synchronous loop over a socketpair inherited from the manager: `prepare`, `start`, `initialize`, `freeze`, `fork` and `stop` in; `ready`, `exited`, `frozen`, `forked` and `error` out; descriptors such as the listening socket travel with their message as `SCM_RIGHTS`. Hosts die with the manager.
+- **The runtime is Wasmer with a patch series.** `patches/wasmer/` is applied to a checkout under `work/wasmer` that the workspace builds against. The Wasmer CLI that builds and smoke-tests guests is a separate stock installation.
 
 ## Design rules
 
@@ -22,7 +25,7 @@ The manager and its guests are designed to be independent programs. Their only i
 2. **Guests import only the standard WASIX ABI.** Every guest runs unchanged under stock Wasmer.
 3. **Initialization is the service's own client.** Upstream's client, built for WASIX, speaking the service's own protocol.
 4. **Guest patches make sense without ServiceCache.** Anyone running the server under plain Wasmer should want them.
-5. **Snapshot and clone happen in the runtime.** The guest never knows.
+5. **Freeze and clone happen in the runtime.** The guest never knows.
 6. **No state is shipped.** Guests start on a clean filesystem.
 7. **Manifests are plain files.** No inheritance, no merging.
 
@@ -65,5 +68,6 @@ args   = ["--host", "{host}", "--port", "{port}"]
 
 - Paths are relative to the manifest's directory; absolute paths are an error.
 - The writable filesystem always starts clean; no state is shipped. `[prepare]` builds what `[guest]` starts on: `fs` mounts read-only trees shipped in the package, and `module`, if present, runs to completion on that filesystem with no network.
-- `[initializer]` runs on the guest's private virtual network with `{host}` and `{port}` substituted, receives the recipe on stdin, and must exit 0. The manager never interprets its arguments.
+- `listen_port` is the port the server binds inside the guest. The socket it gets is the one the manager passed, so a guest never binds a real host port; a bind on any other port is refused.
+- `[initializer]` runs against the guest's endpoint with `{host}` and `{port}` substituted, receives the recipe on stdin, and must exit 0. The manager never interprets its arguments.
 - Manifests are plain files; the manager never merges or inherits them.

@@ -89,7 +89,7 @@ impl Runtime {
             )
         })?;
         let mut store = Store::new(self.engine.clone());
-        let filesystem = Self::filesystem(request.mounts, tokio_runtime.handle())?;
+        let filesystem = read_only_mounts(request.mounts, tokio_runtime.handle())?;
 
         let (mut stdin_writer, stdin_reader) = Pipe::channel();
         stdin_writer
@@ -160,27 +160,35 @@ impl Runtime {
             stderr,
         })
     }
+}
 
-    fn filesystem(
-        mounts: &[ReadOnlyMount],
-        handle: &tokio::runtime::Handle,
-    ) -> Result<MountFileSystem> {
-        let filesystem = RootFileSystemBuilder::default().build();
-        for mount in mounts {
-            let host = HostFileSystem::new(handle.clone(), &mount.host)
-                .with_context(|| format!("failed to open host mount {}", mount.host.display()))?;
-            filesystem
-                .mount(&mount.guest, Arc::new(ReadOnlyFileSystem { inner: host }))
-                .with_context(|| {
-                    format!(
-                        "failed to mount {} at {}",
-                        mount.host.display(),
-                        mount.guest.display()
-                    )
-                })?;
-        }
-        Ok(filesystem)
+/// An in-memory root filesystem with `mounts` as read-only host directories.
+///
+/// Nothing is created under the root: a guest's data directory must not
+/// exist until the guest makes it.
+///
+/// # Errors
+///
+/// Fails if a mount cannot be opened or mounted.
+pub fn read_only_mounts(
+    mounts: &[ReadOnlyMount],
+    handle: &tokio::runtime::Handle,
+) -> Result<MountFileSystem> {
+    let filesystem = RootFileSystemBuilder::default().build();
+    for mount in mounts {
+        let host = HostFileSystem::new(handle.clone(), &mount.host)
+            .with_context(|| format!("failed to open host mount {}", mount.host.display()))?;
+        filesystem
+            .mount(&mount.guest, Arc::new(ReadOnlyFileSystem { inner: host }))
+            .with_context(|| {
+                format!(
+                    "failed to mount {} at {}",
+                    mount.host.display(),
+                    mount.guest.display()
+                )
+            })?;
     }
+    Ok(filesystem)
 }
 
 #[derive(Debug)]
@@ -284,7 +292,7 @@ mod tests {
         fs::write(host_directory.join("input.txt"), "mounted").expect("write mounted test file");
 
         let tokio_runtime = tokio::runtime::Runtime::new().expect("create test runtime");
-        let filesystem = Runtime::filesystem(
+        let filesystem = read_only_mounts(
             &[ReadOnlyMount {
                 guest: PathBuf::from("/mounted"),
                 host: host_directory.clone(),

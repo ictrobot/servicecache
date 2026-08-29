@@ -1,0 +1,48 @@
+Subject: virtual-net: adopt a listening socket
+
+A host that creates a guest's listening socket itself needs to hand it
+to the guest as a `LocalTcpListener`: `from_std_listener` wraps a socket
+that is already listening, and `LocalNetworking::selector` exposes the
+selector it registers with.
+
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index d39b5d7..c750260 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -61,6 +61,11 @@ impl LocalNetworking {
+             ruleset: Some(ruleset),
+         }
+     }
++
++    /// The selector this networking registers its sockets with.
++    pub fn selector(&self) -> &Arc<Selector> {
++        &self.selector
++    }
+ }
+ 
+ impl Drop for LocalNetworking {
+@@ -304,6 +309,24 @@ pub struct LocalTcpListener {
+ }
+ 
+ impl LocalTcpListener {
++    /// Wraps a socket that is already listening, so that a host can give a
++    /// guest a listener it created itself.
++    pub fn from_std_listener(
++        listener: std::net::TcpListener,
++        selector: Arc<Selector>,
++    ) -> io::Result<Self> {
++        listener.set_nonblocking(true)?;
++        Ok(Self {
++            stream: mio::net::TcpListener::from_std(listener),
++            selector,
++            handler_guard: HandlerGuardState::None,
++            no_delay: None,
++            keep_alive: None,
++            backlog: Default::default(),
++            ruleset: None,
++        })
++    }
++
+     fn try_accept_internal(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
+         match self.stream.accept().map_err(io_err_into_net_error) {
+             Ok((stream, addr)) => {

@@ -1,4 +1,5 @@
-Patches to Wasmer 7.3.0 for the ServiceCache host process.
+Patches to Wasmer 7.3.0 for the ServiceCache host process: a host can hand
+the guest a listening socket it created.
 
 scripts/setup-wasmer applies the series to a checkout under work/wasmer, and
 the workspace builds the host against the Wasmer crates from that tree. The

@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Test adapter for beanstalkd, spoken over its own protocol.
+
+usage: adapter recipe
+       adapter check-initialized HOST PORT
+
+Every verb exits 0 on success and non-zero with a message on stderr
+otherwise. `recipe` prints the initializer's stdin (empty: beanstalkd has
+no initializer).
+"""
+
+import socket
+import sys
+
+
+class Client:
+    def __init__(self, host, port, timeout):
+        self.sock = socket.create_connection((host, int(port)), timeout=5)
+        self.sock.settimeout(timeout)
+        self.reader = self.sock.makefile("rb")
+
+    def line(self):
+        return self.reader.readline().decode().rstrip("\r\n")
+
+    def command(self, text):
+        self.sock.sendall((text + "\r\n").encode())
+        return self.line()
+
+
+def expect(actual, expected):
+    if actual != expected:
+        raise SystemExit(f"expected {expected!r}, got {actual!r}")
+
+
+def check_initialized(host, port):
+    client = Client(host, port, 5)
+    expect(client.command("use default"), "USING default")
+
+
+def main(argv):
+    if not argv:
+        raise SystemExit(__doc__)
+    verb, args = argv[0], argv[1:]
+    if verb == "recipe":
+        return
+    if verb == "check-initialized":
+        return check_initialized(*args)
+    raise SystemExit(f"unknown verb {verb}\n{__doc__}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
