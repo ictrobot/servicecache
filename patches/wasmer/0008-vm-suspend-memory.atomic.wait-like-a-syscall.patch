@@ -1,0 +1,340 @@
+Subject: vm: suspend memory.atomic.wait like a syscall
+
+`ThreadConditions::do_wait` parked the OS thread on a Condvar from
+inside the coroutine, so a guest thread sitting in `memory.atomic.wait`
+could never be frozen. The waiters are now a list with wakers and the
+wait is a future run through the same suspension path as the WASIX
+syscalls; its timeout comes from the sleep hook the host installs with
+`suspend::enable`. Without suspension the future is polled in a park
+loop with the deadline, which is what the Condvar did.
+
+diff --git a/lib/vm/src/threadconditions.rs b/lib/vm/src/threadconditions.rs
+index d1ef95c..06c5842 100644
+--- a/lib/vm/src/threadconditions.rs
++++ b/lib/vm/src/threadconditions.rs
+@@ -1,14 +1,17 @@
+ use std::{
++    collections::HashMap,
++    future::Future,
++    pin::Pin,
+     sync::{
+         Arc,
+         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+     },
+-    time::Duration,
++    task::{Context, Poll, Waker},
++    time::{Duration, Instant},
+ };
+ 
+-use dashmap::DashMap;
+ use fnv::FnvBuildHasher;
+-use parking_lot::{Condvar, Mutex};
++use parking_lot::Mutex;
+ use thiserror::Error;
+ 
+ /// Error that can occur during wait/notify calls.
+@@ -51,18 +54,27 @@ pub struct NotifyLocation {
+     pub memory_base: *mut u8,
+ }
+ 
++/// One thread waiting on an address.
++#[derive(Debug)]
++struct Waiter {
++    id: u64,
++    notified: bool,
++    waker: Option<Waker>,
++}
++
+ #[derive(Debug, Default)]
+ struct NotifyMap {
+     /// If set to true, all waits will fail with an error.
+     closed: AtomicBool,
+ 
+-    // For each wait address, we store a mutex and a condvar. The condvar is
+-    // used to handle sleeping and waking, while the mutex stores the
+-    // (manually-updated) number of waiters on that address. This lets us
+-    // know when there are no more waiters so we can clean up the map entry.
+-    // note that using a Weak here would be insufficient since it can't
+-    // clean up the map entries for us, only the mutexes/condvars.
+-    map: DashMap<u32, Arc<(Mutex<u32>, Condvar)>, FnvBuildHasher>,
++    /// The waiters for each address, in arrival order. The lock also orders
++    /// the expected-value check against the notifier's write: a notifying
++    /// thread writes the new value *before* it notifies, and the notify has
++    /// to take this lock, so a waiter that read the old value under the lock
++    /// cannot miss the notification. (This mirrors the futex syscall.)
++    waiters: Mutex<HashMap<u32, Vec<Waiter>, FnvBuildHasher>>,
++
++    next_waiter: AtomicU64,
+ }
+ 
+ /// HashMap of Waiters for the Thread/Notify opcodes
+@@ -79,6 +91,66 @@ impl Clone for ThreadConditions {
+     }
+ }
+ 
++/// The wait as a future: ready once notified, or once the timer fires.
++///
++/// A wait is normally run through the suspension machinery (the coroutine
++/// suspends and its host loop polls this), which is what lets a process be
++/// frozen while a guest thread sits in `memory.atomic.wait`. Without
++/// suspension it is polled in a park loop on the calling thread, with the
++/// deadline handled by `park_timeout`, which is what the Condvar did.
++struct AtomicWait {
++    map: Arc<NotifyMap>,
++    address: u32,
++    id: u64,
++    timer: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
++    deadline: Option<Instant>,
++}
++
++impl Future for AtomicWait {
++    type Output = Result<u32, WaiterError>;
++
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        if self.map.closed.load(Ordering::Acquire) {
++            return Poll::Ready(Err(WaiterError::AtomicsDisabled));
++        }
++        {
++            let mut waiters = self.map.waiters.lock();
++            match waiters
++                .get_mut(&self.address)
++                .and_then(|list| list.iter_mut().find(|w| w.id == self.id))
++            {
++                Some(waiter) if waiter.notified => return Poll::Ready(Ok(0)),
++                Some(waiter) => waiter.waker = Some(cx.waker().clone()),
++                None => return Poll::Ready(Ok(0)),
++            }
++        }
++        if let Some(timer) = self.timer.as_mut()
++            && timer.as_mut().poll(cx).is_ready()
++        {
++            return Poll::Ready(Ok(2));
++        }
++        if self
++            .deadline
++            .is_some_and(|deadline| Instant::now() >= deadline)
++        {
++            return Poll::Ready(Ok(2));
++        }
++        Poll::Pending
++    }
++}
++
++impl NotifyMap {
++    fn remove_waiter(&self, address: u32, id: u64) {
++        let mut waiters = self.waiters.lock();
++        if let Some(list) = waiters.get_mut(&address) {
++            list.retain(|w| w.id != id);
++            if list.is_empty() {
++                waiters.remove(&address);
++            }
++        }
++    }
++}
++
+ impl ThreadConditions {
+     /// Create a new ThreadConditions
+     pub fn new() -> Self {
+@@ -87,12 +159,6 @@ impl ThreadConditions {
+         }
+     }
+ 
+-    // To implement Wait / Notify, a HasMap, behind a mutex, will be used
+-    // to track the address of waiter. The key of the hashmap is based on the memory.
+-    // The actual waiting is implemented with a Condvar + Mutex pair. A Weak is stored
+-    // in the hashmap to at least delete the condvar and mutex when there are no
+-    // waiters for a given address. Map keys are currently not cleaned up.
+-
+     /// Add current thread to the waiter hash
+     ///
+     /// # Safety
+@@ -107,113 +173,78 @@ impl ThreadConditions {
+         expected: ExpectedValue,
+         timeout: Option<Duration>,
+     ) -> Result<u32, WaiterError> {
+-        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
++        if self.inner.closed.load(Ordering::Acquire) {
+             return Err(WaiterError::AtomicsDisabled);
+         }
+ 
+-        if self.inner.map.len() as u64 >= 1u64 << 32 {
+-            return Err(WaiterError::TooManyWaiters);
+-        }
+-
+-        // Step 1: lock the map key, so we know no one else can get/create a
+-        // different Arc than the one we're getting/creating
+-        let entry = self.inner.map.entry(dst.address);
+-        let ref_mut = entry.or_default();
+-        let arc = ref_mut.clone();
+-
+-        // Step 2: lock the mutex while still holding the map lock, so nobody
+-        // can delete the map key or make a new Arc
+-        let mut mutex_guard = arc.0.lock();
+-
+-        // Step 3: unlock the map key, we don't need it anymore.
+-        drop(ref_mut);
+-
+-        // Once we lock the mutex, we can check the expected value. A notifying
+-        // thread will have written an updated value to the address *before*
+-        // doing the notify call, and the call has to acquire the same lock we're
+-        // holding. This means we can't miss an update to the expected value that
+-        // would prevent us from sleeping.
+-        // This logic mirrors how the linux kernel's futex syscall works, so see
+-        // the documentation on that if I made zero sense here.
+-
+-        // Safety: the function's safety contract ensures that the memory location is valid
+-        // and can be dereferenced.
+-        let should_sleep = match expected {
+-            ExpectedValue::None => true,
+-            ExpectedValue::U32(expected_val) => unsafe {
+-                let src = dst.memory_base.offset(dst.address as isize) as *mut u32;
+-                let read_val = AtomicU32::from_ptr(src).load(Ordering::Acquire);
+-                read_val == expected_val
+-            },
+-            ExpectedValue::U64(expected_val) => unsafe {
+-                let src = dst.memory_base.offset(dst.address as isize) as *mut u64;
+-                let read_val = AtomicU64::from_ptr(src).load(Ordering::Acquire);
+-                read_val == expected_val
+-            },
+-        };
+-
+-        let ret = if should_sleep {
+-            *mutex_guard += 1;
++        let id = self.inner.next_waiter.fetch_add(1, Ordering::Relaxed);
++        {
++            let mut waiters = self.inner.waiters.lock();
++            if waiters.len() as u64 >= 1u64 << 32 {
++                return Err(WaiterError::TooManyWaiters);
++            }
+ 
+-            let ret = if let Some(timeout) = timeout {
+-                let timeout = arc.1.wait_for(&mut mutex_guard, timeout);
+-                if timeout.timed_out() {
+-                    2 // timeout
+-                } else {
+-                    0 // notified
+-                }
+-            } else {
+-                arc.1.wait(&mut mutex_guard);
+-                0
++            // Safety: the function's safety contract ensures that the memory location is valid
++            // and can be dereferenced.
++            let should_sleep = match expected {
++                ExpectedValue::None => true,
++                ExpectedValue::U32(expected_val) => unsafe {
++                    let src = dst.memory_base.offset(dst.address as isize) as *mut u32;
++                    let read_val = AtomicU32::from_ptr(src).load(Ordering::Acquire);
++                    read_val == expected_val
++                },
++                ExpectedValue::U64(expected_val) => unsafe {
++                    let src = dst.memory_base.offset(dst.address as isize) as *mut u64;
++                    let read_val = AtomicU64::from_ptr(src).load(Ordering::Acquire);
++                    read_val == expected_val
++                },
+             };
+-
+-            *mutex_guard -= 1;
+-
+-            if self.inner.closed.load(Ordering::Acquire) {
+-                return Err(WaiterError::AtomicsDisabled);
++            if !should_sleep {
++                return Ok(1); // value mismatch
+             }
++            waiters.entry(dst.address).or_default().push(Waiter {
++                id,
++                notified: false,
++                waker: None,
++            });
++        }
+ 
+-            ret
+-        } else {
+-            1 // value mismatch
++        let deadline = timeout.map(|timeout| Instant::now() + timeout);
++        let wait = AtomicWait {
++            map: self.inner.clone(),
++            address: dst.address,
++            id,
++            timer: timeout.and_then(crate::trap::suspend::sleep),
++            deadline,
+         };
++        let ret = crate::trap::suspend::block_on(wait, deadline);
+ 
+-        {
+-            // Note we use two sets of locks; one for the map itself, and one per
+-            // wait address. Locking order must stay consistent at all times: map
+-            // first, then mutex. So we have to drop the mutex guard here and then
+-            // reacquire it after locking the map key to avoid deadlocks.
+-            drop(mutex_guard);
+-
+-            // Same as above, first lock the map key...
+-            let entry = self.inner.map.entry(dst.address);
+-            if let dashmap::Entry::Occupied(occupied) = entry {
+-                // ... then lock the mutex.
+-                let arc = occupied.get().clone();
+-                let mutex_guard = arc.0.lock();
+-
+-                if *mutex_guard == 0 {
+-                    // No more waiters, remove the map entry.
+-                    occupied.remove();
+-                }
+-            }
+-        }
++        self.inner.remove_waiter(dst.address, id);
+ 
+-        Ok(ret)
++        if self.inner.closed.load(Ordering::Acquire) {
++            return Err(WaiterError::AtomicsDisabled);
++        }
++        ret
+     }
+ 
+     /// Notify waiters from the wait list
+     pub fn do_notify(&mut self, dst: u32, count: u32) -> u32 {
+-        let mut count_token = 0u32;
+-        if let Some(v) = self.inner.map.get(&dst) {
+-            let mutex_guard = v.0.lock();
+-            for _ in 0..count {
+-                if !v.1.notify_one() {
+-                    break;
++        let mut woken = Vec::new();
++        {
++            let mut waiters = self.inner.waiters.lock();
++            if let Some(list) = waiters.get_mut(&dst) {
++                for waiter in list.iter_mut().filter(|w| !w.notified) {
++                    if woken.len() as u32 >= count {
++                        break;
++                    }
++                    waiter.notified = true;
++                    woken.push(waiter.waker.take());
+                 }
+-                count_token += 1;
+             }
+-            drop(mutex_guard);
++        }
++        let count_token = woken.len() as u32;
++        for waker in woken.into_iter().flatten() {
++            waker.wake();
+         }
+         count_token
+     }
+@@ -222,10 +253,15 @@ impl ThreadConditions {
+     ///
+     /// Useful on shutdown to resume execution in all waiters.
+     pub fn wake_all_atomic_waiters(&self) {
+-        for item in self.inner.map.iter_mut() {
+-            let arc = item.value();
+-            let _mutex_guard = arc.0.lock();
+-            arc.1.notify_all();
++        let wakers: Vec<Waker> = {
++            let waiters = self.inner.waiters.lock();
++            waiters
++                .values()
++                .flat_map(|list| list.iter().filter_map(|w| w.waker.clone()))
++                .collect()
++        };
++        for waker in wakers {
++            waker.wake();
+         }
+     }
+ 

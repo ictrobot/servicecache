@@ -1,0 +1,97 @@
+Subject: virtual-io, virtual-net: replace a listener after a fork
+
+A forked child must listen on a socket of its own rather than the one it
+inherited: `replace_std_listener` swaps the descriptor while the guest's
+interest handler stays registered, through `Selector::reregister`, which
+moves a token's registration to a new descriptor.
+
+diff --git a/lib/virtual-io/src/guard.rs b/lib/virtual-io/src/guard.rs
+index ac50e02..42dc47a 100644
+--- a/lib/virtual-io/src/guard.rs
++++ b/lib/virtual-io/src/guard.rs
+@@ -32,6 +32,11 @@ impl InterestGuard {
+         })
+     }
+ 
++    /// The token this registration was made under.
++    pub fn token(&self) -> Token {
++        self.token
++    }
++
+     pub fn unregister(&mut self, source: &mut dyn SelectorSource) -> io::Result<()> {
+         if let Some(selector) = self.selector.upgrade() {
+             selector.remove(self.token, Some(source))?;
+diff --git a/lib/virtual-io/src/selector.rs b/lib/virtual-io/src/selector.rs
+index eb5d4ee..df1993c 100644
+--- a/lib/virtual-io/src/selector.rs
++++ b/lib/virtual-io/src/selector.rs
+@@ -255,6 +255,31 @@ impl Selector {
+         Ok(())
+     }
+ 
++    /// Moves a token's registration to another descriptor, keeping its
++    /// handler: the old descriptor is deregistered if it is still known and
++    /// the new one is registered under the same token. A forked child uses
++    /// this to replace an inherited listening socket with its own.
++    #[cfg(unix)]
++    pub fn reregister(
++        &self,
++        token: Token,
++        source: &mut dyn SelectorSource,
++        interests: mio::Interest,
++    ) -> io::Result<()> {
++        let instance = self.instance.lock().unwrap();
++        let mut sources = self.sources.lock().unwrap();
++        if let Some((old_fd, _)) = sources.remove(&token) {
++            // The old descriptor may already be closed or unregistered.
++            instance
++                .registry
++                .deregister(&mut mio::unix::SourceFd(&old_fd))
++                .ok();
++        }
++        source.register(&instance.registry, token, interests)?;
++        sources.insert(token, (std::os::fd::AsRawFd::as_raw_fd(source), interests));
++        Ok(())
++    }
++
+     pub fn push_interest(&self, token: Token, interest: InterestType) {
+         self.queue_modification(SelectorModification::PushInterest { token, interest });
+     }
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index 172d3ca..44576cc 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -323,6 +323,33 @@ impl LocalTcpListener {
+         })
+     }
+ 
++    /// Replaces the listening socket, keeping the guest's interest handler:
++    /// the registration moves to the new descriptor under the same token.
++    /// Connections accepted but not yet handed to the guest are dropped;
++    /// they belong to the old socket. A forked child uses this to listen on
++    /// its own socket instead of the one it inherited.
++    #[cfg(unix)]
++    pub fn replace_std_listener(&mut self, listener: std::net::TcpListener) -> io::Result<()> {
++        listener.set_nonblocking(true)?;
++        let mut stream = mio::net::TcpListener::from_std(listener);
++        let token = match &self.handler_guard {
++            HandlerGuardState::ExternalHandler(guard) | HandlerGuardState::WakerMap(guard, _) => {
++                Some(guard.token())
++            }
++            HandlerGuardState::None => None,
++        };
++        if let Some(token) = token {
++            self.selector.reregister(
++                token,
++                &mut stream,
++                mio::Interest::READABLE.add(mio::Interest::WRITABLE),
++            )?;
++        }
++        self.backlog.clear();
++        self.stream = stream;
++        Ok(())
++    }
++
+     fn try_accept_internal(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
+         match self.stream.accept().map_err(io_err_into_net_error) {
+             Ok((stream, addr)) => {

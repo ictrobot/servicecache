@@ -1,5 +1,9 @@
-Patches to Wasmer 7.3.0 for the ServiceCache host process: a host can hand
-the guest a listening socket it created.
+Patches to Wasmer 7.3.0 for the ServiceCache host process: a guest coroutine
+suspends on a blocking host wait instead of parking its OS thread, guest
+threads can be resurrected on fresh threads in a forked child, the selector
+can be rebuilt after a fork, a clone can replace its listening socket, and
+host I/O never goes through a runtime handle captured at construction.
+Suspension is off unless the host enables it; the I/O changes apply always.
 
 scripts/setup-wasmer applies the series to a checkout under work/wasmer, and
 the workspace builds the host against the Wasmer crates from that tree. The

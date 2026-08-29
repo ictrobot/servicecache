@@ -1,0 +1,263 @@
+Subject: api: run host imports on the coroutine stack when suspension is
+ enabled
+
+The import trampolines switch every host call to the OS thread's stack
+through `on_host_stack`, which is what stops a syscall from suspending
+the coroutine: the wait would be on a stack the coroutine does not own.
+With suspension enabled the trampolines call the host function directly
+on the coroutine stack; otherwise they behave as before.
+
+This trades the isolation of host frames from guest-controlled stack
+depth for suspendable syscalls: a stack overflow inside an import is
+reported as a Wasm trap, and the host sizes the coroutine stacks for its
+imports. Because an import can now be resumed on a different OS thread,
+every access to the store-context thread-local goes through a function
+that is never inlined; see wasmer-vm's `trap/suspend.rs`.
+
+diff --git a/lib/api/src/backend/sys/entities/function/mod.rs b/lib/api/src/backend/sys/entities/function/mod.rs
+index efed13c..82c37c8 100644
+--- a/lib/api/src/backend/sys/entities/function/mod.rs
++++ b/lib/api/src/backend/sys/entities/function/mod.rs
+@@ -31,8 +31,8 @@ use wasmer_vm::interrupt_registry;
+ use wasmer_vm::{
+     MaybeInstanceOwned, StoreHandle, Trap, TrapCode, VMCallerCheckedAnyfunc, VMContext,
+     VMDynamicFunctionContext, VMExceptionRef, VMFuncRef, VMFunction, VMFunctionBody,
+-    VMFunctionContext, VMFunctionKind, VMTrampoline, on_host_stack, raise_lib_trap,
+-    raise_user_trap, resume_panic, wasmer_call_trampoline,
++    VMFunctionContext, VMFunctionKind, VMTrampoline, raise_lib_trap, raise_user_trap, resume_panic,
++    wasmer_call_trampoline,
+ };
+ 
+ #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+@@ -833,7 +833,7 @@ where
+         this: &mut VMDynamicFunctionContext<Self>,
+         values_vec: *mut RawValue,
+     ) {
+-        let result = on_host_stack(|| {
++        let result = wasmer_vm::on_host_stack_for_import(|| {
+             panic::catch_unwind(AssertUnwindSafe(|| match (this.ctx.func)(values_vec) {
+                 HostCallOutcome::Ready { func_ty, result } => to_invocation_result(
+                     finalize_dynamic_call(this.ctx.store_id, func_ty, values_vec, result),
+@@ -972,7 +972,7 @@ macro_rules! impl_host_function {
+                 RetsAsResult: IntoResult<Rets>,
+                 Func: Fn($( $x , )*) -> RetsAsResult + 'static,
+             {
+-                let result = on_host_stack(|| {
++                let result = wasmer_vm::on_host_stack_for_import(|| {
+                     panic::catch_unwind(AssertUnwindSafe(|| {
+                         let mut store_wrapper = unsafe { StoreContext::get_current(env.store_id) };
+                         let mut store = store_wrapper.as_mut();
+@@ -1072,7 +1072,7 @@ macro_rules! impl_host_function {
+                 RetsAsResult: IntoResult<Rets>,
+                 Func: Fn(FunctionEnvMut<T>, $( $x , )*) -> RetsAsResult + 'static,
+             {
+-                let result = wasmer_vm::on_host_stack(|| {
++                let result = wasmer_vm::on_host_stack_for_import(|| {
+                     panic::catch_unwind(AssertUnwindSafe(|| {
+                         let mut store_wrapper = unsafe { StoreContext::get_current(env.store_id) };
+                         let mut store = store_wrapper.as_mut();
+diff --git a/lib/api/src/entities/store/context.rs b/lib/api/src/entities/store/context.rs
+index 84a3346..cc0c87a 100644
+--- a/lib/api/src/entities/store/context.rs
++++ b/lib/api/src/entities/store/context.rs
+@@ -40,6 +40,14 @@
+ //! "paused", i.e. not the top entry. This should be impossible
+ //! due to how the function call code is structured, but we
+ //! guard against it anyway.
++//!
++//! Every access to the thread-local stack goes through a function that
++//! is never inlined. A coroutine running Wasm may suspend inside a host
++//! import and be resumed on a different OS thread (`wasmer_vm`'s
++//! `trap/suspend.rs`); the compiler materialises a thread-local's
++//! address once per function, so an access after the resume that reused
++//! an address computed before it would write into the old thread's
++//! block.
+ 
+ use std::{
+     borrow::BorrowMut,
+@@ -124,6 +132,7 @@ thread_local! {
+ }
+ 
+ impl StoreContext {
++    #[inline(never)]
+     fn is_active(id: StoreId) -> bool {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let stack = cell.borrow();
+@@ -131,6 +140,7 @@ impl StoreContext {
+         })
+     }
+ 
++    #[inline(never)]
+     fn is_suspended(id: StoreId) -> bool {
+         !Self::is_active(id)
+             && STORE_CONTEXT_STACK.with(|cell| {
+@@ -139,6 +149,7 @@ impl StoreContext {
+             })
+     }
+ 
++    #[inline(never)]
+     fn install(id: StoreId, entry: StoreContextEntry) {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -151,6 +162,7 @@ impl StoreContext {
+     }
+ 
+     #[cfg(feature = "unsafe-cothread")]
++    #[inline(never)]
+     fn install_cothread(id: StoreId, store_ptr: NonNull<StoreInner>) {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -163,6 +175,7 @@ impl StoreContext {
+     }
+ 
+     #[cfg(feature = "unsafe-cothread")]
++    #[inline(never)]
+     fn uninstall_cothread(id: StoreId) {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -180,6 +193,7 @@ impl StoreContext {
+     }
+ 
+     /// Returns true if there are no active store context entries.
++    #[inline(never)]
+     pub(crate) fn is_empty() -> bool {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let stack = cell.borrow();
+@@ -203,6 +217,7 @@ impl StoreContext {
+     /// # Safety
+     /// The pointer must be dereferenceable and remain valid until the
+     /// store context is uninstalled.
++    #[inline(never)]
+     pub(crate) unsafe fn ensure_installed(store_ptr: *mut StoreInner) -> StoreInstallGuard {
+         let store_id = unsafe { store_ptr.as_ref().unwrap().objects.id() };
+         if Self::is_active(store_id) {
+@@ -235,6 +250,7 @@ impl StoreContext {
+     /// However, since the imported function passes a mutable borrow
+     /// of its store into `Function::call`, it will expect the store
+     /// to change before the call returns.
++    #[inline(never)]
+     pub(crate) unsafe fn pause(id: StoreId) -> StorePtrPauseGuard {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -264,6 +280,7 @@ impl StoreContext {
+     ///
+     /// The intended, valid use-case for this method is from within
+     /// imported function trampolines.
++    #[inline(never)]
+     pub(crate) unsafe fn get_current(id: StoreId) -> StorePtrWrapper {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -283,6 +300,7 @@ impl StoreContext {
+     /// the store context is changed in any way (via installing or uninstalling
+     /// a store context). The caller must ensure that the store context
+     /// remains unchanged as long as the pointer is being accessed.
++    #[inline(never)]
+     pub(crate) unsafe fn get_current_transient(id: StoreId) -> *mut StoreInner {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -295,6 +313,7 @@ impl StoreContext {
+     }
+ 
+     /// Safety: See [`Self::get_current`].
++    #[inline(never)]
+     pub(crate) unsafe fn try_get_current(id: StoreId) -> Option<StorePtrWrapper> {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -311,6 +330,7 @@ impl StoreContext {
+ 
+     /// Safety: See [`Self::get_current`].
+     #[cfg(feature = "experimental-async")]
++    #[inline(never)]
+     pub(crate) unsafe fn try_get_current_async(id: StoreId) -> GetStoreAsyncGuardResult {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -391,6 +411,7 @@ impl StorePtrWrapper {
+ }
+ 
+ impl Clone for StorePtrWrapper {
++    #[inline(never)]
+     fn clone(&self) -> Self {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -410,6 +431,7 @@ impl Clone for StorePtrWrapper {
+ }
+ 
+ impl Drop for StorePtrWrapper {
++    #[inline(never)]
+     fn drop(&mut self) {
+         if std::thread::panicking() {
+             return;
+@@ -428,6 +450,7 @@ impl Drop for StorePtrWrapper {
+ 
+ #[cfg(feature = "experimental-async")]
+ impl Drop for StoreAsyncGuardWrapper {
++    #[inline(never)]
+     fn drop(&mut self) {
+         if std::thread::panicking() {
+             return;
+@@ -445,6 +468,7 @@ impl Drop for StoreAsyncGuardWrapper {
+ }
+ 
+ impl Drop for StoreInstallGuard {
++    #[inline(never)]
+     fn drop(&mut self) {
+         if let Self::Installed(store_id) = self {
+             STORE_CONTEXT_STACK.with(|cell| {
+@@ -477,6 +501,7 @@ impl Drop for StoreInstallGuard {
+ }
+ 
+ impl Drop for ForcedStoreInstallGuard {
++    #[inline(never)]
+     fn drop(&mut self) {
+         STORE_CONTEXT_STACK.with(|cell| {
+             let mut stack = cell.borrow_mut();
+@@ -507,6 +532,7 @@ impl Drop for ForcedStoreInstallGuard {
+ }
+ 
+ impl Drop for StorePtrPauseGuard {
++    #[inline(never)]
+     fn drop(&mut self) {
+         if std::thread::panicking() {
+             return;
+diff --git a/lib/vm/src/trap/mod.rs b/lib/vm/src/trap/mod.rs
+index c0e9418..5a50aaf 100644
+--- a/lib/vm/src/trap/mod.rs
++++ b/lib/vm/src/trap/mod.rs
+@@ -21,7 +21,9 @@ mod traphandlers;
+ mod traphandlers;
+ 
+ #[cfg(not(feature = "baremetal"))]
+-pub use suspend::{BlockedFuture, SleepHook, WasmYield, try_suspend_on_block};
++pub use suspend::{
++    BlockedFuture, SleepHook, WasmYield, on_host_stack_for_import, try_suspend_on_block,
++};
+ pub use trap::{Trap, UnwindReason};
+ #[cfg(feature = "baremetal")]
+ pub use traphandlers::install_unwinder;
+diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
+index 1bb7d27..b7a186a 100644
+--- a/lib/vm/src/trap/suspend.rs
++++ b/lib/vm/src/trap/suspend.rs
+@@ -100,6 +100,22 @@ pub fn enabled() -> bool {
+     ENABLED.load(Ordering::Relaxed)
+ }
+ 
++/// Runs a host import: on the coroutine stack when suspension is enabled, so
++/// that a wait inside it can suspend the coroutine; on the OS thread's stack
++/// (stock behaviour, `on_host_stack`) otherwise.
++///
++/// Running host code on the coroutine stack gives up the isolation of host
++/// frames from guest-controlled stack depth: a stack overflow in an import is
++/// reported as a Wasm stack-overflow trap, and the coroutine stack must be
++/// sized for the host code as well.
++pub fn on_host_stack_for_import<F: FnOnce() -> T, T>(f: F) -> T {
++    if enabled() {
++        f()
++    } else {
++        super::traphandlers::on_host_stack(f)
++    }
++}
++
+ /// A timer from the host's sleep hook, if suspension is enabled.
+ pub(crate) fn sleep(duration: Duration) -> Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>> {
+     SLEEP_HOOK.get().map(|hook| hook(duration))

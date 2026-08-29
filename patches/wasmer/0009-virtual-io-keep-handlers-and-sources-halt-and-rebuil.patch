@@ -1,0 +1,359 @@
+Subject: virtual-io: keep handlers and sources; halt and rebuild the selector
+
+The selector's handler map lived on its poll thread's stack, and the
+descriptors it had registered were known only to the kernel's epoll
+instance. Both are now kept in the `Selector` itself, and registration
+takes a source with a raw descriptor, so that:
+
+- `halt` stops the poll thread and joins it, leaving every registration
+  in place (a frozen process has no threads);
+- `rebuild_after_fork` creates a new poll instance, registers every
+  known descriptor with it again and starts a new poll thread. A forked
+  child must not share its parent's epoll instance: events would be
+  delivered to whichever process polled first.
+
+`LocalNetworking::selector` exposes the selector so a host can do both.
+
+diff --git a/lib/virtual-io/Cargo.toml b/lib/virtual-io/Cargo.toml
+index 92a8eb3..305319b 100644
+--- a/lib/virtual-io/Cargo.toml
++++ b/lib/virtual-io/Cargo.toml
+@@ -15,7 +15,7 @@ bytes.workspace = true
+ async-trait.workspace = true
+ tracing.workspace = true
+ 
+-mio = { workspace = true, features = ["os-poll"], optional = true }
++mio = { workspace = true, features = ["os-poll", "os-ext"], optional = true }
+ socket2 = { workspace = true, optional = true }
+ futures.workspace = true
+ serde = { workspace = true, default-features = false, features = ["derive"] }
+diff --git a/lib/virtual-io/src/guard.rs b/lib/virtual-io/src/guard.rs
+index 60d5596..ac50e02 100644
+--- a/lib/virtual-io/src/guard.rs
++++ b/lib/virtual-io/src/guard.rs
+@@ -5,7 +5,7 @@ use std::{
+ 
+ use mio::Token;
+ 
+-use crate::{InterestHandler, InterestType, InterestWakerMap, Selector};
++use crate::{InterestHandler, InterestType, InterestWakerMap, Selector, SelectorSource};
+ 
+ #[derive(Debug)]
+ #[must_use = "Leaking token guards will break the IO subsystem"]
+@@ -22,7 +22,7 @@ impl InterestGuard {
+     pub fn new(
+         selector: &Arc<Selector>,
+         handler: Box<dyn InterestHandler + Send + Sync>,
+-        source: &mut dyn mio::event::Source,
++        source: &mut dyn SelectorSource,
+         interest: mio::Interest,
+     ) -> io::Result<InterestGuard> {
+         let token = selector.add(handler, source, interest)?;
+@@ -32,7 +32,7 @@ impl InterestGuard {
+         })
+     }
+ 
+-    pub fn unregister(&mut self, source: &mut dyn mio::event::Source) -> io::Result<()> {
++    pub fn unregister(&mut self, source: &mut dyn SelectorSource) -> io::Result<()> {
+         if let Some(selector) = self.selector.upgrade() {
+             selector.remove(self.token, Some(source))?;
+         }
+@@ -75,7 +75,7 @@ pub enum HandlerGuardState {
+ pub fn state_as_waker_map<'a>(
+     state: &'a mut HandlerGuardState,
+     selector: &'_ Arc<Selector>,
+-    source: &'_ mut dyn mio::event::Source,
++    source: &'_ mut dyn SelectorSource,
+ ) -> io::Result<&'a mut InterestWakerMap> {
+     if !matches!(state, HandlerGuardState::WakerMap(_, _)) {
+         let waker_map = InterestWakerMap::default();
+diff --git a/lib/virtual-io/src/selector.rs b/lib/virtual-io/src/selector.rs
+index 858f80e..eb5d4ee 100644
+--- a/lib/virtual-io/src/selector.rs
++++ b/lib/virtual-io/src/selector.rs
+@@ -1,4 +1,4 @@
+-use mio::{Registry, Token};
++use mio::{Interest, Registry, Token};
+ use std::{
+     collections::HashMap,
+     io,
+@@ -10,6 +10,19 @@ use std::{
+ 
+ use crate::{InterestHandler, InterestType};
+ 
++/// What the selector registers: an event source with a raw descriptor, so that
++/// the registration can be re-created on a new poll instance after a fork.
++#[cfg(unix)]
++pub trait SelectorSource: mio::event::Source + std::os::fd::AsRawFd {}
++#[cfg(unix)]
++impl<T: mio::event::Source + std::os::fd::AsRawFd> SelectorSource for T {}
++
++/// What the selector registers.
++#[cfg(not(unix))]
++pub trait SelectorSource: mio::event::Source {}
++#[cfg(not(unix))]
++impl<T: mio::event::Source> SelectorSource for T {}
++
+ pub enum SelectorModification {
+     Add {
+         handler: Box<dyn InterestHandler + Send + Sync>,
+@@ -89,60 +102,122 @@ impl std::fmt::Debug for SelectorModification {
+     }
+ }
+ 
++/// The poll instance the selector thread waits on and the registry and waker
++/// bound to it. Replaced as a whole by `rebuild_after_fork`.
++#[derive(Debug)]
++struct PollInstance {
++    /// The core assumption here is that this will always be the innermost lock, so we will never deadlock
++    registry: Registry,
++    /// Waker to wake up the selectors own poll loop
++    wakeup: mio::Waker,
++}
++
+ #[derive(Debug)]
+ pub struct Selector {
+     /// Set to true when exiting the poll loop
+     close_requested: AtomicBool,
+     token_wakeup: Token,
+-    /// The core assumption here is that this will always be the innermost lock, so we will never deadlock
+-    registry: Mutex<Registry>,
++    instance: Mutex<PollInstance>,
+     next_seed: AtomicUsize,
+-    /// Waker to wake up the selectors own poll loop
+-    wakeup: mio::Waker,
+     /// Queued up modifications that will be processed immediately after we get new events
+     ///
+     /// The core assumption here is that this will always be the innermost lock, so we will never deadlock
+     queued_modifications: Mutex<Vec<SelectorModification>>,
++    /// The handlers by token. Kept here rather than on the poll thread's
++    /// stack so that a forked child, which has no poll thread, can start a
++    /// new one with the same handlers.
++    handlers: Mutex<HashMap<Token, Box<dyn InterestHandler + Send + Sync>>>,
++    /// Every registered descriptor and its interests, so that the
++    /// registrations can be re-created on a new poll instance.
++    #[cfg(unix)]
++    sources: Mutex<HashMap<Token, (std::os::fd::RawFd, Interest)>>,
++    /// The poll thread, joined by `halt`.
++    poll_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+ }
+ 
+ impl Selector {
+     pub fn new() -> Arc<Self> {
+         let poll = mio::Poll::new().unwrap();
+-        let registry = poll
+-            .registry()
+-            .try_clone()
+-            .expect("the selector registry failed to clone");
+-
+         let token_wakeup = Token(0);
++        let instance = Self::instance_for(&poll, token_wakeup).unwrap();
++
+         let engine = Arc::new(Selector {
+-            wakeup: mio::Waker::new(poll.registry(), token_wakeup).unwrap(),
+             close_requested: false.into(),
+             token_wakeup,
++            instance: Mutex::new(instance),
+             next_seed: 10.into(),
+-            registry: Mutex::new(registry),
+             queued_modifications: Mutex::new(Vec::new()),
++            handlers: Mutex::new(HashMap::new()),
++            #[cfg(unix)]
++            sources: Mutex::new(HashMap::new()),
++            poll_thread: Mutex::new(None),
+         });
+-
+-        {
+-            let engine = engine.clone();
+-            std::thread::spawn(move || {
+-                Self::run(engine, poll);
+-            });
+-        }
++        engine.spawn_poll_thread(poll);
+ 
+         engine
+     }
+ 
++    fn instance_for(poll: &mio::Poll, token_wakeup: Token) -> io::Result<PollInstance> {
++        Ok(PollInstance {
++            registry: poll.registry().try_clone()?,
++            wakeup: mio::Waker::new(poll.registry(), token_wakeup)?,
++        })
++    }
++
++    fn spawn_poll_thread(self: &Arc<Self>, poll: mio::Poll) {
++        let engine = self.clone();
++        let handle = std::thread::spawn(move || {
++            Self::run(engine, poll);
++        });
++        *self.poll_thread.lock().unwrap() = Some(handle);
++    }
++
+     pub fn shutdown(&self) {
+         self.close_requested.store(true, Ordering::SeqCst);
+-        self.wakeup.wake().ok();
++        self.instance.lock().unwrap().wakeup.wake().ok();
++    }
++
++    /// Stops the poll thread and waits for it to end. Registrations and
++    /// handlers are kept: a later `rebuild_after_fork` starts a new thread
++    /// with them. Sockets keep working for non-blocking operations; nothing
++    /// is woken until then.
++    pub fn halt(&self) {
++        self.shutdown();
++        let handle = self.poll_thread.lock().unwrap().take();
++        if let Some(handle) = handle {
++            handle.join().ok();
++        }
++    }
++
++    /// In a forked child (or after `halt`): creates a new poll instance,
++    /// registers every known descriptor with it again and starts a new poll
++    /// thread. The previous instance is closed; its thread, if any, belonged
++    /// to the parent.
++    #[cfg(unix)]
++    pub fn rebuild_after_fork(self: &Arc<Self>) -> io::Result<()> {
++        let poll = mio::Poll::new()?;
++        let instance = Self::instance_for(&poll, self.token_wakeup)?;
++        {
++            let sources = self.sources.lock().unwrap();
++            for (token, (fd, interests)) in sources.iter() {
++                poll.registry()
++                    .register(&mut mio::unix::SourceFd(fd), *token, *interests)?;
++            }
++        }
++        // Drop the old thread's handle (the thread does not exist here)
++        // before anything can join it.
++        self.poll_thread.lock().unwrap().take();
++        self.close_requested.store(false, Ordering::SeqCst);
++        *self.instance.lock().unwrap() = instance;
++        self.spawn_poll_thread(poll);
++        Ok(())
+     }
+ 
+     #[must_use = "the token must be consumed"]
+     pub fn add(
+         &self,
+         handler: Box<dyn InterestHandler + Send + Sync>,
+-        source: &mut dyn mio::event::Source,
++        source: &mut dyn SelectorSource,
+         interests: mio::Interest,
+     ) -> io::Result<Token> {
+         let token = self.new_token();
+@@ -150,29 +225,32 @@ impl Selector {
+         self.queue_modification(SelectorModification::Add { handler, token });
+ 
+         // CONCURRENCY: This should never result in a deadlock, as long as source.deregister does not call remove or add again.
+-        let inner_registry = self.registry.lock().unwrap();
+-        match source.register(&inner_registry, token, interests) {
++        let instance = self.instance.lock().unwrap();
++        match source.register(&instance.registry, token, interests) {
+             Ok(()) => {}
+             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+-                source.deregister(&inner_registry).ok();
+-                source.register(&inner_registry, token, interests)?;
++                source.deregister(&instance.registry).ok();
++                source.register(&instance.registry, token, interests)?;
+             }
+             Err(err) => return Err(err),
+         };
++        #[cfg(unix)]
++        self.sources
++            .lock()
++            .unwrap()
++            .insert(token, (std::os::fd::AsRawFd::as_raw_fd(source), interests));
+ 
+         Ok(token)
+     }
+ 
+-    pub fn remove(
+-        &self,
+-        token: Token,
+-        source: Option<&mut dyn mio::event::Source>,
+-    ) -> io::Result<()> {
++    pub fn remove(&self, token: Token, source: Option<&mut dyn SelectorSource>) -> io::Result<()> {
+         self.queue_modification(SelectorModification::Remove { token });
++        #[cfg(unix)]
++        self.sources.lock().unwrap().remove(&token);
+         // CONCURRENCY: This should never result in a deadlock, as long as source.deregister does not call remove or add again.
+         if let Some(source) = source {
+-            let inner_registry = self.registry.lock().unwrap();
+-            source.deregister(&inner_registry)?;
++            let instance = self.instance.lock().unwrap();
++            source.deregister(&instance.registry)?;
+         }
+         Ok(())
+     }
+@@ -203,7 +281,7 @@ impl Selector {
+         self.queued_modifications.lock().unwrap().push(modification);
+ 
+         if needs_wakeup {
+-            self.wakeup.wake().ok();
++            self.instance.lock().unwrap().wakeup.wake().ok();
+         }
+     }
+ 
+@@ -221,8 +299,6 @@ impl Selector {
+         // The outer loop is used to release the scope of the
+         // read lock whenever it needs to do so
+         let mut events = mio::Events::with_capacity(128);
+-        let mut handler_map: HashMap<Token, Box<dyn InterestHandler + Send + Sync>> =
+-            HashMap::new();
+         loop {
+             // Wait for an event to trigger
+             if let Err(e) = poll.poll(&mut events, None) {
+@@ -237,6 +313,7 @@ impl Selector {
+             // Handler changes that may be queued up between the poll completing and taking the queued modifications can be a problem but we can not eliminate that fully.
+ 
+             let queued_modifications = engine.take_queued_modifications();
++            let mut handler_map = engine.handlers.lock().unwrap();
+             for modification in queued_modifications {
+                 modification.apply(&mut handler_map);
+             }
+@@ -429,4 +506,46 @@ mod tests {
+             "Did not receive success signal from handler, deadlocked?"
+         );
+     }
++
++    /// After `halt` the poll thread is gone; `rebuild_after_fork` re-registers
++    /// the same descriptors on a new poll instance and events flow again.
++    #[test]
++    fn test_halt_and_rebuild_keeps_registrations() {
++        let (mut sender, mut receiver) = mio::unix::pipe::new().unwrap();
++        let (success_sender, success_receiver) = std::sync::mpsc::channel();
++
++        let selector = Selector::new();
++        let handler = Box::new(TestHandler { success_sender });
++        let _token = selector
++            .add(handler, &mut receiver, mio::Interest::READABLE)
++            .unwrap();
++
++        selector.halt();
++        assert!(selector.poll_thread.lock().unwrap().is_none());
++
++        sender.write_all(&[1, 2, 3]).unwrap();
++        sender.flush().unwrap();
++        thread::sleep(Duration::from_millis(10));
++        assert!(
++            success_receiver.try_recv().is_err(),
++            "Received an event while halted"
++        );
++
++        selector.rebuild_after_fork().unwrap();
++        thread::sleep(Duration::from_millis(10));
++        assert!(
++            success_receiver.try_recv().is_ok(),
++            "Did not receive the pending event after the rebuild"
++        );
++
++        sender.write_all(&[4]).unwrap();
++        sender.flush().unwrap();
++        thread::sleep(Duration::from_millis(10));
++        assert!(
++            success_receiver.try_recv().is_ok(),
++            "Did not receive a new event after the rebuild"
++        );
++
++        selector.shutdown();
++    }
+ }

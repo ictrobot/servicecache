@@ -1,0 +1,586 @@
+Subject: vm, api: register top-level coroutines, freeze them and resurrect
+ them
+
+`run_guest_thread` runs a whole guest-thread body on a registered
+top-level coroutine driven by one OS thread that does nothing else; the
+Wasm call nests its own coroutine inside and propagates its waits
+outwards. The OS thread therefore holds no guest state, which lets a
+freeze end it and a forked child give the coroutine a fresh thread:
+
+- `close_gate` stops every started coroutine from being resumed or
+  polled; `drain` waits until no host loop is active, then makes each
+  loop capture its per-thread state and end its thread with the raw
+  `exit` syscall, so no destructor runs after quiescence.
+- `resurrect_all` reopens the gate and spawns one thread per registered
+  coroutine that re-creates the thread's state, re-polls the pending
+  wait and resumes the coroutine.
+
+wasmer-api installs hooks that capture and restore its store-context
+stack, the per-thread state the import trampolines read.
+
+diff --git a/lib/api/src/entities/store/context.rs b/lib/api/src/entities/store/context.rs
+index cc0c87a..c0c5b11 100644
+--- a/lib/api/src/entities/store/context.rs
++++ b/lib/api/src/entities/store/context.rs
+@@ -47,7 +47,8 @@
+ //! `trap/suspend.rs`); the compiler materialises a thread-local's
+ //! address once per function, so an access after the resume that reused
+ //! an address computed before it would write into the old thread's
+-//! block.
++//! block. The same suspension is why the stack can be captured on one
++//! thread and restored on another (`install_suspend_thread_state_hooks`).
+ 
+ use std::{
+     borrow::BorrowMut,
+@@ -554,3 +555,60 @@ impl Drop for StorePtrPauseGuard {
+         })
+     }
+ }
++
++/// The store-context stack of a thread, as captured for a coroutine that is
++/// resumed on another thread. Only sync entries can be captured: a suspended
++/// guest thread holds no async store guard.
++#[cfg(feature = "sys")]
++struct SuspendedStoreContexts(Vec<(StoreId, *mut StoreInner, u32)>);
++
++#[cfg(feature = "sys")]
++unsafe impl Send for SuspendedStoreContexts {}
++
++#[cfg(feature = "sys")]
++#[inline(never)]
++fn capture_store_contexts() -> Box<dyn std::any::Any + Send> {
++    STORE_CONTEXT_STACK.with(|cell| {
++        let stack = cell.borrow();
++        Box::new(SuspendedStoreContexts(
++            stack
++                .iter()
++                .map(|ctx| {
++                    // SAFETY: we hold the `RefCell` borrow of the stack, so no
++                    // one mutates the entry while we read it.
++                    let ptr = unsafe { ctx.entry.get().as_ref().unwrap() }.as_ptr();
++                    (ctx.id, ptr, ctx.borrow_count)
++                })
++                .collect(),
++        ))
++    })
++}
++
++#[cfg(feature = "sys")]
++#[inline(never)]
++fn restore_store_contexts(state: &(dyn std::any::Any + Send)) {
++    let state = state
++        .downcast_ref::<SuspendedStoreContexts>()
++        .expect("captured store contexts");
++    STORE_CONTEXT_STACK.with(|cell| {
++        let mut stack = cell.borrow_mut();
++        for (id, ptr, borrow_count) in &state.0 {
++            stack.push(StoreContext {
++                id: *id,
++                borrow_count: *borrow_count,
++                entry: UnsafeCell::new(StoreContextEntry::Sync(*ptr)),
++            });
++        }
++    })
++}
++
++/// Lets `wasmer_vm` carry this thread-local store-context stack from the
++/// thread a suspended coroutine last ran on to the thread that resumes it.
++/// Part of enabling suspension; see `wasmer_vm::suspend`.
++#[cfg(feature = "sys")]
++pub fn install_suspend_thread_state_hooks() {
++    wasmer_vm::set_thread_state_hooks(wasmer_vm::ThreadStateHooks {
++        capture: capture_store_contexts,
++        restore: restore_store_contexts,
++    });
++}
+diff --git a/lib/api/src/entities/store/mod.rs b/lib/api/src/entities/store/mod.rs
+index 594ab43..112bd2c 100644
+--- a/lib/api/src/entities/store/mod.rs
++++ b/lib/api/src/entities/store/mod.rs
+@@ -35,6 +35,8 @@ pub use obj::*;
+ use crate::{AsEngineRef, BackendEngine, Engine, EngineRef};
+ #[cfg(feature = "unsafe-cothread")]
+ pub use context::CoroutineStoreGuard;
++#[cfg(feature = "sys")]
++pub use context::install_suspend_thread_state_hooks;
+ pub(crate) use context::*;
+ pub(crate) use inner::*;
+ use wasmer_types::StoreId;
+diff --git a/lib/vm/src/trap/mod.rs b/lib/vm/src/trap/mod.rs
+index 5a50aaf..83cd32f 100644
+--- a/lib/vm/src/trap/mod.rs
++++ b/lib/vm/src/trap/mod.rs
+@@ -22,7 +22,9 @@ mod traphandlers;
+ 
+ #[cfg(not(feature = "baremetal"))]
+ pub use suspend::{
+-    BlockedFuture, SleepHook, WasmYield, on_host_stack_for_import, try_suspend_on_block,
++    BlockedFuture, FreezeError, Quiescence, Resurrected, SleepHook, ThreadStateHooks, WasmYield,
++    exit_current_thread, on_host_stack_for_import, resurrect_all, run_guest_thread,
++    set_thread_state_hooks, try_suspend_on_block,
+ };
+ pub use trap::{Trap, UnwindReason};
+ #[cfg(feature = "baremetal")]
+diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
+index b7a186a..ecf8006 100644
+--- a/lib/vm/src/trap/suspend.rs
++++ b/lib/vm/src/trap/suspend.rs
+@@ -28,13 +28,16 @@
+ //!   and reused it after a resume on another thread would write into the old
+ //!   thread's block.
+ 
++use std::any::Any;
++use std::fmt;
+ use std::future::Future;
+ use std::mem;
+ use std::pin::Pin;
+ use std::ptr::NonNull;
+-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+-use std::sync::{Arc, OnceLock};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, OnceLock};
+ use std::task::{Context, Poll, Wake, Waker};
++use std::thread::Thread;
+ use std::time::{Duration, Instant};
+ 
+ use corosensei::stack::DefaultStack;
+@@ -42,7 +45,8 @@ use corosensei::{Coroutine, CoroutineResult, Yielder};
+ 
+ use super::trap::UnwindReason;
+ use super::traphandlers::{
+-    TrapHandlerContext, TrapHandlerFn, acquire_stack, release_stack, yielder_get, yielder_set,
++    TrapHandlerContext, TrapHandlerFn, acquire_stack, lazy_per_thread_init, release_stack,
++    yielder_get, yielder_set,
+ };
+ 
+ /// What a coroutine hands back to the loop that resumed it.
+@@ -159,12 +163,17 @@ impl Wake for Unparker {
+ 
+ /// Polls `fut` on this thread, parking between polls, until it is ready.
+ /// Every poll is registered as active, so a freeze never catches a poll in
+-/// flight.
+-fn wait_ready(fut: BlockedFuture) {
++/// flight. A loop driving a registered coroutine (`gate` set) retires
++/// instead of polling once the gate is closed.
++fn wait_ready(fut: BlockedFuture, gate: Option<&mut dyn TopLevelCoro>) {
+     let waker = Waker::from(Arc::new(Unparker(std::thread::current())));
+     let mut cx = Context::from_waker(&waker);
+     loop {
+-        try_enter(false);
++        if !try_enter(gate.is_some()) {
++            retire(gate.expect("only gated loops are refused"));
++        }
++        // SAFETY: the coroutine that owns `fut` is suspended: this loop is the
++        // only thing that resumes it, and it has not done so yet.
+         let ready = unsafe { fut.poll(&mut cx) }.is_ready();
+         leave();
+         if ready {
+@@ -266,6 +275,7 @@ pub(crate) fn block_on<F: Future>(fut: F, deadline: Option<Instant>) -> F::Outpu
+ 
+ /// One coroutine and what its loop needs to resume it.
+ struct GuestCoro<T> {
++    id: u64,
+     coro: Coroutine<(), WasmYield, Result<T, UnwindReason>, DefaultStack>,
+     /// The custom trap handler installed around each resume, for coroutines
+     /// that run Wasm.
+@@ -276,8 +286,16 @@ struct GuestCoro<T> {
+     with_trap_context: bool,
+     /// The wait the coroutine is suspended in, if any.
+     pending: Option<BlockedFuture>,
++    /// The OS thread currently driving a registered coroutine, for unparking.
++    thread: Mutex<Option<Thread>>,
++    /// Per-thread state captured by the last driving thread when it retired.
++    thread_state: Option<Box<dyn Any + Send>>,
+ }
+ 
++// SAFETY: a coroutine moves between OS threads only through the registry,
++// while no thread is driving it, and its stack is process memory.
++unsafe impl<T> Send for GuestCoro<T> {}
++
+ impl<T: 'static> GuestCoro<T> {
+     /// Resumes the coroutine on the calling thread, recording the wait it
+     /// suspends in.
+@@ -319,10 +337,13 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+         Ok(f())
+     });
+     let mut handle = GuestCoro {
++        id: 0,
+         coro,
+         trap_handler,
+         with_trap_context: true,
+         pending: None,
++        thread: Mutex::new(None),
++        thread_state: None,
+     };
+ 
+     // Restore the enclosing yielder however the loop ends, including by a
+@@ -348,7 +369,7 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+                     unsafe { outer.as_ref().suspend(WasmYield::Blocked(fut)) };
+                     yielder_set(Some(outer));
+                 }
+-                None => wait_ready(fut),
++                None => wait_ready(fut, None),
+             },
+             CoroutineResult::Return(result) => break result,
+         }
+@@ -361,3 +382,360 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+     release_stack(coro.into_stack());
+     result
+ }
++
++// ---------------------------------------------------------------------------
++// Top-level coroutines: the registry, the freeze gate and resurrection.
++//
++// A guest thread is one OS thread driving one top-level coroutine that runs
++// the *whole* thread body (instance creation, the Wasm call, the exit
++// bookkeeping); the Wasm call nests its own coroutine inside. The OS thread
++// therefore holds no guest state at all: at a freeze it can simply end, and
++// in a forked child a fresh thread picks the coroutine up from the registry.
++
++/// Per-thread state a resumed coroutine needs re-created on a fresh OS
++/// thread: captured by the thread that retires, restored by the one that
++/// takes over. wasmer-api installs hooks for its store-context stack.
++pub struct ThreadStateHooks {
++    /// Captures the calling thread's state.
++    pub capture: fn() -> Box<dyn Any + Send>,
++    /// Re-creates captured state on the calling thread.
++    pub restore: fn(&(dyn Any + Send)),
++}
++
++static THREAD_STATE_HOOKS: OnceLock<ThreadStateHooks> = OnceLock::new();
++
++/// Installs the per-thread state hooks. Only the first installation takes
++/// effect.
++pub fn set_thread_state_hooks(hooks: ThreadStateHooks) {
++    let _ = THREAD_STATE_HOOKS.set(hooks);
++}
++
++enum Step {
++    Blocked(BlockedFuture),
++    Done,
++}
++
++/// A registered coroutine, as its loop and the freezer see it.
++trait TopLevelCoro: Send {
++    fn id(&self) -> u64;
++    fn started(&self) -> bool;
++    fn pending(&self) -> Option<BlockedFuture>;
++    fn step(&mut self) -> Step;
++    fn set_thread(&self, thread: Thread);
++    fn unpark(&self);
++    fn capture_thread_state(&mut self);
++    fn restore_thread_state(&self);
++}
++
++impl<T: 'static> TopLevelCoro for GuestCoro<T> {
++    fn id(&self) -> u64 {
++        self.id
++    }
++
++    fn started(&self) -> bool {
++        self.coro.started()
++    }
++
++    fn pending(&self) -> Option<BlockedFuture> {
++        self.pending
++    }
++
++    fn step(&mut self) -> Step {
++        match self.resume_here() {
++            CoroutineResult::Yield(WasmYield::Blocked(fut)) => Step::Blocked(fut),
++            CoroutineResult::Yield(WasmYield::Unwind(_)) => {
++                // SAFETY: as in `run_wasm_call`: `unwind_with` guarantees only
++                // Wasm frames on the stack.
++                unsafe { self.coro.force_reset() };
++                Step::Done
++            }
++            CoroutineResult::Return(_) => Step::Done,
++        }
++    }
++
++    fn set_thread(&self, thread: Thread) {
++        *self.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread);
++    }
++
++    fn unpark(&self) {
++        if let Some(thread) = &*self.thread.lock().unwrap_or_else(|e| e.into_inner()) {
++            thread.unpark();
++        }
++    }
++
++    fn capture_thread_state(&mut self) {
++        self.thread_state = THREAD_STATE_HOOKS.get().map(|hooks| (hooks.capture)());
++    }
++
++    fn restore_thread_state(&self) {
++        if let (Some(hooks), Some(state)) = (THREAD_STATE_HOOKS.get(), &self.thread_state) {
++            (hooks.restore)(state.as_ref());
++        }
++    }
++}
++
++/// A registry entry: the coroutine is owned by the registry and freed by the
++/// loop that completes it.
++#[derive(Clone, Copy)]
++struct Registered(NonNull<dyn TopLevelCoro>);
++
++// SAFETY: the pointee is a leaked `Box<GuestCoro<_>>`, which is `Send`; it is
++// freed only by the loop that completes it, after unregistering.
++unsafe impl Send for Registered {}
++
++static REGISTRY: Mutex<Vec<Registered>> = Mutex::new(Vec::new());
++static NEXT_ID: AtomicU64 = AtomicU64::new(1);
++
++/// OS threads currently driving a registered coroutine.
++static HOST_LOOPS: AtomicUsize = AtomicUsize::new(0);
++
++fn registry() -> std::sync::MutexGuard<'static, Vec<Registered>> {
++    REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++fn unregister(ptr: NonNull<dyn TopLevelCoro>) {
++    registry().retain(|entry| !std::ptr::addr_eq(entry.0.as_ptr(), ptr.as_ptr()));
++}
++
++/// Runs `f` on a top-level coroutine driven by the calling OS thread.
++///
++/// The thread must do nothing else: it returns when `f` completes, and it
++/// *ends* — with the raw `exit` syscall, running no destructor — if the
++/// freeze gate closes while `f` is suspended in a wait. A forked child
++/// resumes the coroutine on a fresh thread through [`resurrect_all`].
++pub fn run_guest_thread<F: FnOnce() + Send + 'static>(stack_size: usize, f: F) {
++    let _ = lazy_per_thread_init();
++    let stack = DefaultStack::new(stack_size).expect("failed to allocate a guest thread stack");
++    // corosensei copies the initial closure onto the new stack and refuses
++    // large ones; a guest thread's body captures a whole task.
++    let f: Box<dyn FnOnce() + Send> = Box::new(f);
++    let coro = Coroutine::with_stack(stack, move |yielder: &Yielder<(), WasmYield>, ()| {
++        yielder_set(Some(yielder.into()));
++        f();
++        Ok(())
++    });
++    let entry: Box<GuestCoro<()>> = Box::new(GuestCoro {
++        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
++        coro,
++        trap_handler: None,
++        with_trap_context: false,
++        pending: None,
++        thread: Mutex::new(None),
++        thread_state: None,
++    });
++    let ptr: NonNull<dyn TopLevelCoro> = NonNull::from(Box::leak(entry));
++    registry().push(Registered(ptr));
++    host_loop(ptr, None);
++}
++
++/// Drives a registered coroutine to completion on the calling thread.
++fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<BlockedFuture>) {
++    HOST_LOOPS.fetch_add(1, Ordering::SeqCst);
++    // SAFETY: the registry owns the box behind `ptr` and only this loop drives
++    // it; the freezer touches it through `&self` methods only while no loop
++    // is active.
++    let coro = unsafe { &mut *ptr.as_ptr() };
++    coro.set_thread(std::thread::current());
++    loop {
++        if let Some(fut) = pending.take() {
++            wait_ready(fut, Some(coro));
++        }
++        if !try_enter(coro.started()) {
++            retire(coro);
++        }
++        let step = coro.step();
++        if matches!(step, Step::Done) {
++            // Unregister while still active: a freeze must never see a
++            // finished coroutine as one that is running.
++            unregister(ptr);
++        }
++        leave();
++        match step {
++            Step::Blocked(fut) => pending = Some(fut),
++            Step::Done => break,
++        }
++    }
++    // SAFETY: the entry was unregistered above under the registry lock, so no
++    // other thread can reach it; `ptr` came from `Box::leak`.
++    unsafe { drop(Box::from_raw(ptr.as_ptr())) };
++    HOST_LOOPS.fetch_sub(1, Ordering::SeqCst);
++}
++
++/// Ends the calling host loop's thread because the gate closed: captures the
++/// thread's state for whoever resumes the coroutine, then exits the thread.
++fn retire(coro: &mut dyn TopLevelCoro) -> ! {
++    coro.capture_thread_state();
++    HOST_LOOPS.fetch_sub(1, Ordering::SeqCst);
++    exit_current_thread()
++}
++
++/// Ends the calling OS thread with the raw `exit` syscall: no unwinding, no
++/// destructor, no thread-local drop. The thread's stack stays mapped.
++#[cfg(unix)]
++pub fn exit_current_thread() -> ! {
++    // SAFETY: a plain syscall with no memory arguments; it ends this thread
++    // only, which is the point.
++    unsafe { libc::syscall(libc::SYS_exit, 0) };
++    unreachable!("the exit syscall returned")
++}
++
++/// Ends the calling OS thread. Not supported on this platform.
++#[cfg(not(unix))]
++pub fn exit_current_thread() -> ! {
++    std::process::abort()
++}
++
++/// Closes the freeze gate: from now on no coroutine that has already started
++/// is resumed or polled. A coroutine's first resume is still allowed, so a
++/// thread spawn in flight completes and the spawner drains to its own wait.
++pub fn close_gate() {
++    GATE_CLOSED.store(true, Ordering::SeqCst);
++}
++
++/// Reopens the gate (in a forked child, before resurrection).
++pub fn open_gate() {
++    GATE_CLOSED.store(false, Ordering::SeqCst);
++}
++
++/// Whether the gate is closed.
++pub fn gate_closed() -> bool {
++    GATE_CLOSED.load(Ordering::SeqCst)
++}
++
++/// Number of registered top-level coroutines (live guest threads).
++pub fn coroutines() -> usize {
++    registry().len()
++}
++
++/// Number of host loops resuming a coroutine or polling a wait right now.
++pub fn active() -> usize {
++    ACTIVE.load(Ordering::SeqCst)
++}
++
++/// Number of OS threads currently driving a registered coroutine.
++pub fn host_loops() -> usize {
++    HOST_LOOPS.load(Ordering::SeqCst)
++}
++
++/// What [`drain`] established.
++#[derive(Debug, Clone, Copy)]
++pub struct Quiescence {
++    /// Registered coroutines, every one suspended in a wait or not started.
++    pub coroutines: usize,
++}
++
++/// Why [`drain`] or [`resurrect_all`] failed.
++#[derive(Debug)]
++pub enum FreezeError {
++    /// Some host loop was still active or alive when the timeout expired.
++    Timeout {
++        /// Loops resuming or polling.
++        active: usize,
++        /// Loop threads still alive.
++        host_loops: usize,
++        /// Registered coroutines.
++        coroutines: usize,
++    },
++    /// A registered coroutine had started but was not suspended in a wait.
++    NotSuspended(u64),
++    /// The thread spawner failed.
++    Spawn(std::io::Error),
++}
++
++impl fmt::Display for FreezeError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Timeout {
++                active,
++                host_loops,
++                coroutines,
++            } => write!(
++                f,
++                "guest did not reach quiescence: {active} active, {host_loops} host loops alive, {coroutines} coroutines"
++            ),
++            Self::NotSuspended(id) => write!(f, "coroutine {id} is not suspended in a wait"),
++            Self::Spawn(err) => write!(f, "failed to spawn a resurrection thread: {err}"),
++        }
++    }
++}
++
++impl std::error::Error for FreezeError {}
++
++/// With the gate closed, waits until no host loop is active, then makes every
++/// host loop end its thread; returns once none is alive. Every registered
++/// coroutine is then suspended in a wait (or not started) with its state in
++/// memory alone.
++pub fn drain(timeout: Duration) -> Result<Quiescence, FreezeError> {
++    let deadline = Instant::now() + timeout;
++    let timeout_error = || FreezeError::Timeout {
++        active: active(),
++        host_loops: host_loops(),
++        coroutines: coroutines(),
++    };
++    while active() != 0 {
++        if Instant::now() >= deadline {
++            return Err(timeout_error());
++        }
++        std::thread::sleep(Duration::from_micros(20));
++    }
++    loop {
++        for entry in registry().iter() {
++            // SAFETY: entries are valid while in the registry, and we hold its
++            // lock; `unpark` takes `&self` and its own mutex.
++            unsafe { entry.0.as_ref() }.unpark();
++        }
++        if host_loops() == 0 {
++            break;
++        }
++        if Instant::now() >= deadline {
++            return Err(timeout_error());
++        }
++        std::thread::sleep(Duration::from_micros(20));
++    }
++    Ok(Quiescence {
++        coroutines: coroutines(),
++    })
++}
++
++/// What [`resurrect_all`] did.
++#[derive(Debug, Clone, Copy)]
++pub struct Resurrected {
++    /// Coroutines given a fresh OS thread.
++    pub threads: usize,
++}
++
++/// In a forked child of a drained process: reopens the gate and gives every
++/// registered coroutine a fresh OS thread that restores the per-thread state,
++/// re-creates the wait from its future and resumes the coroutine. `spawn`
++/// must start an OS thread running the closure.
++pub fn resurrect_all(
++    spawn: &mut dyn FnMut(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
++) -> Result<Resurrected, FreezeError> {
++    let entries: Vec<Registered> = registry().clone();
++    for entry in &entries {
++        // SAFETY: the process is drained: no loop is driving any coroutine, so a
++        // shared reference cannot alias a `&mut` from `host_loop`.
++        let coro = unsafe { entry.0.as_ref() };
++        if coro.started() && coro.pending().is_none() {
++            return Err(FreezeError::NotSuspended(coro.id()));
++        }
++    }
++    open_gate();
++    for entry in &entries {
++        let entry = *entry;
++        spawn(Box::new(move || {
++            let entry = entry;
++            let _ = lazy_per_thread_init();
++            // SAFETY: this thread is the coroutine's only driver from here on;
++            // see `host_loop`.
++            let coro = unsafe { &mut *entry.0.as_ptr() };
++            coro.restore_thread_state();
++            let pending = coro.pending();
++            host_loop(entry.0, pending);
++        }))
++        .map_err(FreezeError::Spawn)?;
++    }
++    Ok(Resurrected {
++        threads: entries.len(),
++    })
++}

@@ -1,0 +1,115 @@
+Subject: virtual-io: hand a fused wait to a suspend hook
+
+block_on is the choke point of every blocking WASIX syscall. It now wraps
+the wait in a fused future pinned on the caller's stack and offers it to
+a hook before parking. A runtime that runs guests on suspendable
+coroutines installs the hook to suspend the caller instead of parking
+its OS thread; the wait is then polled by whoever resumed the coroutine.
+Fusing matters because a forked child re-creates each wait from its
+future and may re-poll one that had already completed. Without a hook
+nothing changes.
+
+diff --git a/lib/virtual-io/src/lib.rs b/lib/virtual-io/src/lib.rs
+index ba1a981..c988c00 100644
+--- a/lib/virtual-io/src/lib.rs
++++ b/lib/virtual-io/src/lib.rs
+@@ -5,7 +5,7 @@ mod interest;
+ #[cfg(feature = "sys")]
+ mod selector;
+ pub mod waker;
+-pub use waker::block_on;
++pub use waker::{SuspendHook, block_on, set_suspend_hook};
+ 
+ pub use arc::*;
+ #[cfg(feature = "sys")]
+diff --git a/lib/virtual-io/src/waker.rs b/lib/virtual-io/src/waker.rs
+index a2c8e9a..34200db 100644
+--- a/lib/virtual-io/src/waker.rs
++++ b/lib/virtual-io/src/waker.rs
+@@ -1,22 +1,75 @@
++use std::pin::Pin;
++use std::sync::OnceLock;
+ use std::task::{Context, Poll, Waker};
+ 
+ use futures::Future;
+ 
+-pub fn block_on<'a, A>(task: impl Future<Output = A> + 'a) -> A {
+-    // Create the waker
+-    let (parker, unparker) = parking::pair();
+-    let waker = Waker::from(unparker.clone());
+-    let mut cx = Context::from_waker(&waker);
++/// Lets the caller's coroutine suspend instead of parking the OS thread.
++///
++/// The hook receives the wait as one fused future that lives on the caller's
++/// stack. It returns `true` once the future has been driven to completion by
++/// whoever resumed the coroutine, or `false`, without polling, when the
++/// caller cannot be suspended; `block_on` then parks as before.
++pub type SuspendHook = fn(Pin<&mut (dyn Future<Output = ()> + '_)>) -> bool;
++
++static SUSPEND_HOOK: OnceLock<SuspendHook> = OnceLock::new();
++
++/// Installs the suspend hook. Only the first installation takes effect.
++pub fn set_suspend_hook(hook: SuspendHook) {
++    let _ = SUSPEND_HOOK.set(hook);
++}
+ 
++/// The wait as a fused future: a suspended coroutine's wait may be re-polled
++/// after it completed (a forked child re-creates every wait from its future,
++/// and the fork can land between completion and the resume).
++struct Fused<'a, F: Future> {
++    task: Pin<&'a mut F>,
++    slot: &'a mut Option<F::Output>,
++    done: bool,
++}
++
++impl<F: Future> Future for Fused<'_, F> {
++    type Output = ();
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++        // All fields are `Unpin`, so `Fused` is too and no projection is needed.
++        let this = self.get_mut();
++        if this.done {
++            return Poll::Ready(());
++        }
++        match this.task.as_mut().poll(cx) {
++            Poll::Ready(value) => {
++                *this.slot = Some(value);
++                this.done = true;
++                Poll::Ready(())
++            }
++            Poll::Pending => Poll::Pending,
++        }
++    }
++}
++
++pub fn block_on<'a, A>(task: impl Future<Output = A> + 'a) -> A {
++    let mut slot: Option<A> = None;
+     let mut task = Box::pin(task);
+-    loop {
+-        match task.as_mut().poll(&mut cx) {
+-            Poll::Pending => {
++    {
++        let mut fused = std::pin::pin!(Fused {
++            task: task.as_mut(),
++            slot: &mut slot,
++            done: false,
++        });
++        let suspended = match SUSPEND_HOOK.get() {
++            Some(hook) => hook(fused.as_mut()),
++            None => false,
++        };
++        if !suspended {
++            // Not suspendable: park the OS thread between polls.
++            let (parker, unparker) = parking::pair();
++            let waker = Waker::from(unparker.clone());
++            let mut cx = Context::from_waker(&waker);
++            while fused.as_mut().poll(&mut cx).is_pending() {
+                 parker.park();
+             }
+-            Poll::Ready(ret) => {
+-                return ret;
+-            }
+         }
+     }
++    slot.expect("a fused future completed without an output")
+ }

@@ -28,6 +28,8 @@ pub struct HostProcess {
     child: Option<Child>,
     /// Unsolicited events received while waiting for a reply.
     events: Vec<Reply>,
+    /// Where the guest serves, once it does.
+    endpoint: Option<SocketAddr>,
 }
 
 impl HostProcess {
@@ -85,6 +87,7 @@ impl HostProcess {
             channel: ours,
             child: Some(child),
             events: Vec::new(),
+            endpoint: None,
         })
     }
 
@@ -120,10 +123,72 @@ impl HostProcess {
         let reply = self.request(Request::Start, &[], &[listener.as_raw_fd()])?;
         drop(listener);
         match reply {
-            Reply::Ready { endpoint } => endpoint
-                .parse()
-                .with_context(|| format!("bad endpoint from the host: {endpoint}")),
+            Reply::Ready { endpoint } => {
+                let endpoint = endpoint
+                    .parse()
+                    .with_context(|| format!("bad endpoint from the host: {endpoint}"))?;
+                self.endpoint = Some(endpoint);
+                Ok(endpoint)
+            }
             other => bail!("unexpected reply to start: {other:?}"),
+        }
+    }
+
+    /// Where the guest serves.
+    ///
+    /// # Errors
+    ///
+    /// Fails before `start` (or, for a clone, before it announced itself).
+    pub fn endpoint(&self) -> Result<SocketAddr> {
+        self.endpoint
+            .with_context(|| format!("host {} has no endpoint yet", self.pid))
+    }
+
+    /// Freezes the guest: terminal, the host can then only be forked or
+    /// stopped. The number of guest threads frozen.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the guest cannot reach quiescence; the host is then gone.
+    pub fn freeze(&mut self) -> Result<usize> {
+        match self.request(Request::Freeze, &[], &[])? {
+            Reply::Frozen { coroutines } => Ok(coroutines),
+            other => bail!("unexpected reply to freeze: {other:?}"),
+        }
+    }
+
+    /// Forks the frozen guest into a clone serving on a fresh loopback
+    /// socket, with its own control channel.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the host is not frozen or the clone does not come up.
+    pub fn fork(&mut self) -> Result<(Self, SocketAddr)> {
+        let (ours, theirs) = Channel::pair()?;
+        let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind a listener")?;
+        let reply = self.request(
+            Request::Fork,
+            &[],
+            &[theirs.as_raw_fd(), listener.as_raw_fd()],
+        )?;
+        drop(theirs);
+        drop(listener);
+        let Reply::Forked { pid, endpoint } = reply else {
+            bail!("unexpected reply to fork: {reply:?}");
+        };
+        let endpoint: SocketAddr = endpoint
+            .parse()
+            .with_context(|| format!("bad endpoint from the host: {endpoint}"))?;
+        let mut child = Self {
+            pid,
+            channel: ours,
+            child: None,
+            events: Vec::new(),
+            endpoint: Some(endpoint),
+        };
+        match child.reply()? {
+            Reply::Forked { .. } => Ok((child, endpoint)),
+            other => bail!("unexpected announcement from clone {pid}: {other:?}"),
         }
     }
 

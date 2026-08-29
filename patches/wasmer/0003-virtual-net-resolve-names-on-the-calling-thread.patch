@@ -1,0 +1,64 @@
+Subject: virtual-net: resolve names on the calling thread
+
+`LocalNetworking::resolve` spawned the lookup on the runtime handle
+captured at construction, which a forked child does not have. It now
+resolves synchronously through the standard library, and
+`LocalNetworking` no longer needs a runtime to be constructed.
+
+Synchronous for the same reason as the host-file patch: the lookup could
+instead be re-submitted on the child's runtime, but nothing gains from
+that.
+
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index c750260..172d3ca 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -23,7 +23,6 @@ use std::os::windows::io::AsRawSocket;
+ use std::sync::{Arc, Mutex};
+ use std::task::Poll;
+ use std::time::Duration;
+-use tokio::runtime::Handle;
+ #[allow(unused_imports, dead_code)]
+ use tracing::{debug, error, info, trace, warn};
+ use virtual_mio::{
+@@ -41,7 +40,6 @@ const LISTEN_BACKLOG: i32 = 128;
+ #[derive(Debug)]
+ pub struct LocalNetworking {
+     selector: Arc<Selector>,
+-    handle: Handle,
+     ruleset: Option<Ruleset>,
+ }
+ 
+@@ -49,7 +47,6 @@ impl LocalNetworking {
+     pub fn new() -> Self {
+         Self {
+             selector: Selector::new(),
+-            handle: Handle::current(),
+             ruleset: None,
+         }
+     }
+@@ -57,7 +54,6 @@ impl LocalNetworking {
+     pub fn with_ruleset(ruleset: Ruleset) -> Self {
+         Self {
+             selector: Selector::new(),
+-            handle: Handle::current(),
+             ruleset: Some(ruleset),
+         }
+     }
+@@ -277,11 +273,11 @@ impl VirtualNetworking for LocalNetworking {
+         } else {
+             format!("{}:{}", host, port.unwrap_or(0))
+         };
+-        let addrs = self
+-            .handle
+-            .spawn(tokio::net::lookup_host(host_to_lookup))
+-            .await
+-            .map_err(|_| NetworkError::IOError)?
++        // Resolved synchronously on the calling thread rather than as a task
++        // on the runtime handle captured at construction: a guest thread's
++        // view of the host must not depend on a runtime that a forked child
++        // no longer has.
++        let addrs = std::net::ToSocketAddrs::to_socket_addrs(&host_to_lookup)
+             .map(|a| a.map(|a| a.ip()).collect::<Vec<_>>())
+             .map_err(io_err_into_net_error)?;
+ 

@@ -2995,6 +2995,7 @@ dependencies = [
  "clap",
  "libc",
  "nix 0.29.0",
+ "rayon",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3004,6 +3005,7 @@ dependencies = [
  "virtual-mio",
  "virtual-net",
  "wasmer",
+ "wasmer-vm",
  "wasmer-wasix",
 ]
 

@@ -7,9 +7,11 @@
 //! on this thread and the child continues the same loop. The tokio runtime
 //! only serves timers and the few async tasks wasmer-wasix spawns.
 
+mod freeze;
 pub mod guest;
 pub mod net;
 pub mod protocol;
+pub mod tasks;
 
 use std::{
     net::TcpListener,
@@ -25,14 +27,19 @@ use nix::{
     sys::wait::{WaitPidFlag, WaitStatus, waitpid},
     unistd::Pid,
 };
-use wasmer_wasix::{os::task::TaskJoinHandle, runtime::task_manager::tokio::TokioTaskManager};
+use wasmer_wasix::os::task::TaskJoinHandle;
 
 use self::{
     guest::{GuestRun, GuestRuntime, exit_status},
     net::HostNetworking,
     protocol::{Channel, Frame, Reply, Request, Run},
+    tasks::HostTaskManager,
 };
 use crate::{manifest::Manifest, runtime::ReadOnlyMount};
+
+/// Coroutine stack for Wasm calls. Host imports run on it too, so it is
+/// sized for the deepest syscall path rather than for Wasm alone.
+const WASM_STACK_SIZE: usize = 16 << 20;
 
 /// How often the control loop checks the guest and reaps children.
 const TICK: Duration = Duration::from_millis(100);
@@ -52,17 +59,29 @@ pub struct HostArgs {
 /// channel fails; a guest failure is reported over the channel instead.
 pub fn run(args: &HostArgs) -> Result<()> {
     die_with_parent()?;
+    enable_suspension();
     let manifest = Manifest::load(&args.manifest)?;
     // The descriptor was inherited from the manager and is ours to close.
     let channel = Channel::from_fd(unsafe { OwnedFd::from_raw_fd(args.control_fd) });
-    let mut host = Host::new(manifest)?;
-    host.serve(&channel)
+    let host = Host::new(manifest)?;
+    host.serve(channel)
 }
 
 /// Makes the kernel kill this process when the thread that spawned it dies.
 fn die_with_parent() -> Result<()> {
     nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
         .context("failed to set the parent-death signal")
+}
+
+/// Switches the embedded runtime to suspendable coroutines: blocking waits
+/// suspend the guest's coroutine, host imports run on the coroutine stack,
+/// and timers come from the host task manager. Process-wide and
+/// irreversible; the `host` subcommand is the only one that calls it.
+fn enable_suspension() {
+    wasmer_vm::set_stack_size(WASM_STACK_SIZE);
+    virtual_mio::set_suspend_hook(wasmer_vm::try_suspend_on_block);
+    wasmer::install_suspend_thread_state_hooks();
+    wasmer_vm::suspend::enable(HostTaskManager::sleep_hook);
 }
 
 /// Where the host is in a guest's life.
@@ -74,6 +93,8 @@ enum Phase {
     Prepared,
     /// The guest is running (and, once `ready`, listening).
     Running { ready: bool },
+    /// The guest is frozen; only `fork` and `stop` are accepted.
+    Frozen,
 }
 
 /// The self-pipe the guest thread writes to when its listen completes.
@@ -115,10 +136,23 @@ impl EventPipe {
     }
 }
 
+/// What handling a request decided about the loop.
+enum Outcome {
+    /// Keep serving on the same channel.
+    Continue,
+    /// End the process.
+    Exit,
+    /// This process is now a forked child: serve on its own channel.
+    Child(Channel),
+}
+
 struct Host {
     manifest: Manifest,
-    /// Kept for its lifetime only: the host never blocks on it.
-    _tokio: tokio::runtime::Runtime,
+    /// The runtime behind the task manager. Never blocked on by the host,
+    /// never dropped: a freeze ends its threads, after which tokio's drop
+    /// would wait forever for them, and a forked child replaces it.
+    tokio: std::mem::ManuallyDrop<tokio::runtime::Runtime>,
+    tasks: HostTaskManager,
     networking: Arc<HostNetworking>,
     guests: GuestRuntime,
     events: EventPipe,
@@ -128,18 +162,11 @@ struct Host {
 
 impl Host {
     fn new(manifest: Manifest) -> Result<Self> {
-        let tokio = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("tokio")
-            .enable_all()
-            .build()
-            .context("failed to create the tokio runtime")?;
-        let tasks = Arc::new(TokioTaskManager::new(tokio.handle().clone()));
+        let tokio = freeze::build_tokio()?;
+        let tasks = HostTaskManager::new(tokio.handle().clone());
+        tasks.install_as_sleep_source();
 
         let events = EventPipe::new()?;
-        // Stock networking and stdio capture the current tokio runtime when
-        // they are constructed; build them inside one.
-        let guard = tokio.enter();
         let networking = Arc::new(HostNetworking::new(
             manifest.guest.listen_port,
             events.notifier(),
@@ -158,12 +185,12 @@ impl Host {
                     .collect()
             })
             .unwrap_or_default();
-        let guests = GuestRuntime::new(tasks, &mounts, networking.clone())?;
-        drop(guard);
+        let guests = GuestRuntime::new(tasks.clone(), &mounts, networking.clone())?;
 
         Ok(Self {
             manifest,
-            _tokio: tokio,
+            tokio: std::mem::ManuallyDrop::new(tokio),
+            tasks,
             networking,
             guests,
             events,
@@ -172,10 +199,10 @@ impl Host {
         })
     }
 
-    fn serve(&mut self, channel: &Channel) -> Result<()> {
+    fn serve(mut self, mut channel: Channel) -> Result<()> {
         loop {
-            let readable = self.wait(channel, TICK)?;
-            if self.tick(channel)? {
+            let readable = self.wait(&channel, TICK)?;
+            if self.tick(&channel)? {
                 return Ok(());
             }
             if !readable {
@@ -185,8 +212,15 @@ impl Host {
                 // The manager is gone; so is the reason to exist.
                 return Ok(());
             };
-            if self.handle(channel, frame)? {
-                return Ok(());
+            match self.handle(&channel, frame)? {
+                Outcome::Continue => {}
+                Outcome::Exit => return Ok(()),
+                Outcome::Child(own) => {
+                    // The inherited copy of the template's channel closes
+                    // here; the template keeps its own.
+                    channel = own;
+                    channel.send(&self.forked_reply(std::process::id())?, &[], &[])?;
+                }
             }
         }
     }
@@ -217,7 +251,9 @@ impl Host {
             self.phase = Phase::Running { ready: true };
             channel.send(&self.ready_reply()?, &[], &[])?;
         }
-        if let Some(status) = self.guest.as_ref().and_then(exit_status) {
+        if self.phase != Phase::Frozen
+            && let Some(status) = self.guest.as_ref().and_then(exit_status)
+        {
             channel.send(
                 &Reply::Exited {
                     run: Run::Guest,
@@ -261,18 +297,26 @@ impl Host {
         })
     }
 
-    /// Handles one request. Returns `true` when the host should end.
-    fn handle(&mut self, channel: &Channel, frame: Frame<Request>) -> Result<bool> {
+    fn forked_reply(&self, pid: u32) -> Result<Reply> {
+        Ok(Reply::Forked {
+            pid,
+            endpoint: self.networking.endpoint()?.to_string(),
+        })
+    }
+
+    /// Handles one request.
+    fn handle(&mut self, channel: &Channel, frame: Frame<Request>) -> Result<Outcome> {
         let reply = match frame.message {
             Request::Prepare => self.prepare(channel),
             Request::Start => self.start(channel, frame.fds),
             Request::Initialize => self.initialize(channel, &frame.payload),
-            Request::Freeze | Request::Fork => Err(anyhow::anyhow!("not implemented")),
-            Request::Stop => return Ok(true),
+            Request::Freeze => return self.freeze(channel),
+            Request::Fork => return self.fork(channel, frame.fds),
+            Request::Stop => return Ok(Outcome::Exit),
         };
         match reply {
             Ok(Some(reply)) => channel.send(&reply, &[], &[])?,
-            Ok(None) => return Ok(true),
+            Ok(None) => return Ok(Outcome::Exit),
             Err(error) => channel.send(
                 &Reply::Error {
                     text: format!("{error:#}"),
@@ -281,7 +325,13 @@ impl Host {
                 &[],
             )?,
         }
-        Ok(false)
+        Ok(Outcome::Continue)
+    }
+
+    /// Answers a request with `error` and keeps serving.
+    fn refuse(channel: &Channel, text: String) -> Result<Outcome> {
+        channel.send(&Reply::Error { text }, &[], &[])?;
+        Ok(Outcome::Continue)
     }
 
     fn prepare(&mut self, channel: &Channel) -> Result<Option<Reply>> {
@@ -381,6 +431,87 @@ impl Host {
                 pid: None,
             })),
             None => Ok(None),
+        }
+    }
+
+    fn freeze(&mut self, channel: &Channel) -> Result<Outcome> {
+        if self.phase != (Phase::Running { ready: true }) {
+            return Self::refuse(
+                channel,
+                "freeze is only accepted while the guest is listening".to_owned(),
+            );
+        }
+        // Terminal from here, whatever happens.
+        self.phase = Phase::Frozen;
+        match freeze::freeze(self) {
+            Ok(coroutines) => {
+                channel.send(&Reply::Frozen { coroutines }, &[], &[])?;
+                Ok(Outcome::Continue)
+            }
+            Err(error) => {
+                // A failed freeze is not recoverable.
+                channel.send(
+                    &Reply::Error {
+                        text: format!("{error:#}"),
+                    },
+                    &[],
+                    &[],
+                )?;
+                Ok(Outcome::Exit)
+            }
+        }
+    }
+
+    fn fork(&mut self, channel: &Channel, mut fds: Vec<OwnedFd>) -> Result<Outcome> {
+        if self.phase != Phase::Frozen {
+            return Self::refuse(channel, "fork is only accepted on a frozen host".to_owned());
+        }
+        if fds.len() != 2 {
+            return Self::refuse(
+                channel,
+                "fork needs two descriptors: the child's control end and its listening socket"
+                    .to_owned(),
+            );
+        }
+        let listener = fds.pop().expect("two descriptors");
+        let control = fds.pop().expect("two descriptors");
+        match freeze::fork(self, control, listener) {
+            Ok(freeze::Forked::Parent { pid, endpoint }) => {
+                channel.send(
+                    &Reply::Forked {
+                        pid,
+                        endpoint: endpoint.to_string(),
+                    },
+                    &[],
+                    &[],
+                )?;
+                Ok(Outcome::Continue)
+            }
+            Ok(freeze::Forked::Child {
+                control,
+                rebuilt: Ok(()),
+            }) => {
+                self.phase = Phase::Running { ready: true };
+                Ok(Outcome::Child(Channel::from_fd(control)))
+            }
+            Ok(freeze::Forked::Child {
+                control,
+                rebuilt: Err(error),
+            }) => {
+                // A child with nothing to serve: say so on its own channel
+                // and end.
+                Channel::from_fd(control)
+                    .send(
+                        &Reply::Error {
+                            text: format!("{error:#}"),
+                        },
+                        &[],
+                        &[],
+                    )
+                    .ok();
+                Ok(Outcome::Exit)
+            }
+            Err(error) => Self::refuse(channel, format!("{error:#}")),
         }
     }
 

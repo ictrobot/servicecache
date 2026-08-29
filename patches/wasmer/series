@@ -1,1 +1,11 @@
 0001-virtual-net-adopt-a-listening-socket.patch
+0002-virtual-fs-synchronous-positional-host-files-and-std.patch
+0003-virtual-net-resolve-names-on-the-calling-thread.patch
+0004-virtual-io-hand-a-fused-wait-to-a-suspend-hook.patch
+0005-vm-suspend-a-blocked-coroutine-instead-of-parking-it.patch
+0006-api-run-host-imports-on-the-coroutine-stack-when-sus.patch
+0007-vm-api-register-top-level-coroutines-freeze-them-and.patch
+0008-vm-suspend-memory.atomic.wait-like-a-syscall.patch
+0009-virtual-io-keep-handlers-and-sources-halt-and-rebuil.patch
+0010-wasix-expose-the-body-of-task_wasm.patch
+0011-virtual-io-virtual-net-replace-a-listener-after-a-fo.patch

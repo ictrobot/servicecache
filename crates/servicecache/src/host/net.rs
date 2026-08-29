@@ -85,6 +85,27 @@ impl HostNetworking {
         Ok(())
     }
 
+    /// In a forked child: makes the guest's listener use `listener` instead
+    /// of the socket inherited from the parent.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the guest has not bound yet or the swap fails.
+    pub fn replace_listener(&self, listener: TcpListener) -> Result<()> {
+        let adopted = self
+            .adopted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(shared) = adopted.as_ref() else {
+            bail!("the guest has not bound its listening socket");
+        };
+        shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace_std_listener(listener)
+            .context("failed to replace the guest's listening socket")
+    }
+
     /// The address of the socket the guest listens (or will listen) on.
     ///
     /// # Errors

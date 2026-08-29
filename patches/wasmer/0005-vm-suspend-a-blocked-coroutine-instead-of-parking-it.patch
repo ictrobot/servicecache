@@ -1,0 +1,598 @@
+Subject: vm: suspend a blocked coroutine instead of parking its thread
+
+The coroutine that runs a call into Wasm can yield `Blocked(future)`
+when a host wait would park the thread; `on_wasm_stack` becomes a loop
+that polls the future on the OS thread's stack and resumes the coroutine
+when it completes, propagating the wait to an enclosing coroutine if
+there is one so that no OS thread stack holds guest state. A guest
+thread that waits therefore has its whole state in memory, which is what
+freezing and forking a process rely on.
+
+Every thread-local access on the resume path goes through a function
+that is never inlined: the compiler materialises a thread-local's
+address once per function, and a coroutine resumed on another thread
+would otherwise write into the old thread's block.
+
+Nothing changes until `suspend::enable` is called: the loop runs exactly
+once per call, as before. Traps still unwind through the yielder.
+
+diff --git a/lib/vm/src/trap/mod.rs b/lib/vm/src/trap/mod.rs
+index 94cfbc5..c0e9418 100644
+--- a/lib/vm/src/trap/mod.rs
++++ b/lib/vm/src/trap/mod.rs
+@@ -1,5 +1,8 @@
+ // This file contains code from external sources.
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
++//
++// Modified for ServiceCache: adds the `suspend`
++// module and its exports.
+ 
+ //! This is the module that facilitates the usage of Traps
+ //! in Wasmer Runtime
+@@ -7,6 +10,8 @@
+ use crate::vmcontext::{VMFunctionContext, VMTrampoline};
+ use crate::{VMContext, VMFunctionBody};
+ 
++#[cfg(not(feature = "baremetal"))]
++pub mod suspend;
+ #[allow(clippy::module_inception)]
+ mod trap;
+ #[cfg(not(feature = "baremetal"))]
+@@ -15,6 +20,8 @@ mod traphandlers;
+ #[path = "traphandlers_baremetal.rs"]
+ mod traphandlers;
+ 
++#[cfg(not(feature = "baremetal"))]
++pub use suspend::{BlockedFuture, SleepHook, WasmYield, try_suspend_on_block};
+ pub use trap::{Trap, UnwindReason};
+ #[cfg(feature = "baremetal")]
+ pub use traphandlers::install_unwinder;
+diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
+new file mode 100644
+index 0000000..1bb7d27
+--- /dev/null
++++ b/lib/vm/src/trap/suspend.rs
+@@ -0,0 +1,347 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
++// Copyright (c) 2026 Ethan Jones
++
++//! Suspend-on-block for the coroutines that run Wasm.
++//!
++//! Stock Wasmer runs every call into Wasm on a corosensei coroutine and, when
++//! a host function inside that call waits for I/O, parks the OS thread from
++//! within the coroutine. With suspension enabled a wait instead *suspends* the
++//! coroutine and hands its pending future to the loop that resumed it: that
++//! loop polls the future on the OS thread's own stack, parking between polls,
++//! and resumes the coroutine once the future completes. The guest observes
++//! the same syscall semantics, but while it waits its whole state is in
++//! memory and no OS thread is committed to it.
++//!
++//! Nothing here changes behaviour until [`enable`] is called: the suspend
++//! hooks are never installed, so `try_suspend_on_block` refuses and every
++//! wait blocks its thread as before.
++//!
++//! Two rules make a coroutine resumable on a different OS thread than the one
++//! it suspended on:
++//!
++//! - The pending future lives on the coroutine's own stack and is fused, so a
++//!   process that copies the memory (a fork) can re-poll it safely even when
++//!   it had already completed.
++//! - Every thread-local access on a path that spans a suspend goes through a
++//!   `#[inline(never)]` function. The compiler materialises a thread-local's
++//!   address once per function; a function that computed it before a suspend
++//!   and reused it after a resume on another thread would write into the old
++//!   thread's block.
++
++use std::future::Future;
++use std::mem;
++use std::pin::Pin;
++use std::ptr::NonNull;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, OnceLock};
++use std::task::{Context, Poll, Wake, Waker};
++use std::time::{Duration, Instant};
++
++use corosensei::stack::DefaultStack;
++use corosensei::{Coroutine, CoroutineResult, Yielder};
++
++use super::trap::UnwindReason;
++use super::traphandlers::{
++    TrapHandlerContext, TrapHandlerFn, acquire_stack, release_stack, yielder_get, yielder_set,
++};
++
++/// What a coroutine hands back to the loop that resumed it.
++pub enum WasmYield {
++    /// Trap unwinding, the only yield stock Wasmer has.
++    Unwind(UnwindReason),
++    /// The guest is blocked in a host wait. The loop polls the future to
++    /// completion, parking between polls, and then resumes the coroutine.
++    Blocked(BlockedFuture),
++}
++
++/// A fused, `()`-returning future pinned on a suspended coroutine's stack.
++///
++/// The pointer stays valid until the coroutine is resumed: the frame holding
++/// the future cannot go away while the coroutine is suspended.
++#[derive(Clone, Copy, Debug)]
++pub struct BlockedFuture(NonNull<dyn Future<Output = ()> + 'static>);
++
++// SAFETY: the future is only ever polled by one thread at a time (the loop
++// that owns the coroutine), and the coroutine's stack is process memory, so
++// the pointer is valid from any thread.
++unsafe impl Send for BlockedFuture {}
++
++impl BlockedFuture {
++    /// Polls the future.
++    ///
++    /// # Safety
++    ///
++    /// The coroutine that owns the future must be suspended.
++    pub unsafe fn poll(self, cx: &mut Context<'_>) -> Poll<()> {
++        // SAFETY: the caller guarantees the owning coroutine is suspended, so the
++        // frame holding the future is intact, pinned on that stack, and nothing
++        // else touches it while we poll.
++        unsafe { Pin::new_unchecked(&mut *self.0.as_ptr()).poll(cx) }
++    }
++}
++
++/// A timer source: the host's sleep, used for the timeouts of waits that
++/// wasmer-vm implements itself (`memory.atomic.wait`).
++pub type SleepHook = fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>;
++
++static ENABLED: AtomicBool = AtomicBool::new(false);
++static SLEEP_HOOK: OnceLock<SleepHook> = OnceLock::new();
++
++/// Enables suspension process-wide: host imports run on the coroutine stack
++/// and blocking waits suspend the coroutine. `sleep` supplies timers for the
++/// waits wasmer-vm implements itself. Irreversible.
++pub fn enable(sleep: SleepHook) {
++    let _ = SLEEP_HOOK.set(sleep);
++    ENABLED.store(true, Ordering::SeqCst);
++}
++
++/// Whether [`enable`] has been called.
++pub fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// A timer from the host's sleep hook, if suspension is enabled.
++pub(crate) fn sleep(duration: Duration) -> Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>> {
++    SLEEP_HOOK.get().map(|hook| hook(duration))
++}
++
++/// Number of host loops currently resuming a coroutine or polling its wait.
++static ACTIVE: AtomicUsize = AtomicUsize::new(0);
++
++/// Closed: no coroutine that has already started may be resumed or polled.
++static GATE_CLOSED: AtomicBool = AtomicBool::new(false);
++
++/// Registers the caller as active unless the gate is closed and `started`.
++///
++/// With sequentially consistent ordering either this thread sees the closed
++/// gate or the closer sees the incremented count, never neither.
++fn try_enter(started: bool) -> bool {
++    ACTIVE.fetch_add(1, Ordering::SeqCst);
++    if started && GATE_CLOSED.load(Ordering::SeqCst) {
++        ACTIVE.fetch_sub(1, Ordering::SeqCst);
++        return false;
++    }
++    true
++}
++
++fn leave() {
++    ACTIVE.fetch_sub(1, Ordering::SeqCst);
++}
++
++/// A `Waker` that unparks the thread that created it.
++struct Unparker(std::thread::Thread);
++
++impl Wake for Unparker {
++    fn wake(self: Arc<Self>) {
++        self.0.unpark();
++    }
++
++    fn wake_by_ref(self: &Arc<Self>) {
++        self.0.unpark();
++    }
++}
++
++/// Polls `fut` on this thread, parking between polls, until it is ready.
++/// Every poll is registered as active, so a freeze never catches a poll in
++/// flight.
++fn wait_ready(fut: BlockedFuture) {
++    let waker = Waker::from(Arc::new(Unparker(std::thread::current())));
++    let mut cx = Context::from_waker(&waker);
++    loop {
++        try_enter(false);
++        let ready = unsafe { fut.poll(&mut cx) }.is_ready();
++        leave();
++        if ready {
++            return;
++        }
++        std::thread::park();
++    }
++}
++
++/// Suspends the calling coroutine until the host loop has polled `fut` to
++/// completion, possibly on another OS thread. Returns `false`, without
++/// polling, when suspension is disabled or the caller is not on a coroutine.
++///
++/// This is the hook virtual-io's `block_on` calls; its signature is
++/// `virtual_mio::SuspendHook`.
++pub fn try_suspend_on_block(fut: Pin<&mut (dyn Future<Output = ()> + '_)>) -> bool {
++    if !enabled() {
++        return false;
++    }
++    let Some(yielder) = yielder_get() else {
++        return false;
++    };
++    // SAFETY: only the address is taken; the future is never moved out of
++    // its pinned place.
++    let raw: *mut (dyn Future<Output = ()> + '_) = unsafe { fut.get_unchecked_mut() };
++    // SAFETY: the lifetime is erased, not extended: the future lives on this
++    // coroutine's stack, which stays intact until the coroutine is resumed,
++    // and the loop polls it only while the coroutine is suspended (see
++    // `BlockedFuture`).
++    let raw: *mut (dyn Future<Output = ()> + 'static) = unsafe { mem::transmute(raw) };
++    // SAFETY: `raw` came from a reference.
++    let blocked = BlockedFuture(unsafe { NonNull::new_unchecked(raw) });
++    // SAFETY: the yielder pointer was stored in this thread's TLS by the
++    // coroutine we are running on and stays valid while that coroutine is
++    // live; suspending from within it is the operation it exists for.
++    unsafe { yielder.as_ref().suspend(WasmYield::Blocked(blocked)) };
++    // Resumed, possibly on another thread: this thread's view of the
++    // coroutine is re-established through the non-inlined accessor.
++    yielder_set(Some(yielder));
++    true
++}
++
++/// Fuses a future so that it can be re-polled after completion, storing its
++/// output in `slot`.
++struct Fused<'a, F: Future> {
++    fut: Pin<&'a mut F>,
++    slot: &'a mut Option<F::Output>,
++    done: bool,
++}
++
++impl<F: Future> Future for Fused<'_, F> {
++    type Output = ();
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
++        // All fields are `Unpin`, so `Fused` is too and no projection is needed.
++        let this = self.get_mut();
++        if this.done {
++            return Poll::Ready(());
++        }
++        match this.fut.as_mut().poll(cx) {
++            Poll::Ready(value) => {
++                *this.slot = Some(value);
++                this.done = true;
++                Poll::Ready(())
++            }
++            Poll::Pending => Poll::Pending,
++        }
++    }
++}
++
++/// Blocks on a future the way virtual-io's `block_on` does: suspending the
++/// coroutine when possible, otherwise polling in a park loop on this thread.
++/// `deadline` only matters for the park loop; a suspended wait must carry
++/// its own timer.
++pub(crate) fn block_on<F: Future>(fut: F, deadline: Option<Instant>) -> F::Output {
++    let mut slot = None;
++    let mut fut = std::pin::pin!(fut);
++    {
++        let mut fused = std::pin::pin!(Fused {
++            fut: fut.as_mut(),
++            slot: &mut slot,
++            done: false,
++        });
++        if !try_suspend_on_block(fused.as_mut()) {
++            let waker = Waker::from(Arc::new(Unparker(std::thread::current())));
++            let mut cx = Context::from_waker(&waker);
++            while fused.as_mut().poll(&mut cx).is_pending() {
++                match deadline {
++                    Some(deadline) => std::thread::park_timeout(
++                        deadline.saturating_duration_since(Instant::now()),
++                    ),
++                    None => std::thread::park(),
++                }
++            }
++        }
++    }
++    slot.expect("a fused future completed without an output")
++}
++
++/// One coroutine and what its loop needs to resume it.
++struct GuestCoro<T> {
++    coro: Coroutine<(), WasmYield, Result<T, UnwindReason>, DefaultStack>,
++    /// The custom trap handler installed around each resume, for coroutines
++    /// that run Wasm.
++    trap_handler: Option<*const TrapHandlerFn<'static>>,
++    /// Whether a trap-handler context is installed around each resume. Only
++    /// coroutines that run Wasm need one; a host segfault on a stack without
++    /// one crashes the process as it would anywhere else.
++    with_trap_context: bool,
++    /// The wait the coroutine is suspended in, if any.
++    pending: Option<BlockedFuture>,
++}
++
++impl<T: 'static> GuestCoro<T> {
++    /// Resumes the coroutine on the calling thread, recording the wait it
++    /// suspends in.
++    fn resume_here(&mut self) -> CoroutineResult<WasmYield, Result<T, UnwindReason>> {
++        self.pending = None;
++        let result = if self.with_trap_context {
++            let coro_trap_handler = self.coro.trap_handler();
++            TrapHandlerContext::install(self.trap_handler, coro_trap_handler, || {
++                self.coro.resume(())
++            })
++        } else {
++            self.coro.resume(())
++        };
++        if let CoroutineResult::Yield(WasmYield::Blocked(fut)) = &result {
++            self.pending = Some(*fut);
++        }
++        result
++    }
++}
++
++/// Runs `f` on a fresh coroutine stack with a trap-handler context, the way
++/// stock `on_wasm_stack` did, and drives the coroutine through its waits.
++///
++/// A wait is handled by whoever resumed this coroutine: if that is another
++/// coroutine (a call from within a suspended guest thread, or a nested call
++/// through a host import), the wait is propagated outwards so that no OS
++/// thread stack holds guest state; otherwise it is polled right here.
++pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
++    stack_size: usize,
++    trap_handler: Option<*const TrapHandlerFn<'static>>,
++    f: F,
++) -> Result<T, UnwindReason> {
++    let stack = acquire_stack(stack_size);
++    let outer = yielder_get();
++
++    let coro = Coroutine::with_stack(stack, move |yielder: &Yielder<(), WasmYield>, ()| {
++        // Save the yielder to TLS so that it can be used later.
++        yielder_set(Some(yielder.into()));
++        Ok(f())
++    });
++    let mut handle = GuestCoro {
++        coro,
++        trap_handler,
++        with_trap_context: true,
++        pending: None,
++    };
++
++    // Restore the enclosing yielder however the loop ends, including by a
++    // panic propagating out of the coroutine.
++    let _restore = scopeguard::guard((), move |()| yielder_set(outer));
++
++    let result = loop {
++        let step = handle.resume_here();
++        yielder_set(outer);
++        match step {
++            CoroutineResult::Yield(WasmYield::Unwind(reason)) => {
++                // SAFETY: this came from `unwind_with`, which requires that there
++                // be only Wasm frames on the stack, so nothing on it needs `Drop`
++                // (the same contract as stock `on_wasm_stack`).
++                unsafe { handle.coro.force_reset() };
++                break Err(reason);
++            }
++            CoroutineResult::Yield(WasmYield::Blocked(fut)) => match outer {
++                Some(outer) => {
++                    // SAFETY: `outer` is the enclosing coroutine's yielder, read
++                    // from this thread's TLS before we started; that coroutine is
++                    // live because it is the one resuming us.
++                    unsafe { outer.as_ref().suspend(WasmYield::Blocked(fut)) };
++                    yielder_set(Some(outer));
++                }
++                None => wait_ready(fut),
++            },
++            CoroutineResult::Return(result) => break result,
++        }
++    };
++
++    // The loop only ends with the coroutine finished: it returned, or it
++    // unwound and was reset. Its stack goes back to the pool.
++    let GuestCoro { coro, .. } = handle;
++    debug_assert!(coro.done());
++    release_stack(coro.into_stack());
++    result
++}
+diff --git a/lib/vm/src/trap/traphandlers.rs b/lib/vm/src/trap/traphandlers.rs
+index ac6b394..9bd0213 100644
+--- a/lib/vm/src/trap/traphandlers.rs
++++ b/lib/vm/src/trap/traphandlers.rs
+@@ -1,11 +1,16 @@
+ // This file contains code from external sources.
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
++//
++// Modified for ServiceCache: the coroutine that runs
++// Wasm can suspend on a blocking host wait (see `trap/suspend.rs`); every
++// thread-local access on the resume path goes through a non-inlined function.
+ 
+ #![allow(static_mut_refs)]
+ 
+ //! WebAssembly trap handling, which is built on top of the lower-level
+ //! signalhandling mechanisms.
+ 
++use super::suspend::WasmYield;
+ use super::trap::UnwindReason;
+ use crate::Trap;
+ #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+@@ -13,9 +18,9 @@ use crate::interrupt_registry;
+ use backtrace::Backtrace;
+ use bytesize::ByteSize;
+ use core::ptr::{read, read_unaligned};
++use corosensei::Yielder;
+ use corosensei::stack::{DefaultStack, Stack};
+ use corosensei::trap::{CoroutineTrapHandler, TrapHandlerRegs};
+-use corosensei::{CoroutineResult, ScopedCoroutine, Yielder};
+ use scopeguard::defer;
+ use std::any::Any;
+ use std::cell::Cell;
+@@ -117,7 +122,11 @@ thread_local! {
+ /// Acquire a coroutine stack large enough for `min_size`. Prefers the
+ /// thread-local cache (no atomics), falls back to the global `STACK_POOL`,
+ /// then allocates a fresh stack.
+-fn acquire_stack(min_size: usize) -> DefaultStack {
++///
++/// Never inlined: it touches a thread-local from a function that may be
++/// resumed on another thread (see `trap/suspend.rs`).
++#[inline(never)]
++pub(crate) fn acquire_stack(min_size: usize) -> DefaultStack {
+     // Fast path: thread-local cache. Steady-state per-thread reuse never
+     // touches the SegQueue.
+     if let Some(stack) = TLS_STACK.with(|cache| cache.0.take()) {
+@@ -139,7 +148,10 @@ fn acquire_stack(min_size: usize) -> DefaultStack {
+ /// Release a coroutine stack. Prefers the thread-local slot if empty (no
+ /// atomics); otherwise pushes to the global `STACK_POOL` so the stack is
+ /// still reusable by other threads.
+-fn release_stack(stack: DefaultStack) {
++///
++/// Never inlined, like `acquire_stack`.
++#[inline(never)]
++pub(crate) fn release_stack(stack: DefaultStack) {
+     let displaced = TLS_STACK.with(|cache| cache.0.replace(Some(stack)));
+     if let Some(displaced) = displaced {
+         STACK_POOL.push(displaced);
+@@ -888,14 +900,33 @@ where
+ // We also do per-thread signal stack initialization on the first time
+ // TRAP_HANDLER is accessed.
+ thread_local! {
+-    static YIELDER: Cell<Option<NonNull<Yielder<(), UnwindReason>>>> = const { Cell::new(None) };
++    static YIELDER: Cell<Option<NonNull<Yielder<(), WasmYield>>>> = const { Cell::new(None) };
+     static TRAP_HANDLER: AtomicPtr<TrapHandlerContext> = const { AtomicPtr::new(ptr::null_mut()) };
+ }
+ 
++/// Reads this thread's `YIELDER`.
++///
++/// Never inlined: a coroutine may be resumed on a different OS thread than
++/// the one it suspended on, and the compiler computes a thread-local's
++/// address once per function. Every access from a function that may span a
++/// suspend goes through here so the address is recomputed on the resuming
++/// thread (see `trap/suspend.rs`).
++#[inline(never)]
++pub(crate) fn yielder_get() -> Option<NonNull<Yielder<(), WasmYield>>> {
++    YIELDER.with(|cell| cell.get())
++}
++
++/// Writes this thread's `YIELDER`. Never inlined, like `yielder_get`.
++#[inline(never)]
++pub(crate) fn yielder_set(yielder: Option<NonNull<Yielder<(), WasmYield>>>) {
++    YIELDER.with(|cell| cell.set(yielder));
++    compiler_fence(Ordering::SeqCst);
++}
++
+ /// Read-only information that is used by signal handlers to handle and recover
+ /// from traps.
+ #[allow(clippy::type_complexity)]
+-struct TrapHandlerContext {
++pub(crate) struct TrapHandlerContext {
+     inner: *const u8,
+     handle_trap: fn(
+         *const u8,
+@@ -916,7 +947,12 @@ struct TrapHandlerContextInner<T> {
+ impl TrapHandlerContext {
+     /// Runs the given function with a trap handler context. The previous
+     /// trap handler context is preserved and restored afterwards.
+-    fn install<T, R>(
++    ///
++    /// Never inlined: it accesses a thread-local before and after `f`, and
++    /// the loop that calls it may be resumed on another thread between two
++    /// calls (see `trap/suspend.rs`).
++    #[inline(never)]
++    pub(crate) fn install<T, R>(
+         custom_trap: Option<*const TrapHandlerFn<'static>>,
+         coro_trap_handler: CoroutineTrapHandler<Result<T, UnwindReason>>,
+         f: impl FnOnce() -> R,
+@@ -1054,11 +1090,10 @@ impl<T> TrapHandlerContextInner<T> {
+ 
+ unsafe fn unwind_with(reason: UnwindReason) -> ! {
+     unsafe {
+-        let yielder = YIELDER
+-            .with(|cell| cell.replace(None))
+-            .expect("not running on Wasm stack");
++        let yielder = yielder_get().expect("not running on Wasm stack");
++        yielder_set(None);
+ 
+-        yielder.as_ref().suspend(reason);
++        yielder.as_ref().suspend(WasmYield::Unwind(reason));
+ 
+         // on_wasm_stack will forcibly reset the coroutine stack after yielding.
+         unreachable!();
+@@ -1068,50 +1103,15 @@ unsafe fn unwind_with(reason: UnwindReason) -> ! {
+ /// Runs the given function on a separate stack so that its stack usage can be
+ /// bounded. Stack overflows and other traps can be caught and execution
+ /// returned to the root of the stack.
++///
++/// The coroutine may suspend on a blocking host wait and be resumed later,
++/// possibly on another OS thread; see `trap/suspend.rs`.
+ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
+     stack_size: usize,
+     trap_handler: Option<*const TrapHandlerFn<'static>>,
+     f: F,
+ ) -> Result<T, UnwindReason> {
+-    // Reuse a cached stack — TLS first (atomic-free hot path), then the
+-    // cross-thread overflow pool, then allocate fresh. Size mismatches
+-    // (e.g. after `drain_stack_pool()` + a stack-size change) are filtered
+-    // inside `acquire_stack`. `base() - limit()` is the full mmap region
+-    // (including guard page), which is always >= the requested size for
+-    // stacks allocated with that size.
+-    let stack = acquire_stack(stack_size);
+-    let mut stack = scopeguard::guard(stack, release_stack);
+-
+-    // Create a coroutine with a new stack to run the function on.
+-    let coro = ScopedCoroutine::with_stack(&mut *stack, move |yielder, ()| {
+-        // Save the yielder to TLS so that it can be used later.
+-        YIELDER.with(|cell| cell.set(Some(yielder.into())));
+-
+-        Ok(f())
+-    });
+-
+-    // Ensure that YIELDER is reset on exit even if the coroutine panics,
+-    defer! {
+-        YIELDER.with(|cell| cell.set(None));
+-    }
+-
+-    coro.scope(|mut coro_ref| {
+-        // Set up metadata for the trap handler for the duration of the coroutine
+-        // execution. This is restored to its previous value afterwards.
+-        TrapHandlerContext::install(trap_handler, coro_ref.trap_handler(), || {
+-            match coro_ref.resume(()) {
+-                CoroutineResult::Yield(trap) => {
+-                    // This came from unwind_with which requires that there be only
+-                    // Wasm code on the stack.
+-                    unsafe {
+-                        coro_ref.force_reset();
+-                    }
+-                    Err(trap)
+-                }
+-                CoroutineResult::Return(result) => result,
+-            }
+-        })
+-    })
++    super::suspend::run_wasm_call(stack_size, trap_handler, f)
+ }
+ 
+ /// When executing on the Wasm stack, temporarily switch back to the host stack
+@@ -1125,7 +1125,8 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
+ pub fn on_host_stack<F: FnOnce() -> T, T>(f: F) -> T {
+     // Reset YIEDER to None for the duration of this call to indicate that we
+     // are no longer on the Wasm stack.
+-    let yielder_ptr = YIELDER.with(|cell| cell.replace(None));
++    let yielder_ptr = yielder_get();
++    yielder_set(None);
+ 
+     // If we are already on the host stack, execute the function directly. This
+     // happens if a host function is called directly from the API.
+@@ -1136,7 +1137,7 @@ pub fn on_host_stack<F: FnOnce() -> T, T>(f: F) -> T {
+ 
+     // Restore YIELDER upon exiting normally or unwinding.
+     defer! {
+-        YIELDER.with(|cell| cell.set(yielder_ptr));
++        yielder_set(yielder_ptr);
+     }
+ 
+     // on_parent_stack requires the closure to be Send so that the Yielder

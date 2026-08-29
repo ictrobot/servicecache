@@ -1,0 +1,544 @@
+Subject: virtual-fs: synchronous, positional host files and stdio
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`host_fs::File` ran every read, write and seek as a `spawn_blocking`
+task on the runtime handle captured at construction, and the stdio
+wrappers did the same through `tokio::io`. In a forked child that
+runtime has no threads: the first guest thread to write there blocks
+forever. All of it is now done synchronously on the calling thread.
+
+Files also keep their position in process memory and use `pread` and
+`pwrite`: a forked child shares the kernel's file offset with its parent
+and siblings through the inherited open file description, and a
+seek-then-read in one process read whatever page another had moved the
+offset to. `open` accepts create without write, as Linux does.
+
+Synchronous I/O is the simplest way to keep a guest thread's I/O
+independent of a runtime that fork cannot carry across, and it fits a
+model where each guest thread is an OS thread the host owns. The
+alternative — looking the runtime handle up at call time and
+re-submitting work in flight on the child's runtime, as the host's
+fork-aware sleep does for timers — would keep every operation a round
+trip through a thread pool; it remains possible if that ever matters.
+The positional reads and writes are not a choice: clones share the
+kernel's file offset whichever thread does the reading.
+
+diff --git a/lib/virtual-fs/src/host_fs.rs b/lib/virtual-fs/src/host_fs.rs
+index c765c4d..097ff12 100644
+--- a/lib/virtual-fs/src/host_fs.rs
++++ b/lib/virtual-fs/src/host_fs.rs
+@@ -6,19 +6,25 @@ use bytes::{Buf, Bytes};
+ use futures::future::BoxFuture;
+ use std::convert::TryInto;
+ use std::fs;
+-use std::io::{self, Seek};
++use std::io;
+ use std::path::{Component, Path, PathBuf};
+ use std::pin::Pin;
+ use std::sync::Arc;
+ use std::task::{Context, Poll};
+ use std::time::{SystemTime, UNIX_EPOCH};
+-use tokio::fs as tfs;
+ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+ use tokio::runtime::Handle;
+ 
++// Every operation on a host file or on the process's standard streams is
++// performed synchronously on the calling thread. Nothing here holds a handle
++// to a runtime: a guest thread that is resumed in a forked child, where the
++// parent's runtime has no threads, must be able to complete its I/O on its
++// own. Files keep their position in process memory and use positional reads
++// and writes, because a forked child shares the kernel's file offset with its
++// parent (and with its siblings) through the inherited open file description.
++
+ #[derive(Debug, Clone)]
+ pub struct FileSystem {
+-    handle: Handle,
+     root: PathBuf,
+ }
+ 
+@@ -98,10 +104,12 @@ fn host_root_relative_target(root: &Path, target: PathBuf) -> PathBuf {
+ }
+ 
+ impl FileSystem {
+-    pub fn new(handle: Handle, root: impl Into<PathBuf>) -> Result<Self> {
++    /// The runtime handle is accepted for compatibility and not used: host
++    /// file I/O is synchronous.
++    pub fn new(_handle: Handle, root: impl Into<PathBuf>) -> Result<Self> {
+         let root = canonicalize(&root.into())?;
+ 
+-        Ok(FileSystem { handle, root })
++        Ok(FileSystem { root })
+     }
+ 
+     fn prepare_path(&self, path: &Path) -> Result<PathBuf> {
+@@ -343,7 +351,10 @@ impl crate::FileOpener for FileSystem {
+ 
+         let mut oo = fs::OpenOptions::new();
+         oo.read(conf.read())
+-            .write(conf.write())
++            // Linux accepts O_CREAT without write access (a program may probe
++            // a directory's writability by creating a file that way);
++            // `OpenOptions` would reject create-without-write with EINVAL.
++            .write(conf.write() || conf.create() || conf.create_new())
+             .create_new(conf.create_new())
+             .create(conf.create())
+             .append(append)
+@@ -351,14 +362,8 @@ impl crate::FileOpener for FileSystem {
+             .open(&path)
+             .map_err(Into::into)
+             .map(|file| {
+-                Box::new(File::new(
+-                    self.handle.clone(),
+-                    file,
+-                    path.to_owned(),
+-                    read,
+-                    write,
+-                    append,
+-                )) as Box<dyn VirtualFile + Send + Sync + 'static>
++                Box::new(File::new_sync(file, path.to_owned(), read, write, append))
++                    as Box<dyn VirtualFile + Send + Sync + 'static>
+             })
+     }
+ }
+@@ -366,10 +371,15 @@ impl crate::FileOpener for FileSystem {
+ /// A thin wrapper around `std::fs::File`
+ #[derive(Debug)]
+ pub struct File {
+-    handle: Handle,
+-    inner: tfs::File,
+     inner_std: fs::File,
+     pub host_path: PathBuf,
++    /// The file position, kept in process memory and applied with positional
++    /// reads and writes: the kernel's offset is shared with a forked parent
++    /// or sibling through the inherited open file description.
++    cursor: u64,
++    append: bool,
++    /// The result of the last `start_seek`, returned by `poll_complete`.
++    pending_seek: Option<io::Result<u64>>,
+ }
+ 
+ impl File {
+@@ -378,8 +388,21 @@ impl File {
+     const APPEND: u16 = 4;
+ 
+     /// creates a new host file from a `std::fs::File` and a path
++    ///
++    /// The runtime handle is accepted for compatibility and not used.
+     pub fn new(
+-        handle: Handle,
++        _handle: Handle,
++        file: fs::File,
++        host_path: PathBuf,
++        read: bool,
++        write: bool,
++        append: bool,
++    ) -> Self {
++        Self::new_sync(file, host_path, read, write, append)
++    }
++
++    /// creates a new host file from a `std::fs::File` and a path
++    pub fn new_sync(
+         file: fs::File,
+         host_path: PathBuf,
+         read: bool,
+@@ -400,12 +423,12 @@ impl File {
+             _flags |= Self::APPEND;
+         }
+ 
+-        let async_file = tfs::File::from_std(file.try_clone().unwrap());
+         Self {
+-            handle,
+             inner_std: file,
+-            inner: async_file,
+             host_path,
++            cursor: 0,
++            append,
++            pending_seek: None,
+         }
+     }
+ 
+@@ -468,18 +491,12 @@ impl VirtualFile for File {
+         None
+     }
+ 
+-    fn poll_read_ready(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+-        let cursor = match self.inner_std.stream_position() {
+-            Ok(a) => a,
+-            Err(err) => return Poll::Ready(Err(err)),
+-        };
+-        let end = match self.inner_std.seek(io::SeekFrom::End(0)) {
+-            Ok(a) => a,
++    fn poll_read_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
++        let end = match self.inner_std.metadata() {
++            Ok(metadata) => metadata.len(),
+             Err(err) => return Poll::Ready(Err(err)),
+         };
+-        let _ = self.inner_std.seek(io::SeekFrom::Start(cursor));
+-
+-        let remaining = end - cursor;
++        let remaining = end.saturating_sub(self.cursor);
+         Poll::Ready(Ok(remaining as usize))
+     }
+ 
+@@ -491,64 +508,103 @@ impl VirtualFile for File {
+ impl AsyncRead for File {
+     fn poll_read(
+         mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        _cx: &mut Context<'_>,
+         buf: &mut tokio::io::ReadBuf<'_>,
+     ) -> Poll<io::Result<()>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_read(cx, buf)
++        use std::os::unix::fs::FileExt;
++        let cursor = self.cursor;
++        let dst = buf.initialize_unfilled();
++        match self.inner_std.read_at(dst, cursor) {
++            Ok(n) => {
++                self.cursor += n as u64;
++                buf.advance(n);
++                Poll::Ready(Ok(()))
++            }
++            Err(err) => Poll::Ready(Err(err)),
++        }
+     }
+ }
+ 
+ impl AsyncWrite for File {
+     fn poll_write(
+         mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        _cx: &mut Context<'_>,
+         buf: &[u8],
+     ) -> Poll<io::Result<usize>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_write(cx, buf)
++        use std::os::unix::fs::FileExt;
++        if self.append {
++            // The kernel appends regardless of the offset for O_APPEND files.
++            let result = io::Write::write(&mut self.inner_std, buf);
++            if let Ok(n) = result {
++                self.cursor = self
++                    .inner_std
++                    .metadata()
++                    .map(|metadata| metadata.len())
++                    .unwrap_or(self.cursor + n as u64);
++            }
++            return Poll::Ready(result);
++        }
++        let cursor = self.cursor;
++        let result = self.inner_std.write_at(buf, cursor);
++        if let Ok(n) = result {
++            self.cursor += n as u64;
++        }
++        Poll::Ready(result)
+     }
+ 
+-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_flush(cx)
++    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(io::Write::flush(&mut self.inner_std))
+     }
+ 
+-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_shutdown(cx)
++    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(io::Write::flush(&mut self.inner_std))
+     }
+ 
+     fn poll_write_vectored(
+-        mut self: Pin<&mut Self>,
++        self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         bufs: &[io::IoSlice<'_>],
+     ) -> Poll<io::Result<usize>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_write_vectored(cx, bufs)
++        match bufs.iter().find(|buf| !buf.is_empty()) {
++            Some(buf) => self.poll_write(cx, buf),
++            None => Poll::Ready(Ok(0)),
++        }
+     }
+ 
+     fn is_write_vectored(&self) -> bool {
+-        self.inner.is_write_vectored()
++        false
+     }
+ }
+ 
+ impl AsyncSeek for File {
+     fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.start_seek(position)
++        // Only the process-private cursor moves; the kernel offset is never
++        // used.
++        let new = match position {
++            io::SeekFrom::Start(offset) => i128::from(offset),
++            io::SeekFrom::End(delta) => {
++                i128::from(self.inner_std.metadata()?.len()) + i128::from(delta)
++            }
++            io::SeekFrom::Current(delta) => i128::from(self.cursor) + i128::from(delta),
++        };
++        self.pending_seek = Some(match u64::try_from(new) {
++            Ok(cursor) => {
++                self.cursor = cursor;
++                Ok(cursor)
++            }
++            Err(_) => Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "invalid seek to a negative or overflowing position",
++            )),
++        });
++        Ok(())
+     }
+ 
+-    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_complete(cx)
++    fn poll_complete(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
++        match self.pending_seek.take() {
++            Some(result) => Poll::Ready(result),
++            None => Poll::Ready(Ok(self.cursor)),
++        }
+     }
+ }
+ 
+@@ -559,23 +615,11 @@ impl Drop for File {
+ }
+ 
+ /// A wrapper type around Stdout that implements `VirtualFile`.
+-#[derive(Debug)]
+-pub struct Stdout {
+-    handle: Handle,
+-    inner: tokio::io::Stdout,
+-}
+-#[allow(dead_code)]
+-fn default_stdout() -> tokio::io::Stdout {
+-    tokio::io::stdout()
+-}
+-impl Default for Stdout {
+-    fn default() -> Self {
+-        Self {
+-            handle: Handle::current(),
+-            inner: tokio::io::stdout(),
+-        }
+-    }
+-}
++///
++/// Writes go to the process's standard output synchronously, on the calling
++/// thread.
++#[derive(Debug, Default)]
++pub struct Stdout;
+ 
+ /// Default size for write buffers.
+ ///
+@@ -637,39 +681,31 @@ impl AsyncRead for Stdout {
+ 
+ impl AsyncWrite for Stdout {
+     fn poll_write(
+-        mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
+         buf: &[u8],
+     ) -> Poll<io::Result<usize>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_write(cx, buf)
++        Poll::Ready(io::Write::write(&mut io::stdout(), buf))
+     }
+ 
+-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_flush(cx)
++    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(io::Write::flush(&mut io::stdout()))
+     }
+ 
+-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_shutdown(cx)
++    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(io::Write::flush(&mut io::stdout()))
+     }
+ 
+     fn poll_write_vectored(
+-        mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
+         bufs: &[io::IoSlice<'_>],
+     ) -> Poll<io::Result<usize>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_write_vectored(cx, bufs)
++        Poll::Ready(io::Write::write_vectored(&mut io::stdout(), bufs))
+     }
+ 
+     fn is_write_vectored(&self) -> bool {
+-        self.inner.is_write_vectored()
++        true
+     }
+ }
+ 
+@@ -684,23 +720,11 @@ impl AsyncSeek for Stdout {
+ }
+ 
+ /// A wrapper type around Stderr that implements `VirtualFile`.
+-#[derive(Debug)]
+-pub struct Stderr {
+-    handle: Handle,
+-    inner: tokio::io::Stderr,
+-}
+-#[allow(dead_code)]
+-fn default_stderr() -> tokio::io::Stderr {
+-    tokio::io::stderr()
+-}
+-impl Default for Stderr {
+-    fn default() -> Self {
+-        Self {
+-            handle: Handle::current(),
+-            inner: tokio::io::stderr(),
+-        }
+-    }
+-}
++///
++/// Writes go to the process's standard error synchronously, on the calling
++/// thread.
++#[derive(Debug, Default)]
++pub struct Stderr;
+ 
+ impl AsyncRead for Stderr {
+     fn poll_read(
+@@ -714,39 +738,31 @@ impl AsyncRead for Stderr {
+ 
+ impl AsyncWrite for Stderr {
+     fn poll_write(
+-        mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
+         buf: &[u8],
+     ) -> Poll<io::Result<usize>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_write(cx, buf)
++        Poll::Ready(io::Write::write(&mut io::stderr(), buf))
+     }
+ 
+-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_flush(cx)
++    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(io::Write::flush(&mut io::stderr()))
+     }
+ 
+-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_shutdown(cx)
++    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(io::Write::flush(&mut io::stderr()))
+     }
+ 
+     fn poll_write_vectored(
+-        mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
+         bufs: &[io::IoSlice<'_>],
+     ) -> Poll<io::Result<usize>> {
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_write_vectored(cx, bufs)
++        Poll::Ready(io::Write::write_vectored(&mut io::stderr(), bufs))
+     }
+ 
+     fn is_write_vectored(&self) -> bool {
+-        self.inner.is_write_vectored()
++        true
+     }
+ }
+ 
+@@ -800,30 +816,25 @@ impl VirtualFile for Stderr {
+ }
+ 
+ /// A wrapper type around Stdin that implements `VirtualFile`.
++///
++/// Reads come from the process's standard input synchronously: a read that
++/// finds no buffered data blocks the calling thread until input arrives.
+ #[derive(Debug)]
+ pub struct Stdin {
+     read_buffer: Arc<std::sync::Mutex<Option<Bytes>>>,
+-    handle: Handle,
+-    inner: tokio::io::Stdin,
+-}
+-#[allow(dead_code)]
+-fn default_stdin() -> tokio::io::Stdin {
+-    tokio::io::stdin()
+ }
+ impl Default for Stdin {
+     fn default() -> Self {
+         Self {
+-            handle: Handle::current(),
+             read_buffer: Arc::new(std::sync::Mutex::new(None)),
+-            inner: tokio::io::stdin(),
+         }
+     }
+ }
+ 
+ impl AsyncRead for Stdin {
+     fn poll_read(
+-        mut self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
+         buf: &mut tokio::io::ReadBuf<'_>,
+     ) -> Poll<io::Result<()>> {
+         let max_size = buf.remaining();
+@@ -840,9 +851,14 @@ impl AsyncRead for Stdin {
+             }
+         }
+ 
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-        inner.poll_read(cx, buf)
++        let dst = buf.initialize_unfilled();
++        match io::Read::read(&mut io::stdin(), dst) {
++            Ok(n) => {
++                buf.advance(n);
++                Poll::Ready(Ok(()))
++            }
++            Err(err) => Poll::Ready(Err(err)),
++        }
+     }
+ }
+ 
+@@ -916,12 +932,9 @@ impl VirtualFile for Stdin {
+             }
+         }
+ 
+-        let _guard = Handle::try_current().map_err(|_| self.handle.enter());
+-        let inner = Pin::new(&mut self.inner);
+-
+         let mut buf = [0u8; 8192];
+         let mut read_buf = ReadBuf::new(&mut buf[..]);
+-        match inner.poll_read(cx, &mut read_buf) {
++        match Pin::new(&mut *self).poll_read(cx, &mut read_buf) {
+             Poll::Pending => Poll::Pending,
+             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+             Poll::Ready(Ok(())) => {
