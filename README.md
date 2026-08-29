@@ -18,6 +18,7 @@ ServiceCache is designed to be generic: the manager knows how to run, freeze, sn
 
 | Service    | Version |
 |------------|---------|
+| Valkey     | 9.1.1   |
 | beanstalkd | 1.13    |
 
 Each service is built from an exact upstream release plus a small patch series for WASIX.
@@ -32,5 +33,6 @@ This repository distributes patches and build scripts, not built binaries. A gue
 
 ServiceCache is an independent project. It is not affiliated with, sponsored by, or endorsed by the trademark owners noted below, or by the maintainers of the software it builds and depends on.
 
+- Valkey and the Valkey logo are trademarks of LF Projects, LLC.
 - Wasmer is a trademark of Wasmer, Inc.
 - Other names may be trademarks of their respective owners.

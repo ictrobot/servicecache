@@ -1,0 +1,12 @@
+[service]
+name = "valkey"
+version = "{version}"
+
+[guest]
+module = "valkey-server.wasm"
+args = ["--bind", "127.0.0.1", "--port", "6380", "--protected-mode", "no", "--daemonize", "no", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction", "--dir", "/data"]
+listen_port = 6380
+
+[initializer]
+module = "valkey-cli.wasm"
+args = ["-h", "{host}", "-p", "{port}", "--pipe"]

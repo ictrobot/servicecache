@@ -1,0 +1,127 @@
+diff --git a/deps/Makefile b/deps/Makefile
+index 94d9385..174580c 100644
+--- a/deps/Makefile
++++ b/deps/Makefile
+@@ -87,7 +87,13 @@ ifeq ($(uname_S),SunOS)
+ 	LUA_CFLAGS= -D__C99FEATURES__=1
+ endif
+ 
+-LUA_CFLAGS+= -Wall -DLUA_ANSI -DENABLE_CJSON_GLOBAL -DLUA_USE_MKSTEMP $(CFLAGS) -fPIC
++LUA_PIC_FLAG=-fPIC
++ifneq (,$(findstring wasm32,$(CFLAGS)))
++ifneq ($(BUILD_LUA),module)
++LUA_PIC_FLAG=
++endif
++endif
++LUA_CFLAGS+= -Wall -DLUA_ANSI -DENABLE_CJSON_GLOBAL -DLUA_USE_MKSTEMP $(CFLAGS) $(LUA_PIC_FLAG)
+ LUA_LDFLAGS+= $(LDFLAGS)
+ ifeq ($(LUA_DEBUG),yes)
+ 	LUA_CFLAGS+= -O0 -g -DLUA_USE_APICHECK
+diff --git a/src/module.c b/src/module.c
+--- a/src/module.c
++++ b/src/module.c
+@@ -98,6 +98,11 @@ static char *dlerror(void) {
+ #include <fcntl.h>
+ #include <string.h>
+ 
++#if defined(__wasm__) && STATIC_LUA
++extern int ValkeyModule_OnLoad_lua(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc);
++extern int ValkeyModule_OnUnload_lua(ValkeyModuleCtx *ctx);
++#endif
++
+ /* --------------------------------------------------------------------------
+  * Private data structures used by the modules system. Those are data
+  * structures that are never exposed to Modules, if not as void
+@@ -13575,9 +13580,17 @@ static int moduleLoadStaticSymbol(void **out, void **handle, const char *symbol_
+ int moduleLoadStatic(const char *module_name, void **module_argv, int module_argc, int is_loadex) {
+     ModuleLoadFunc onload;
+     void *handle = NULL;
++#if defined(__wasm__) && STATIC_LUA
++    if (strcmp(module_name, "lua") != 0) {
++        serverLog(LL_WARNING, "Unknown statically linked WebAssembly module: %s", module_name);
++        return C_ERR;
++    }
++    onload = (ModuleLoadFunc)ValkeyModule_OnLoad_lua;
++#else
+     if (moduleLoadStaticSymbol((void **)&onload, &handle, "ValkeyModule_OnLoad", module_name) != C_OK) {
+         return C_ERR;
+     }
++#endif
+     return moduleInitPostOnLoadResolved(onload, handle, module_name, module_argv, module_argc,
+                                         is_loadex, 1);
+ }
+@@ -13616,11 +13629,20 @@ static int moduleUnloadInternal(struct ValkeyModule *module, const char **errmsg
+     /* Give module a chance to clean up. */
+     ModuleUnLoadFunc onunload = NULL;
+     if (module->is_static_module == 1) {
++#if defined(__wasm__) && STATIC_LUA
++        if (strcmp(module->name, "lua") != 0) {
++            serverLog(LL_WARNING, "Unknown statically linked WebAssembly module: %s", module->name);
++            errno = ENOENT;
++            return C_ERR;
++        }
++        onunload = (ModuleUnLoadFunc)ValkeyModule_OnUnload_lua;
++#else
+         if (moduleLoadStaticSymbol((void **)&onunload, &module->handle, "ValkeyModule_OnUnload", module->name) != C_OK) {
+             serverLog(LL_WARNING, "Module %s OnUnload failed. Unload canceled.", module->name);
+             errno = ECANCELED;
+             return C_ERR;
+         }
++#endif
+     } else {
+         const char *onUnloadNames[] = {"ValkeyModule_OnUnload", "RedisModule_OnUnload"};
+         for (size_t i = 0; i < sizeof(onUnloadNames) / sizeof(onUnloadNames[0]); i++) {
+diff --git a/src/modules/lua/Makefile b/src/modules/lua/Makefile
+index 5754ff3..7b44871 100644
+--- a/src/modules/lua/Makefile
++++ b/src/modules/lua/Makefile
+@@ -2,6 +2,7 @@ uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
+ CLANG := $(findstring clang,$(shell sh -c '$(CC) --version | head -1'))
+ 
+ DEPS_DIR=../../../deps
++LUA_PIC_FLAG=-fPIC
+ 
+ ifeq ($(BUILD_LUA),module)
+ 	STATIC_LUA_FLAG=-DSTATIC_LUA=0
+@@ -16,11 +17,22 @@ else
+ 	override OPTIMIZATION:=$(subst -flto,,$(subst -ffat-lto-objects,,$(subst -flto=auto,,$(OPTIMIZATION))))
+ endif
+ 
++# WASIX clang crashes while lowering the hundreds of __common__ module API
++# pointer declarations emitted into every Lua translation unit.  A static
++# module only needs one set of definitions, so engine_lua.c provides them and
++# the remaining objects use ordinary extern declarations.
++ifneq (,$(findstring wasm32,$(CFLAGS)))
++ifneq ($(BUILD_LUA),module)
++	LUA_PIC_FLAG=
++	LUA_WASM_API_FLAGS=-DVALKEYMODULE_API=extern -DVALKEYMODULE_ATTR_COMMON=
++endif
++endif
++
+ ifeq ($(uname_S),Darwin)
+-	SHOBJ_CFLAGS= -I. -I$(DEPS_DIR)/lua/src -I$(DEPS_DIR)/fpconv -fPIC -W -Wall -dynamic -fno-common $(OPTIMIZATION) -std=gnu11 -D_GNU_SOURCE $(STATIC_LUA_FLAG) $(CFLAGS)
++	SHOBJ_CFLAGS= -I. -I$(DEPS_DIR)/lua/src -I$(DEPS_DIR)/fpconv $(LUA_PIC_FLAG) -W -Wall -dynamic -fno-common $(OPTIMIZATION) -std=gnu11 -D_GNU_SOURCE $(STATIC_LUA_FLAG) $(LUA_WASM_API_FLAGS) $(CFLAGS)
+ 	SHOBJ_LDFLAGS= -bundle -undefined dynamic_lookup $(LDFLAGS)
+ else
+-	SHOBJ_CFLAGS= -I. -I$(DEPS_DIR)/lua/src -I$(DEPS_DIR)/fpconv -fPIC -W -Wall -fno-common $(OPTIMIZATION) -std=gnu11 -D_GNU_SOURCE $(STATIC_LUA_FLAG) $(CFLAGS)
++	SHOBJ_CFLAGS= -I. -I$(DEPS_DIR)/lua/src -I$(DEPS_DIR)/fpconv $(LUA_PIC_FLAG) -W -Wall -fno-common $(OPTIMIZATION) -std=gnu11 -D_GNU_SOURCE $(STATIC_LUA_FLAG) $(LUA_WASM_API_FLAGS) $(CFLAGS)
+ 	SHOBJ_LDFLAGS= -shared $(LDFLAGS)
+ 
+ # Pretty-printing setup for module build
+diff --git a/src/modules/lua/engine_lua.c b/src/modules/lua/engine_lua.c
+index da96079..718d907 100644
+--- a/src/modules/lua/engine_lua.c
++++ b/src/modules/lua/engine_lua.c
+@@ -3,6 +3,12 @@
+  * All rights reserved.
+  * SPDX-License-Identifier: BSD-3-Clause
+  */
++#if defined(__wasm__) && STATIC_LUA
++/* The WASIX static build declares the module API pointers as extern in all
++ * Lua objects.  Define the single owning copy in this translation unit. */
++#undef VALKEYMODULE_API
++#define VALKEYMODULE_API
++#endif
+ #include "../../valkeymodule.h"
+ #include <lua.h>
+ #include <lauxlib.h>

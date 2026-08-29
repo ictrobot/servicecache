@@ -1,0 +1,34 @@
+diff --git a/deps/libvalkey/src/net.c b/deps/libvalkey/src/net.c
+index d35351f..2bf0e60 100644
+--- a/deps/libvalkey/src/net.c
++++ b/deps/libvalkey/src/net.c
+@@ -303,6 +303,21 @@ static int valkeyContextWaitReady(valkeyContext *c, long msec) {
+ }
+ 
+ int valkeyCheckConnectDone(valkeyContext *c, int *completed) {
++#ifdef __wasm__
++    /* WASIX returns ENOTSUP when connect() is repeated on a connected socket,
++     * so inspect the pending socket error directly. */
++    int error = 0;
++    socklen_t error_length = sizeof(error);
++    if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &error, &error_length) == -1) {
++        return VALKEY_ERR;
++    }
++    if (error == 0) {
++        *completed = 1;
++        return VALKEY_OK;
++    }
++    errno = error;
++    return VALKEY_ERR;
++#else
+     int rc = connect(c->fd, (const struct sockaddr *)c->saddr, c->addrlen);
+     if (rc == 0) {
+         *completed = 1;
+@@ -336,6 +351,7 @@ int valkeyCheckConnectDone(valkeyContext *c, int *completed) {
+     default:
+         return VALKEY_ERR;
+     }
++#endif
+ }
+ 
+ int valkeyCheckSocketError(valkeyContext *c) {
