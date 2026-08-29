@@ -31,7 +31,8 @@ make -C "$SC_SRC/src" -j"$jobs" valkey-server \
   FINAL_LDFLAGS="-pthread -O2" \
   FINAL_LIBS=-lm
 
-# libvalkey is linked by valkey-cli but is not one of its Make prerequisites.
+# libvalkey is linked by valkey-cli but is not one of its Make prerequisites,
+# so build it explicitly and remove the old binary to force the relink.
 make -C "$SC_SRC/deps" -j"$jobs" libvalkey linenoise fpconv \
   CC="$WASIXCC_DIR/bin/wasixcc" \
   AR="$WASIXCC_DIR/bin/wasixar" \
@@ -41,7 +42,8 @@ make -C "$SC_SRC/deps" -j"$jobs" libvalkey linenoise fpconv \
   CFLAGS="$wasix_cflags" \
   LDFLAGS=-pthread
 
-make -C "$SC_SRC/src" -B -j"$jobs" valkey-cli \
+rm -f "$SC_SRC/src/valkey-cli"
+make -C "$SC_SRC/src" -j"$jobs" valkey-cli \
   CC="$WASIXCC_DIR/bin/wasixcc" \
   AR="$WASIXCC_DIR/bin/wasixar" \
   RANLIB="$WASIXCC_DIR/bin/wasixranlib" \

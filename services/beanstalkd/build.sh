@@ -6,7 +6,7 @@ sc_init beanstalkd "${1:?usage: $0 version}"
 sc_clone_tag "$BEANSTALKD_TAG" "$SC_SRC"
 sc_apply_series "$SC_VERSION_DIR/patches" "$SC_SRC"
 
-make -C "$SC_SRC" clean all \
+make -C "$SC_SRC" all \
   OS=linux \
   USE_SYSTEMD=no \
   CC="$WASIXCC_DIR/bin/wasixcc" \
