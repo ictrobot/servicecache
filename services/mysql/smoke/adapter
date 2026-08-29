@@ -3,17 +3,24 @@
 
 usage: adapter recipe
        adapter check-initialized HOST PORT
+       adapter check-working HOST PORT
+       adapter diverge HOST PORT TAG
+       adapter check-diverged HOST PORT TAG
+       adapter blocking-request HOST PORT
 
 Every verb exits 0 on success and non-zero with a message on stderr
 otherwise. `recipe` prints the initializer's stdin: a table of ROWS rows
 of about 230 bytes, well over the guest's 16 MB buffer pool, so that
-reads reach the data files.
+reads reach the data files. `blocking-request` runs a request that blocks
+in the server and prints how it ended.
 """
 
 import importlib.machinery
 import importlib.util
 import os
+import subprocess
 import sys
+import time
 
 ROWS = 100_000
 
@@ -56,6 +63,16 @@ def expect(actual, expected, what):
         raise SystemExit(f"{what}: expected {expected!r}, got {actual!r}")
 
 
+def eventually(seconds, check):
+    deadline = time.monotonic() + seconds
+    while True:
+        if check():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
 def recipe():
     out = sys.stdout
     out.write("CREATE DATABASE adapter;\n")
@@ -78,6 +95,81 @@ def check_initialized(host, port):
     s.close()
 
 
+def metric(s, name):
+    return int(s.scalar(f"SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = '{name}'"))
+
+
+def status(s, name):
+    return int(s.rows(f"SHOW GLOBAL STATUS LIKE '{name}'")[0][1])
+
+
+def check_working(host, port):
+    # Commits on two connections.
+    first = Session(host, port)
+    base = int(first.scalar("SELECT COUNT(*) FROM adapter.t WHERE id >= 2000000"))
+    for i in range(2):
+        s = Session(host, port)
+        s.rows("BEGIN")
+        s.rows(f"INSERT INTO adapter.t VALUES ({2000000 + base + i}, 'commit', 'c')")
+        s.rows("COMMIT")
+        s.close()
+    expect(
+        int(first.scalar("SELECT COUNT(*) FROM adapter.t WHERE id >= 2000000")),
+        base + 2,
+        "commits from two connections",
+    )
+
+    # A timed wait fires on time.
+    started = time.monotonic()
+    first.rows("SELECT SLEEP(1)")
+    elapsed = time.monotonic() - started
+    if not 0.95 <= elapsed < 5:
+        raise SystemExit(f"SLEEP(1) took {elapsed:.2f}s")
+
+    # The page cleaner flushes dirty pages, purge keeps running, and a scan
+    # of a table larger than the buffer pool reads from the data files.
+    # The purge counters are off by default.
+    first.rows("SET GLOBAL innodb_monitor_enable = 'purge%'")
+    purge_before = metric(first, "purge_invoked")
+    reads_before = status(first, "Innodb_data_reads")
+    first.rows("UPDATE adapter.t SET v = CONCAT(v, '-u') WHERE id BETWEEN 1 AND 2000")
+    if not eventually(15, lambda: status(first, "Innodb_buffer_pool_pages_dirty") == 0):
+        raise SystemExit("dirty pages were not flushed")
+    if not eventually(15, lambda: metric(first, "purge_invoked") > purge_before):
+        raise SystemExit("purge did not run")
+    expect(first.scalar("SELECT COUNT(*) FROM adapter.t WHERE pad = 'p'"), str(ROWS), "full scan")
+    if status(first, "Innodb_data_reads") <= reads_before:
+        raise SystemExit("the scan did not read from the data files")
+    first.close()
+
+
+def diverge(host, port, tag):
+    s = Session(host, port)
+    s.rows(f"INSERT INTO adapter.t VALUES ({1000000 + int(tag)}, 'tag', 't')")
+    s.close()
+
+
+def check_diverged(host, port, tag):
+    s = Session(host, port)
+    ids = [row[0] for row in s.rows("SELECT id FROM adapter.t WHERE id >= 1000000 AND id < 2000000 ORDER BY id")]
+    expect(ids, [str(1000000 + int(tag))], f"clone {tag}'s own row")
+    s.close()
+
+
+def blocking_request(host, port):
+    result = subprocess.run(
+        [
+            "timeout", "20", sys.executable,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "mysql-probe.py"),
+            "--host", host, "--port", str(port), "SELECT SLEEP(3)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    print(f"SLEEP(3) ended with status {result.returncode}: {result.stdout.strip()!r}")
+
+
 def main(argv):
     if not argv:
         raise SystemExit(__doc__)
@@ -86,6 +178,14 @@ def main(argv):
         return recipe()
     if verb == "check-initialized":
         return check_initialized(*args)
+    if verb == "check-working":
+        return check_working(*args)
+    if verb == "diverge":
+        return diverge(*args)
+    if verb == "check-diverged":
+        return check_diverged(*args)
+    if verb == "blocking-request":
+        return blocking_request(*args)
     raise SystemExit(f"unknown verb {verb}\n{__doc__}")
 
 

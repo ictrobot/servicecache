@@ -3,13 +3,20 @@
 
 usage: adapter recipe
        adapter check-initialized HOST PORT
+       adapter check-working HOST PORT
+       adapter diverge HOST PORT TAG
+       adapter check-diverged HOST PORT TAG
+       adapter blocking-request HOST PORT
 
 Every verb exits 0 on success and non-zero with a message on stderr
-otherwise. `recipe` prints the initializer's stdin.
+otherwise. `recipe` prints the initializer's stdin. `blocking-request`
+runs a request that blocks in the server until something else happens and
+prints how it ended.
 """
 
 import socket
 import sys
+import time
 
 RECIPE = "SET adapter-recipe recipe-value\nSET adapter-counter 10\n"
 
@@ -40,14 +47,82 @@ class Client:
             return [self.reply() for _ in range(max(int(rest), 0))]
         raise SystemExit(f"unexpected reply: {line}")
 
+    def info(self, section, field):
+        for line in self.command("INFO", section).splitlines():
+            if line.startswith(field + ":"):
+                return line.split(":", 1)[1].strip()
+        return None
+
 
 def expect(actual, expected):
     if actual != expected:
         raise SystemExit(f"expected {expected!r}, got {actual!r}")
 
 
+def eventually(seconds, check):
+    deadline = time.monotonic() + seconds
+    while True:
+        if check():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
 def check_initialized(host, port):
     expect(Client(host, port, 5).command("GET", "adapter-recipe"), "recipe-value")
+
+
+def check_working(host, port):
+    # Lazy freeing runs on a background thread; the server clock runs on
+    # its timer.
+    client = Client(host, port, 10)
+    for batch in range(20):
+        pairs = []
+        for i in range(1000):
+            key = batch * 1000 + i
+            pairs += [f"adapter-fill:{key}", f"value-{key}"]
+        expect(client.command("MSET", *pairs), "OK")
+    before = int(client.info("memory", "lazyfreed_objects") or 0)
+    expect(client.command("FLUSHALL", "ASYNC"), "OK")
+
+    def freed():
+        now = int(client.info("memory", "lazyfreed_objects") or 0)
+        pending = client.info("memory", "lazyfree_pending_objects")
+        return now > before and pending == "0"
+
+    if not eventually(10, freed):
+        raise SystemExit("lazy freeing did not progress")
+    expect(client.command("DBSIZE"), "0")
+    uptime = int(client.info("server", "uptime_in_seconds"))
+    time.sleep(1.1)
+    later = int(client.info("server", "uptime_in_seconds"))
+    if later <= uptime:
+        raise SystemExit(f"the server clock stopped: {uptime} -> {later}")
+    expect(client.command("SET", "adapter-after", "ok"), "OK")
+    expect(client.command("GET", "adapter-after"), "ok")
+
+
+def diverge(host, port, tag):
+    client = Client(host, port, 5)
+    expect(client.command("SET", "adapter-tag", tag), "OK")
+    expect(client.command("INCR", "adapter-counter"), "11")
+
+
+def check_diverged(host, port, tag):
+    client = Client(host, port, 5)
+    expect(client.command("GET", "adapter-tag"), tag)
+    expect(client.command("GET", "adapter-counter"), "11")
+
+
+def blocking_request(host, port):
+    client = Client(host, port, 12)
+    try:
+        reply = client.command("BLPOP", "adapter-block", "8")
+    except (socket.timeout, OSError) as exc:
+        print(f"BLPOP ended with {exc}")
+        return
+    print(f"BLPOP ended with {reply}")
 
 
 def main(argv):
@@ -59,6 +134,14 @@ def main(argv):
         return
     if verb == "check-initialized":
         return check_initialized(*args)
+    if verb == "check-working":
+        return check_working(*args)
+    if verb == "diverge":
+        return diverge(*args)
+    if verb == "check-diverged":
+        return check_diverged(*args)
+    if verb == "blocking-request":
+        return blocking_request(*args)
     raise SystemExit(f"unknown verb {verb}\n{__doc__}")
 
 

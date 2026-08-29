@@ -10,6 +10,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 pub struct ServiceAdapter {
@@ -56,5 +57,62 @@ impl ServiceAdapter {
 
     pub fn check_initialized(&self, endpoint: SocketAddr) {
         self.run("check-initialized", &Self::endpoint_args(endpoint));
+    }
+
+    pub fn check_working(&self, endpoint: SocketAddr) {
+        self.run("check-working", &Self::endpoint_args(endpoint));
+    }
+
+    pub fn diverge(&self, endpoint: SocketAddr, tag: usize) {
+        let mut args = Self::endpoint_args(endpoint);
+        args.push(tag.to_string());
+        self.run("diverge", &args);
+    }
+
+    pub fn check_diverged(&self, endpoint: SocketAddr, tag: usize) {
+        let mut args = Self::endpoint_args(endpoint);
+        args.push(tag.to_string());
+        self.run("check-diverged", &args);
+    }
+
+    /// Starts, on another thread, a request that blocks in the guest.
+    pub fn start_blocking_request(&self, endpoint: SocketAddr) -> PendingRequest {
+        let path = self.path.clone();
+        let args = Self::endpoint_args(endpoint);
+        PendingRequest {
+            thread: std::thread::spawn(move || {
+                let output = Command::new("python3")
+                    .arg(&path)
+                    .arg("blocking-request")
+                    .args(&args)
+                    .output()
+                    .expect("run the adapter");
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            }),
+        }
+    }
+}
+
+/// A request in flight on another thread.
+pub struct PendingRequest {
+    thread: std::thread::JoinHandle<String>,
+}
+
+impl PendingRequest {
+    /// Waits for the request to end and describes how it ended.
+    pub fn finish(self, timeout: Duration) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            self.thread.is_finished(),
+            "the request in flight at the freeze never ended"
+        );
+        self.thread.join().unwrap_or_else(|_| "panicked".into())
     }
 }

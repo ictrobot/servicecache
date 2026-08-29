@@ -3,14 +3,20 @@
 
 usage: adapter recipe
        adapter check-initialized HOST PORT
+       adapter check-working HOST PORT
+       adapter diverge HOST PORT TAG
+       adapter check-diverged HOST PORT TAG
+       adapter blocking-request HOST PORT
 
 Every verb exits 0 on success and non-zero with a message on stderr
 otherwise. `recipe` prints the initializer's stdin (empty: beanstalkd has
-no initializer).
+no initializer). `blocking-request` runs a request that blocks in the
+server until something else happens and prints how it ended.
 """
 
 import socket
 import sys
+import time
 
 
 class Client:
@@ -26,6 +32,30 @@ class Client:
         self.sock.sendall((text + "\r\n").encode())
         return self.line()
 
+    def body(self, reply):
+        size = int(reply.rsplit(" ", 1)[1])
+        data = self.reader.read(size + 2)
+        return data[:size].decode()
+
+    def put(self, tube, delay, body):
+        expect(self.command(f"use {tube}"), f"USING {tube}")
+        self.sock.sendall(f"put 1024 {delay} 60 {len(body)}\r\n{body}\r\n".encode())
+        reply = self.line()
+        if not reply.startswith("INSERTED "):
+            raise SystemExit(f"put: {reply}")
+        return int(reply.split(" ")[1])
+
+    def reserve(self, tube, timeout):
+        reply = self.command(f"watch {tube}")
+        if not reply.startswith("WATCHING"):
+            raise SystemExit(f"watch: {reply}")
+        reply = self.command(f"reserve-with-timeout {timeout}")
+        if reply == "TIMED_OUT":
+            return None
+        if not reply.startswith("RESERVED "):
+            raise SystemExit(f"reserve: {reply}")
+        return int(reply.split(" ")[1]), self.body(reply)
+
 
 def expect(actual, expected):
     if actual != expected:
@@ -37,6 +67,53 @@ def check_initialized(host, port):
     expect(client.command("use default"), "USING default")
 
 
+def check_working(host, port):
+    # A delayed job needs the server's timer: it becomes ready after the
+    # delay and a waiting reserve picks it up.
+    client = Client(host, port, 10)
+    job = client.put("adapter-work", 1, "delayed")
+    started = time.monotonic()
+    reserved = client.reserve("adapter-work", 5)
+    if reserved is None:
+        raise SystemExit("the delayed job never became ready")
+    expect(reserved, (job, "delayed"))
+    elapsed = time.monotonic() - started
+    if elapsed < 0.9:
+        raise SystemExit(f"the delay did not hold: {elapsed:.2f}s")
+    expect(client.command(f"delete {job}"), "DELETED")
+    if client.reserve("adapter-work", 0) is not None:
+        raise SystemExit("a job remained after delete")
+
+
+def diverge(host, port, tag):
+    Client(host, port, 5).put(f"adapter-{tag}", 0, f"tag-{tag}")
+
+
+def check_diverged(host, port, tag):
+    client = Client(host, port, 5)
+    listing = client.body(client.command("list-tubes"))
+    tubes = [line[2:] for line in listing.splitlines() if line.startswith("- ")]
+    mine = f"adapter-{tag}"
+    if mine not in tubes:
+        raise SystemExit(f"tube {mine} missing from {tubes}")
+    foreign = [t for t in tubes if t.startswith("adapter-") and t not in (mine, "adapter-work")]
+    if foreign:
+        raise SystemExit(f"foreign tubes in clone {tag}: {foreign}")
+    reserved = client.reserve(mine, 0)
+    if reserved is None or reserved[1] != f"tag-{tag}":
+        raise SystemExit(f"clone {tag} does not hold its own job: {reserved}")
+
+
+def blocking_request(host, port):
+    client = Client(host, port, 12)
+    try:
+        reserved = client.reserve("adapter-block", 8)
+    except (socket.timeout, OSError) as exc:
+        print(f"reserve ended with {exc}")
+        return
+    print(f"reserve ended with {reserved or 'TIMED_OUT'}")
+
+
 def main(argv):
     if not argv:
         raise SystemExit(__doc__)
@@ -45,6 +122,14 @@ def main(argv):
         return
     if verb == "check-initialized":
         return check_initialized(*args)
+    if verb == "check-working":
+        return check_working(*args)
+    if verb == "diverge":
+        return diverge(*args)
+    if verb == "check-diverged":
+        return check_diverged(*args)
+    if verb == "blocking-request":
+        return blocking_request(*args)
     raise SystemExit(f"unknown verb {verb}\n{__doc__}")
 
 

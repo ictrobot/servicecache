@@ -9,7 +9,7 @@ SMOKE_SERVICE_TARGETS := $(addprefix smoke-,$(SERVICE_TARGETS))
 CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
 PURGE_SERVICE_TARGETS := $(addprefix purge-,$(SERVICE_TARGETS))
 
-.PHONY: help bootstrap setup-wasmer build test lint check services services-list smoke smoke-toolchain smoke-services
+.PHONY: help bootstrap setup-wasmer build test lint check services services-list smoke smoke-toolchain smoke-services lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS)
 
@@ -25,6 +25,10 @@ help:
 	@echo "build                           setup-wasmer, then cargo build"
 	@echo "test                            setup-wasmer, then cargo test"
 	@echo "lint                            setup-wasmer, then cargo fmt --check and cargo clippy"
+	@echo "lifecycle-tests                 freeze and fork every built service through the host (quick matrix)"
+	@echo "lifecycle-tests-long            the same with thousands of forks"
+	@echo "lifecycle-tests-release         the quick matrix on a release build, for latency figures"
+	@echo "lifecycle-tests-long-release    the long matrix on a release build"
 	@echo "services-list                   list services assembled under work/services"
 	@echo "check                           lint, test and smoke-toolchain"
 	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
@@ -55,6 +59,18 @@ lint: setup-wasmer
 	! grep -rniE 'mysql|valkey|beanstalkd' crates/servicecache
 
 check: lint test smoke-toolchain
+
+lifecycle-tests: setup-wasmer
+	SERVICECACHE_LIFECYCLE=quick cargo test --test lifecycle -- --nocapture
+
+lifecycle-tests-long: setup-wasmer
+	SERVICECACHE_LIFECYCLE=long cargo test --test lifecycle -- --nocapture
+
+lifecycle-tests-release: setup-wasmer
+	SERVICECACHE_LIFECYCLE=quick cargo test --release --test lifecycle -- --nocapture
+
+lifecycle-tests-long-release: setup-wasmer
+	SERVICECACHE_LIFECYCLE=long cargo test --release --test lifecycle -- --nocapture
 
 services-list:
 	SERVICECACHE_SERVICES_DIR=work/services cargo run -- services list
