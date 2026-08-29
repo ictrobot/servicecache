@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# export-wasmer-patches [checkout] [branch]: regenerate patches/wasmer from
+# the commits between the pinned Wasmer tag and <branch> in <checkout>
+# (default: work/wasmer-dev, branch servicecache). Each file keeps its
+# Subject and body and then the diff, like the service series: no mail
+# headers, no diffstat, no signature. The series file lists the result.
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+source "$root/toolchain/versions.sh"
+
+checkout="${1:-$root/work/wasmer-dev}"
+branch="${2:-servicecache}"
+patch_dir="$root/patches/wasmer"
+
+rm -f "$patch_dir"/*.patch
+git -C "$checkout" format-patch --keep-subject --no-signature --quiet \
+  -o "$patch_dir" "v$WASMER_VERSION..$branch"
+
+for patch in "$patch_dir"/*.patch; do
+  sed -i \
+    -e '1,/^Subject:/{/^Subject:/!d}' \
+    -e '/^---$/,/^diff --git/{/^diff --git/!d}' \
+    -e '0,/^diff --git/s//\n&/' \
+    "$patch"
+done
+
+(cd "$patch_dir" && ls -- *.patch) > "$patch_dir/series"

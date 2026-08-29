@@ -98,7 +98,13 @@ sc_apply_series() {
     return 1
   fi
 
-  local patch_name patch_path
+  # Every applied patch is recorded here with its content hash, so that a
+  # rerun recognises it even when a later patch in the series changed the
+  # same lines and the patch no longer reverse-applies on its own. The file
+  # is untracked, so resetting the checkout (git clean) forgets it too.
+  local stamp_file="$source_dir/.sc-applied"
+
+  local patch_name patch_path patch_hash
   while IFS= read -r patch_name; do
     [[ -z "$patch_name" || "$patch_name" == \#* ]] && continue
     patch_path="$patch_dir/$patch_name"
@@ -106,17 +112,23 @@ sc_apply_series() {
       sc_fail "series entry not found: $patch_path"
       return 1
     fi
+    patch_hash="$(sha256sum "$patch_path" | cut -d' ' -f1)"
 
-    if git -C "$source_dir" apply --check --whitespace=error-all \
+    if [[ -f "$stamp_file" ]] && grep -qxF "$patch_hash  $patch_name" "$stamp_file"; then
+      echo "already applied: $patch_name"
+    elif git -C "$source_dir" apply --check --whitespace=error-all \
         "$patch_path" 2>/dev/null; then
       echo "applying $patch_name"
       git -C "$source_dir" apply --whitespace=error-all "$patch_path"
+      echo "$patch_hash  $patch_name" >> "$stamp_file"
     elif git -C "$source_dir" apply --reverse --check \
         "$patch_path" 2>/dev/null; then
       echo "already applied: $patch_name"
+      echo "$patch_hash  $patch_name" >> "$stamp_file"
     else
       echo "cannot apply cleanly: $patch_name" >&2
-      echo "the checkout has partial or conflicting changes" >&2
+      echo "the checkout has partial or conflicting changes (a patch that changed after it was applied?);" >&2
+      echo "reset it to the pristine tag and rerun: make clean-wasmer or clean-service-<name>-<version>" >&2
       return 1
     fi
   done < "$series_file"

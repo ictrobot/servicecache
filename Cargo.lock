@@ -3609,8 +3609,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "virtual-fs"
 version = "0.703.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95193729e74c411513c58e0eb70d3665e40e6f5742615fb587906315bb45fa27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3639,8 +3637,6 @@ dependencies = [
 [[package]]
 name = "virtual-mio"
 version = "0.703.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30585718382ea353172f7ae0a02c2f2f6b1d2202666433f19500f3b133766ac5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3654,8 +3650,6 @@ dependencies = [
 [[package]]
 name = "virtual-net"
 version = "0.703.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d063ecae4da014075b8deb697c016a00d938c2a077f201f87b5f0cb87ad3f891"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3850,8 +3844,6 @@ dependencies = [
 [[package]]
 name = "wasmer"
 version = "7.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "730e24fca748ebcd8d3d38062f4abef3b781a15d6cd16e26335bbea2222996e4"
 dependencies = [
  "bindgen",
  "bytes",
@@ -3885,8 +3877,6 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler"
 version = "7.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28802416a0c18155f38e986a43116084ebb1e3d1a50ebb754b5e06807b80dc5e"
 dependencies = [
  "addr2line 0.27.1",
  "backtrace",
@@ -3925,8 +3915,6 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-cranelift"
 version = "7.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490c273a767edccfe834eb6150e77bdce93f4490840cd8f7424ed17dac7ab81f"
 dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
@@ -3948,8 +3936,6 @@ dependencies = [
 [[package]]
 name = "wasmer-config"
 version = "0.703.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ddd51eb4ceaa252082e0c66cb22ce4c0f3de053c7c8adaf9c76d7bc3f3186b2"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -3971,8 +3957,6 @@ dependencies = [
 [[package]]
 name = "wasmer-derive"
 version = "7.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec59bc30b8d1835682cfae450f42743f549b155917c749f2efab73c99ecc13a1"
 dependencies = [
  "proc-macro-error2",
  "proc-macro2",
@@ -3983,8 +3967,6 @@ dependencies = [
 [[package]]
 name = "wasmer-journal"
 version = "0.703.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "033ae4c33e3566e10143dfd500e39c092917910c8be78e92206b9258041aa617"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4010,8 +3992,6 @@ dependencies = [
 [[package]]
 name = "wasmer-package"
 version = "0.703.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "081cc03e6cf6e4dd52232e6e1beb8f12967224d41f1dbde10da427e9e05abc6f"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4038,8 +4018,6 @@ dependencies = [
 [[package]]
 name = "wasmer-types"
 version = "7.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84fa66a876a87f75a996c300bc0058e5027238659634a9c5d16bb173c72af81f"
 dependencies = [
  "bytecheck",
  "crc32fast",
@@ -4061,8 +4039,6 @@ dependencies = [
 [[package]]
 name = "wasmer-vm"
 version = "7.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6b98333506e6b848190e46e8f63efa0e38b675bd7ef3a16957db8aa9712bb14"
 dependencies = [
  "backtrace",
  "bytesize",
@@ -4091,8 +4067,6 @@ dependencies = [
 [[package]]
 name = "wasmer-wasix"
 version = "0.703.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edf2fc1091a105e2f0d267d287302c13c5c7f887206e27daf40de0a415029529"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4167,8 +4141,6 @@ dependencies = [
 [[package]]
 name = "wasmer-wasix-types"
 version = "0.703.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "594bc884f70c3330b2a7dd2f75158d19d682b7859f887c127e4b7e3e7352db03"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",

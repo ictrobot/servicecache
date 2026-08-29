@@ -9,8 +9,8 @@ SMOKE_SERVICE_TARGETS := $(addprefix smoke-,$(SERVICE_TARGETS))
 CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
 PURGE_SERVICE_TARGETS := $(addprefix purge-,$(SERVICE_TARGETS))
 
-.PHONY: help bootstrap build test lint check services services-list smoke smoke-toolchain smoke-services
-.PHONY: clean clean-services purge
+.PHONY: help bootstrap setup-wasmer build test lint check services services-list smoke smoke-toolchain smoke-services
+.PHONY: clean clean-services clean-wasmer purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS)
 
 help:
@@ -21,13 +21,15 @@ help:
 	@echo "smoke-toolchain                 build and run the toolchain smoke test"
 	@echo "smoke-services                  smoke-test every built service version"
 	@echo "smoke-service-<name>-<version>  build if needed, then smoke-test one service version"
-	@echo "build                           cargo build"
-	@echo "test                            cargo test"
-	@echo "lint                            cargo fmt --check and cargo clippy"
+	@echo "setup-wasmer                    check out the pinned Wasmer into work/wasmer and apply patches/wasmer"
+	@echo "build                           setup-wasmer, then cargo build"
+	@echo "test                            setup-wasmer, then cargo test"
+	@echo "lint                            setup-wasmer, then cargo fmt --check and cargo clippy"
 	@echo "services-list                   list services assembled under work/services"
 	@echo "check                           lint, test and smoke-toolchain"
 	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
 	@echo "clean-services                  remove every service's build and output; keep source checkouts"
+	@echo "clean-wasmer                    reset work/wasmer to the pristine tag so setup-wasmer re-applies the series"
 	@echo "clean-service-<name>-<version>  the same for one service version"
 	@echo "purge-service-<name>-<version>  also remove its source checkout"
 	@echo "purge                           remove work/ and target/ entirely, including the toolchain"
@@ -38,13 +40,16 @@ bootstrap:
 smoke-toolchain: bootstrap
 	toolchain/bootstrap.sh --all --check
 
-build:
+setup-wasmer:
+	scripts/setup-wasmer
+
+build: setup-wasmer
 	cargo build --workspace
 
-test:
+test: setup-wasmer
 	cargo test --workspace
 
-lint:
+lint: setup-wasmer
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	! grep -rniE 'mysql|valkey|beanstalkd' crates/servicecache
@@ -59,6 +64,9 @@ clean: clean-services
 	rm -rf work/build/toolchain-smoke
 
 clean-services: $(CLEAN_SERVICE_TARGETS)
+
+clean-wasmer:
+	git -C work/wasmer checkout --quiet -- . && git -C work/wasmer clean --quiet -fdx
 
 purge:
 	rm -rf work target
