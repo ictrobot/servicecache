@@ -122,6 +122,24 @@ sc_apply_series() {
   done < "$series_file"
 }
 
+sc_strip() {
+  if [[ $# -ne 2 ]]; then
+    sc_fail "usage: sc_strip input output.wasm"
+    return 1
+  fi
+
+  local input="$1"
+  local output="$2"
+  if [[ ! -f "$input" ]]; then
+    sc_fail "module not found: $input"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$output")"
+  "$WASIXCC_BINARYEN_LOCATION/bin/wasm-opt" --strip-debug "$input" -o "$output"
+  chmod +x "$output"
+}
+
 sc_assemble() {
   if [[ $# -lt 1 ]]; then
     sc_fail "usage: sc_assemble artifact..."

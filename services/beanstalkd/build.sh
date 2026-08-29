@@ -14,11 +14,7 @@ make -C "$SC_SRC" clean all \
   LDFLAGS="${LDFLAGS:-}" \
   LDLIBS=""
 
-mkdir -p "$SC_BUILD"
-"$WASIXCC_BINARYEN_LOCATION/bin/wasm-opt" "$SC_SRC/beanstalkd" \
-  --strip-debug \
-  -o "$SC_BUILD/beanstalkd.wasm"
-chmod +x "$SC_BUILD/beanstalkd.wasm"
+sc_strip "$SC_SRC/beanstalkd" "$SC_BUILD/beanstalkd.wasm"
 
 sc_assemble "$SC_BUILD/beanstalkd.wasm"
 sc_write_build_info
