@@ -1,0 +1,418 @@
+Subject: [PATCH 4/7] server: adapt lifecycle and networking for WASIX
+
+WASIX lacks the Unix process-control and signal-delivery behavior used by
+mysqld. Keep the server in the foreground, reject chroot/identity switching,
+use an internal atomic shutdown notification, and wake the listener out of
+its blocked poll through a pipe in its poll set: a signal handler runs under
+WASIX but does not interrupt poll(), and a loopback connection to the
+configured port is not a reliable wake, since the listener need not be
+reachable at that address and WASIX connect() reports no failure. Also avoid
+dynamic component autoloading and the unavailable ppoll signal-wakeup path.
+
+For 8.4, also guard the SIGTRAP si_code cases of the fatal signal handler
+the way upstream already guards the rarer ones: WASIX libc leaves
+TRAP_BRKPT and TRAP_TRACE undefined because WASI has no signals.
+
+diff --git a/sql/conn_handler/connection_acceptor.h b/sql/conn_handler/connection_acceptor.h
+index 4012fb1cf..88e70151e 100644
+--- a/sql/conn_handler/connection_acceptor.h
++++ b/sql/conn_handler/connection_acceptor.h
+@@ -81,5 +81,10 @@ class Connection_acceptor {
+     Close the listener.
+   */
+   void close_listener() { m_listener->close_listener(); }
++
++#if defined(__wasm__)
++  /** Wake a WASIX listener blocked in poll() during server shutdown. */
++  void wake_listener() { m_listener->wake_listener(); }
++#endif
+ };
+ #endif  // CONNECTION_ACCEPTOR_INCLUDED
+diff --git a/sql/conn_handler/socket_connection.cc b/sql/conn_handler/socket_connection.cc
+index 2463f6aab..ca6a0d5be 100644
+--- a/sql/conn_handler/socket_connection.cc
++++ b/sql/conn_handler/socket_connection.cc
+@@ -896,6 +896,15 @@ void Mysqld_socket_listener::setup_connection_events(
+ 
+   for (const auto &socket_element : socket_vector)
+     add_socket_to_listener(socket_element.m_socket);
++
++#if defined(__wasm__)
++  /*
++    The wake pipe's read end goes last in the poll set, after the sockets, so
++    that the socket entries keep their indexes.
++  */
++  if (pipe(m_wake_pipe) == 0)
++    m_poll_info.m_fds.emplace_back(pollfd{m_wake_pipe[0], POLLIN, 0});
++#endif
+ }
+ 
+ /**
+@@ -1347,7 +1356,16 @@ const Listen_socket *Mysqld_socket_listener::get_listen_socket() const {
+ }
+ 
+ Channel_info *Mysqld_socket_listener::listen_for_connection_event() {
+-#ifdef HAVE_POLL
++#if defined(__wasm__)
++  // The sockets and, after them, the wake pipe.
++  int retval = poll(&m_poll_info.m_fds[0], m_poll_info.m_fds.size(), -1);
++  if (retval > 0 && m_wake_pipe[0] >= 0 && m_poll_info.m_fds.back().revents) {
++    // Woken during shutdown: consume one wake and let the caller notice.
++    char byte;
++    (void)read(m_wake_pipe[0], &byte, 1);
++    return nullptr;
++  }
++#elif defined(HAVE_POLL)
+   int retval = poll(&m_poll_info.m_fds[0], m_socket_vector.size(), -1);
+ #else
+   m_select_info.m_read_fds = m_select_info.m_client_fds;
+@@ -1440,12 +1458,25 @@ Channel_info *Mysqld_socket_listener::listen_for_connection_event() {
+   return channel_info;
+ }
+ 
++#if defined(__wasm__)
++void Mysqld_socket_listener::wake_listener() {
++  if (m_wake_pipe[1] >= 0) (void)write(m_wake_pipe[1], "", 1);
++}
++#endif
++
+ void Mysqld_socket_listener::close_listener() {
+   for (const auto &socket_element : m_socket_vector) {
+     (void)mysql_socket_shutdown(socket_element.m_socket, SHUT_RDWR);
+     (void)mysql_socket_close(socket_element.m_socket);
+   }
+ 
++#if defined(__wasm__)
++  for (int &fd : m_wake_pipe) {
++    if (fd >= 0) (void)close(fd);
++    fd = -1;
++  }
++#endif
++
+   /*
+     In case a separate thread was spawned to handle incoming connection
+     requests on admin interface, a socket corresponding to an admin interface
+diff --git a/sql/conn_handler/socket_connection.h b/sql/conn_handler/socket_connection.h
+index f18e46c20..45a3ca09e 100644
+--- a/sql/conn_handler/socket_connection.h
++++ b/sql/conn_handler/socket_connection.h
+@@ -125,6 +125,14 @@ class Mysqld_socket_listener {
+   // Container storing listen socket and their attributes.
+   socket_vector_t m_socket_vector;
+   MYSQL_SOCKET m_admin_interface_listen_socket;
++#if defined(__wasm__)
++  /*
++    A pipe whose read end is polled with the listening sockets, so that the
++    listener can be woken from poll() without a signal: WASIX runs signal
++    handlers but does not interrupt poll() for them.
++  */
++  int m_wake_pipe[2] = {-1, -1};
++#endif
+ 
+ #ifdef HAVE_POLL
+   struct poll_info_t {
+@@ -196,6 +204,11 @@ class Mysqld_socket_listener {
+   */
+   void close_listener();
+ 
++#if defined(__wasm__)
++  /** Wake the listener out of poll() during server shutdown. */
++  void wake_listener();
++#endif
++
+   ~Mysqld_socket_listener() {
+     if (!m_socket_vector.empty()) close_listener();
+   }
+diff --git a/sql/mysqld.cc b/sql/mysqld.cc
+index e8a2b1cbd..8022be2d9 100644
+--- a/sql/mysqld.cc
++++ b/sql/mysqld.cc
+@@ -1623,6 +1623,9 @@ mysql_mutex_t LOCK_log_throttle_qni;
+ mysql_rwlock_t LOCK_sys_init_connect, LOCK_sys_init_replica;
+ mysql_rwlock_t LOCK_system_variables_hash;
+ my_thread_handle signal_thread_id;
++#if defined(__wasm__)
++std::atomic<int> wasix_pending_server_signal{0};
++#endif
+ sigset_t mysqld_signal_mask;
+ my_thread_attr_t connection_attrib;
+ mysql_mutex_t LOCK_server_started;
+@@ -2536,14 +2539,15 @@ bool signal_restart_server() {
+     return true;
+   }
+ 
+-#ifdef _WIN32
++#if defined(_WIN32)
+   if (!SetEvent(hEventRestart)) {
+     LogErr(ERROR_LEVEL, ER_SET_EVENT_FAILED, GetLastError());
+     my_error(ER_RESTART_SERVER_FAILED, MYF(0), "Internal operation failure");
+     return true;
+   }
++#elif defined(__wasm__)
++  wasix_pending_server_signal.store(SIGUSR2);
+ #else
+-
+   if (pthread_kill(signal_thread_id.thread, SIGUSR2)) {
+     DBUG_PRINT("error", ("Got error %d from pthread_kill", errno));
+     my_error(ER_RESTART_SERVER_FAILED, MYF(0), "Internal operation failure");
+@@ -2572,6 +2576,8 @@ void kill_mysql(void) {
+       CloseHandle(hEvent);
+     */
+   }
++#elif defined(__wasm__)
++  wasix_pending_server_signal.store(SIGTERM);
+ #else
+   if (pthread_kill(signal_thread_id.thread, SIGTERM)) {
+     DBUG_PRINT("error", ("Got error %d from pthread_kill",
+@@ -2620,7 +2626,11 @@ static void unireg_abort(int exit_code) {
+     // Make sure the signal thread isn't blocked when we are trying to exit.
+     server_components_initialized();
+ 
++#if defined(__wasm__)
++    wasix_pending_server_signal.store(SIGTERM);
++#else
+     pthread_kill(signal_thread_id.thread, SIGTERM);
++#endif
+     my_thread_join(&signal_thread_id, nullptr);
+   }
+   signal_thread_id.thread = null_thread_initializer;
+@@ -3103,6 +3113,18 @@ static void set_user(const char *user, const PasswdValue &user_info_arg) {
+ 
+ static void set_effective_user(const PasswdValue &user_info_arg) {
+   assert(user_info_arg.IsVoid() == false);
++#ifdef __wasm__
++  /*
++    WASIX does not expose the real/effective uid switching interfaces.  A
++    Wasmer instance already provides the process isolation boundary, and this
++    path is only used with --memlock and --user.  Fail explicitly if it is
++    requested instead of silently retaining the original identity.
++  */
++  (void)user_info_arg;
++  errno = ENOSYS;
++  LogErr(ERROR_LEVEL, ER_FAIL_SETREUID, strerror(errno));
++  unireg_abort(MYSQLD_ABORT_EXIT);
++#else
+   if (setregid((gid_t)-1, user_info_arg.pw_gid) == -1) {
+     LogErr(ERROR_LEVEL, ER_FAIL_SETREGID, strerror(errno));
+     unireg_abort(MYSQLD_ABORT_EXIT);
+@@ -3111,15 +3133,23 @@ static void set_effective_user(const PasswdValue &user_info_arg) {
+     LogErr(ERROR_LEVEL, ER_FAIL_SETREUID, strerror(errno));
+     unireg_abort(MYSQLD_ABORT_EXIT);
+   }
++#endif
+ }
+ 
+ /** Change root user if started with @c --chroot . */
+ static void set_root(const char *path) {
++#ifdef __wasm__
++  (void)path;
++  errno = ENOSYS;
++  LogErr(ERROR_LEVEL, ER_FAIL_CHROOT, strerror(errno));
++  unireg_abort(MYSQLD_ABORT_EXIT);
++#else
+   if (chroot(path) == -1) {
+     LogErr(ERROR_LEVEL, ER_FAIL_CHROOT, strerror(errno));
+     unireg_abort(MYSQLD_ABORT_EXIT);
+   }
+   my_setwd("/", MYF(0));
++#endif
+ }
+ #endif  // !_WIN32
+ 
+@@ -3845,13 +3875,19 @@ extern "C" void *signal_hand(void *arg [[maybe_unused]]) {
+   server_components_init_wait();
+   for (;;) {
+     int sig = 0;
+-    int rc;
+     bool error;
+-#ifdef __APPLE__
++#if defined(__wasm__)
++    while ((sig = wasix_pending_server_signal.exchange(0)) == 0) {
++      my_sleep(10000);
++    }
++    error = false;
++#elif defined(__APPLE__)
++    int rc;
+     while ((rc = sigwait(&set, &sig)) == EINTR) {
+     }
+     error = rc != 0;
+ #else
++    int rc;
+     siginfo_t sig_info;
+     while ((rc = sigwaitinfo(&set, &sig_info)) == -1 && errno == EINTR) {
+     }
+@@ -3873,7 +3909,7 @@ extern "C" void *signal_hand(void *arg [[maybe_unused]]) {
+     switch (sig) {
+       case SIGUSR2:
+         signal_hand_thr_exit_code = MYSQLD_RESTART_EXIT;
+-#ifndef __APPLE__  // Mac OS doesn't have sigwaitinfo.
++#if !defined(__APPLE__) && !defined(__wasm__)
+                    //  Log a note if mysqld is restarted via kill command.
+         if (sig_info.si_pid != getpid()) {
+           sql_print_information(
+@@ -3881,18 +3917,18 @@ extern "C" void *signal_hand(void *arg [[maybe_unused]]) {
+               " Restarting mysqld (Version %s)",
+               server_version);
+         }
+-#endif             // __APPLE__
++#endif
+         [[fallthrough]];
+       case SIGTERM:
+       case SIGQUIT:
+-#ifndef __APPLE__  // Mac OS doesn't have sigwaitinfo.
++#if !defined(__APPLE__) && !defined(__wasm__)
+         if (sig_info.si_pid != getpid())
+           LogErr(SYSTEM_LEVEL, ER_SERVER_SHUTDOWN_INFO, "<via user signal>",
+                  server_version, MYSQL_COMPILATION_COMMENT_SERVER);
+ #else
+         LogErr(SYSTEM_LEVEL, ER_SERVER_SHUTDOWN_INFO, "<via user signal>",
+                server_version, MYSQL_COMPILATION_COMMENT_SERVER);
+-#endif  // __APPLE__
++#endif
+         // Switch to the file log message processing.
+         query_logger.set_handlers((log_output_options != LOG_NONE) ? LOG_FILE
+                                                                    : LOG_NONE);
+@@ -3914,10 +3950,14 @@ extern "C" void *signal_hand(void *arg [[maybe_unused]]) {
+           mysql_mutex_lock(&LOCK_socket_listener_active);
+           while (socket_listener_active) {
+             DBUG_PRINT("info", ("Killing socket listener"));
++#if defined(__wasm__)
++            mysqld_socket_acceptor->wake_listener();
++#else
+             if (pthread_kill(main_thread_id, SIGALRM)) {
+               assert(false);
+               break;
+             }
++#endif
+             mysql_cond_wait(&COND_socket_listener_active,
+                             &LOCK_socket_listener_active);
+           }
+@@ -6674,6 +6714,12 @@ int init_common_variables() {
+             sizeof(system_time_zone_dst_off) - 1);
+     strmake(system_time_zone_dst_on, _tzname[1],
+             sizeof(system_time_zone_dst_on) - 1);
++#elif defined(__wasm__)
++    /* WASIX libc implements tzset(), but does not expose tzname[]. */
++    strmake(system_time_zone_dst_off, "UTC",
++            sizeof(system_time_zone_dst_off) - 1);
++    strmake(system_time_zone_dst_on, "UTC",
++            sizeof(system_time_zone_dst_on) - 1);
+ #else
+     strmake(system_time_zone_dst_off, tzname[0],
+             sizeof(system_time_zone_dst_off) - 1);
+@@ -8132,7 +8178,9 @@ static int init_server_components() {
+     plugins/components.
+   */
+   if (!is_help_or_validate_option() && !opt_initialize) {
++#if !defined(__wasm__)
+     dynamic_loader_srv->load(component_urns, NUMBER_OF_COMPONENTS);
++#endif
+     g_event_channels = Event_reference_caching_channels::create();
+   }
+   init_srv_event_tracking_handles();
+@@ -10134,7 +10182,11 @@ int mysqld_main(int argc, char **argv)
+ 
+ #ifndef _WIN32
+   //  Start signal handler thread.
++#if defined(__wasm__)
++  if (!opt_initialize) start_signal_handler();
++#else
+   start_signal_handler();
++#endif
+ #endif
+   if (authentication_policy::init(opt_authentication_policy)) {
+     /* --authentication_policy is set to invalid value */
+diff --git a/sql/mysqld_daemon.cc b/sql/mysqld_daemon.cc
+index 3d34a6391..6367da8c7 100644
+--- a/sql/mysqld_daemon.cc
++++ b/sql/mysqld_daemon.cc
+@@ -54,6 +54,11 @@ bool is_daemon_proc = false;
+ bool mysqld::runtime::is_daemon() { return is_daemon_proc; }
+ 
+ int mysqld::runtime::mysqld_daemonize() {
++#ifdef __wasm__
++  /* Wasmer is the process supervisor; WASIX does not provide fork(). */
++  errno = ENOSYS;
++  return -2;
++#else
+   int pipe_fd[2];
+   if (pipe(pipe_fd) < 0) return -2;
+ 
+@@ -127,6 +132,7 @@ int mysqld::runtime::mysqld_daemonize() {
+     close(pipe_fd[1]);
+     _exit(MYSQLD_SUCCESS_EXIT);
+   }
++#endif
+ }
+ 
+ /**
+diff --git a/sql/signal_handler.cc b/sql/signal_handler.cc
+index 82ad507fd..bec0939f9 100644
+--- a/sql/signal_handler.cc
++++ b/sql/signal_handler.cc
+@@ -198,12 +198,16 @@ static void print_extra_signal_information(int sig, siginfo_t *info) {
+     case SIGTRAP:
+       signal_name = "SIGTRAP";
+       switch (info->si_code) {
++#ifdef TRAP_BRKPT
+         case TRAP_BRKPT:
+           extra_info = "Process breakpoint";
+           break;
++#endif
++#ifdef TRAP_TRACE
+         case TRAP_TRACE:
+           extra_info = "Process trace trap";
+           break;
++#endif
+ #ifdef TRAP_BRANCH
+         case TRAP_BRANCH:
+           extra_info = "Process taken branch trap";
+diff --git a/vio/viosocket.cc b/vio/viosocket.cc
+index 5e0ec7ca8..5d52adbdb 100644
+--- a/vio/viosocket.cc
++++ b/vio/viosocket.cc
+@@ -456,7 +456,7 @@ bool vio_should_retry(Vio *vio) { return (vio_errno(vio) == SOCKET_EINTR); }
+ 
+ bool vio_was_timeout(Vio *vio) { return (vio_errno(vio) == SOCKET_ETIMEDOUT); }
+ 
+-#ifdef USE_PPOLL_IN_VIO
++#if defined(USE_PPOLL_IN_VIO) && !defined(__wasm__)
+ static void vio_wait_until_woken(Vio *vio) {
+   while (vio->poll_shutdown_flag.test_and_set()) {
+     // Wait until the vio is woken up from poll.
+@@ -491,7 +491,7 @@ int vio_shutdown(Vio *vio) {
+     assert(mysql_socket_getfd(vio->mysql_socket) >= 0);
+     if (mysql_socket_shutdown(vio->mysql_socket, SHUT_RDWR)) r = -1;
+ 
+-#ifdef USE_PPOLL_IN_VIO
++#if defined(USE_PPOLL_IN_VIO) && !defined(__wasm__)
+     assert(vio->thread_id.has_value());
+     if (vio->thread_id.value() != 0 && vio->poll_shutdown_flag.test_and_set()) {
+       // Send signal to wake up from poll.
+@@ -861,7 +861,7 @@ int vio_io_wait(Vio *vio, enum enum_vio_io_event event, int timeout) {
+   MYSQL_START_SOCKET_WAIT(locker, &state, vio->mysql_socket, PSI_SOCKET_SELECT,
+                           0);
+ 
+-#ifdef USE_PPOLL_IN_VIO
++#if defined(USE_PPOLL_IN_VIO) && !defined(__wasm__)
+   // Check if shutdown is in progress, if so return -1
+   if (vio->poll_shutdown_flag.test_and_set()) {
+     MYSQL_END_SOCKET_WAIT(locker, 0);
+@@ -882,7 +882,7 @@ int vio_io_wait(Vio *vio, enum enum_vio_io_event event, int timeout) {
+     error or timeout.
+   */
+   do {
+-#ifdef USE_PPOLL_IN_VIO
++#if defined(USE_PPOLL_IN_VIO) && !defined(__wasm__)
+     /*
+       thread_id is only set to std::nullopt or a non-zero value for servers, so
+       signal_mask is unused for client libraries. A valid value for thread_id
+@@ -898,7 +898,7 @@ int vio_io_wait(Vio *vio, enum enum_vio_io_event event, int timeout) {
+   } while (ret < 0 && vio_should_retry(vio) &&
+            (retry_count++ < vio->retry_count));
+ 
+-#ifdef USE_PPOLL_IN_VIO
++#if defined(USE_PPOLL_IN_VIO) && !defined(__wasm__)
+   vio->poll_shutdown_flag.clear();
+ #endif
+ 

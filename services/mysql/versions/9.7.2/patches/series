@@ -1,0 +1,10 @@
+0001-cmake-support-wasix-cross-builds.patch
+0003-add-wasix-platform-services.patch
+0004-adapt-server-lifecycle-and-networking.patch
+0005-adapt-innodb-to-wasix-filesystems.patch
+0006-disable-cross-process-myisam-locking.patch
+0007-build-batch-only-mysql-client.patch
+0008-cmake-define-have-unistd-h-for-bundled-zlib.patch
+0009-innodb-use-fsync-instead-of-fdatasync-under-wasmer.patch
+0010-make-64-bit-length-narrowings-explicit.patch
+0011-add-wasix-system-api.patch

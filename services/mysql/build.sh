@@ -9,6 +9,9 @@ sc_checkout "$SC_SOURCE_URL" "$MYSQL_TAG" "$SC_SRC"
 sc_apply_series "$SC_VERSION_DIR/patches" "$SC_SRC"
 sc_apply_series "$SC_VERSION_DIR/patches/protobuf" "$SC_SRC"
 sc_apply_series "$SC_VERSION_DIR/patches/libmysql" "$SC_SRC"
+if [[ -d "$SC_VERSION_DIR/patches/abseil" ]]; then
+  sc_apply_series "$SC_VERSION_DIR/patches/abseil" "$SC_SRC"
+fi
 source "$SC_SERVICE_DIR/deps.sh" "$SC_VERSION"
 
 jobs="${JOBS:-16}"
@@ -18,7 +21,7 @@ if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 # Dependencies, plugins and bundled libraries that differ between MySQL
-# release series. 8.0 downloads Boost; 8.4 bundles it.
+# release series. 8.0 downloads Boost; 8.4 and 9.x bundle it.
 case "$SC_VERSION" in
   8.0.*)
     series_options=(
@@ -29,10 +32,11 @@ case "$SC_VERSION" in
       -DWITH_LIBEVENT=bundled
     )
     ;;
-  8.4.*)
-    # 8.4 is C++20. Upstream injects -std=c++20 through its default compiler
-    # options, which this build turns off, and the compile feature MySQL sets
-    # on its convenience libraries does not reach their object libraries.
+  8.4.*|9.*)
+    # 8.4 and 9.x are C++20. Upstream injects -std=c++20 through its default
+    # compiler options, which this build turns off, and the compile feature
+    # MySQL sets on its convenience libraries does not reach their object
+    # libraries.
     series_options=(
       -DWITH_AUTHENTICATION_WEBAUTHN=OFF
       -DCMAKE_CXX_STANDARD=20

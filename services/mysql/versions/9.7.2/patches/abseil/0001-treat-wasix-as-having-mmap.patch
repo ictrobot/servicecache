@@ -1,0 +1,36 @@
+Subject: [PATCH] abseil: treat WASIX as a platform with mmap()
+
+Abseil 20250814.1 only lists Emscripten among WebAssembly targets that have
+mmap(); the 20230802.1 release bundled with MySQL 8.4 accepted any __wasm__
+target. Without ABSL_HAVE_MMAP, ABSL_LOW_LEVEL_ALLOC_MISSING is defined and
+low_level_alloc.cc, create_thread_identity.cc and per_thread_sem.cc compile
+to nothing, so absl::Mutex and the stack tracer no longer link (protoc fails
+with undefined CreateThreadIdentity, PerThreadSem and LowLevelAlloc symbols).
+
+WASIX provides mmap() through wasi-libc's emulation, and MySQL 8.4's WASIX
+build has been using Abseil's LowLevelAlloc on top of it, so add __wasi__ to
+the list.
+
+diff --git a/extra/abseil/abseil-cpp-20250814.1/absl/base/config.h b/extra/abseil/abseil-cpp-20250814.1/absl/base/config.h
+index b2557b89..d9e76d10 100644
+--- a/extra/abseil/abseil-cpp-20250814.1/absl/base/config.h
++++ b/extra/abseil/abseil-cpp-20250814.1/absl/base/config.h
+@@ -372,6 +372,8 @@ static_assert(ABSL_INTERNAL_INLINE_NAMESPACE_STR[0] != 'h' ||
+ //
+ // Checks whether the platform has an mmap(2) implementation as defined in
+ // POSIX.1-2001.
++// WASIX provides mmap() through wasi-libc's emulation; without it
++// LowLevelAlloc, and with it Mutex, would not be available.
+ #ifdef ABSL_HAVE_MMAP
+ #error ABSL_HAVE_MMAP cannot be directly set
+ #elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) ||    \
+@@ -379,7 +381,8 @@ static_assert(ABSL_INTERNAL_INLINE_NAMESPACE_STR[0] != 'h' ||
+     defined(__asmjs__) || defined(__EMSCRIPTEN__) || defined(__Fuchsia__) || \
+     defined(__sun) || defined(__myriad2__) || defined(__HAIKU__) ||          \
+     defined(__OpenBSD__) || defined(__NetBSD__) || defined(__QNX__) ||       \
+-    defined(__VXWORKS__) || defined(__hexagon__) || defined(__XTENSA__)
++    defined(__VXWORKS__) || defined(__hexagon__) || defined(__XTENSA__) ||   \
++    defined(__wasi__)
+ #define ABSL_HAVE_MMAP 1
+ #endif
+ 

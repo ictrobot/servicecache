@@ -1,0 +1,71 @@
+Subject: [PATCH] sql: make two 64-bit length narrowings explicit for wasm32
+
+MySQL no longer supports 32-bit targets, and 9.x has grown two places where
+a 64-bit length is brace-initialised into a std::size_t, which is an error
+on wasm32 (-Wc++11-narrowing).
+
+- sql/dd_sp.cc builds string_views from rapidjson::SizeType lengths, which
+  MySQL defines as std::uint64_t. A JSON string's length always fits
+  std::size_t, so the conversion is simply made explicit.
+- libs/mysql/strconv/conv/binary_basic.h passes a decoded uint64_t length
+  to Fixstr_binary_format's std::size_t constructor. A length beyond
+  std::size_t cannot fit the remaining input on such a target either, so it
+  is clamped to the maximum, which keeps the "not found" outcome of the read
+  that follows instead of silently using a truncated length.
+
+diff --git a/libs/mysql/strconv/conv/binary_basic.h b/libs/mysql/strconv/conv/binary_basic.h
+index 5a58fd1c..0aa7419d 100644
+--- a/libs/mysql/strconv/conv/binary_basic.h
++++ b/libs/mysql/strconv/conv/binary_basic.h
+@@ -27,6 +27,8 @@
+ /// @file
+ /// Experimental API header
+ 
++#include <limits>
++
+ #include "mysql/serialization/variable_length_integers.h"  // read_varlen_bytes_unsigned
+ #include "mysql/strconv/decode/parser.h"                   // Parser
+ #include "mysql/strconv/encode/string_target.h"            // Is_string_target
+@@ -141,7 +143,12 @@ inline void decode_impl(const Binary_format &format [[maybe_unused]],
+                         Parser &parser, std::string_view &out) {
+   uint64_t size{0};
+   if (parser.read(format, size) != mysql::utils::Return_status::ok) return;
+-  if (parser.read(Fixstr_binary_format{size}, out) !=
++  /* On 32-bit targets a length beyond std::size_t cannot fit the remaining
++     input either; clamping it keeps the "not found" outcome of the read
++     below instead of silently narrowing to a wrong length. */
++  std::size_t string_size = std::numeric_limits<std::size_t>::max();
++  if (size <= string_size) string_size = static_cast<std::size_t>(size);
++  if (parser.read(Fixstr_binary_format{string_size}, out) !=
+       mysql::utils::Return_status::ok)
+     return;
+ }
+diff --git a/sql/dd_sp.cc b/sql/dd_sp.cc
+index afac4f22..7fce2ee6 100644
+--- a/sql/dd_sp.cc
++++ b/sql/dd_sp.cc
+@@ -81,14 +81,20 @@ static std::vector<imported_library> get_imported_libraries(
+   if (!document.IsArray()) return {};
+   for (auto &node : document.GetArray()) {
+     if (!node.HasMember("name") || !node["name"].IsString()) continue;
+-    std::string_view name{node["name"].GetString(),
+-                          node["name"].GetStringLength()};
++    /* rapidjson::SizeType is 64 bits here; a JSON string's length always
++       fits std::size_t, but the narrowing has to be explicit for 32-bit
++       targets. */
++    std::string_view name{
++        node["name"].GetString(),
++        static_cast<std::size_t>(node["name"].GetStringLength())};
+     std::string_view alias;
+     if (node.HasMember("alias") && node["alias"].IsString())
+-      alias = {node["alias"].GetString(), node["alias"].GetStringLength()};
++      alias = {node["alias"].GetString(),
++               static_cast<std::size_t>(node["alias"].GetStringLength())};
+     std::string_view schema;
+     if (node.HasMember("schema") && node["schema"].IsString())
+-      schema = {node["schema"].GetString(), node["schema"].GetStringLength()};
++      schema = {node["schema"].GetString(),
++                static_cast<std::size_t>(node["schema"].GetStringLength())};
+ 
+     result.emplace_back(
+         imported_library{std::string{schema.data(), size_t{schema.length()}},

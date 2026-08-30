@@ -1,0 +1,8 @@
+This patch modifies the Abseil 20250814.1 sources bundled with MySQL
+for WASIX.
+
+Copyright (c) 2026 Ethan Jones
+
+It is licensed under the Apache License, Version 2.0 (see LICENSE), the same
+terms as upstream Abseil. Context lines are from upstream and remain the
+copyright of their authors under that licence.

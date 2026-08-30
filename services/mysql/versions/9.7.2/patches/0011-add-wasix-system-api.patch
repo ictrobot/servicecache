@@ -1,0 +1,75 @@
+Subject: [PATCH] mysys: add the WASIX system API implementation
+
+9.x moved the VCPU and cgroup probes into components/library_mysys, with one
+implementation per platform selected in CMake. WASIX matches none of them
+(UNIX is not set for the WASI system name), so mysqld fails to link with
+num_vcpus_using_affinity(), is_running_in_cgroup() and friends undefined.
+
+Add a WASIX implementation: no CPU affinity API, no cgroups, and the VCPU
+count from sysconf(_SC_NPROCESSORS_ONLN), which is also what the Linux
+implementation falls back to.
+
+diff --git a/components/library_mysys/CMakeLists.txt b/components/library_mysys/CMakeLists.txt
+index f3b855f0..9667326d 100644
+--- a/components/library_mysys/CMakeLists.txt
++++ b/components/library_mysys/CMakeLists.txt
+@@ -28,12 +28,16 @@ SET(MY_SYSTEM_SOURCES
+   my_system_api/my_system_api_common.cc
+ )
+ 
+-IF(UNIX)
++# WASIX has neither cgroups nor a CPU affinity API; it gets its own file.
++IF(UNIX AND NOT WASIX)
+   LIST(APPEND MY_SYSTEM_SOURCES
+     my_system_api/my_system_api_cgroup.cc)
+ ENDIF()
+ 
+-IF(LINUX)
++IF(WASIX)
++  LIST(APPEND MY_SYSTEM_SOURCES
++    my_system_api/my_system_api_wasix.cc)
++ELSEIF(LINUX)
+   LIST(APPEND MY_SYSTEM_SOURCES
+     my_system_api/my_system_api_linux.cc)
+ ELSEIF(APPLE)
+diff --git a/components/library_mysys/my_system_api/my_system_api_wasix.cc b/components/library_mysys/my_system_api/my_system_api_wasix.cc
+new file mode 100644
+index 00000000..ff542ef4
+--- /dev/null
++++ b/components/library_mysys/my_system_api/my_system_api_wasix.cc
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Copyright (c) 2026 Ethan Jones
++
++   This file is designed to work with certain software (including but not
++   limited to OpenSSL) that is licensed under separate terms, as designated
++   by the authors of MySQL in a particular file or component or in included
++   license documentation. Without limiting your rights under the GPLv2, the
++   copyright holder of this file hereby grants you an additional permission
++   to link this file, and any program or derivative work containing it, with
++   the separately licensed software that the authors of MySQL have either
++   included with the program or referenced in the documentation. */
++
++#include <cstdint>
++#include <unistd.h>  // sysconf
++
++#include "my_system_api.h"
++
++/**
++  @file components/library_mysys/my_system_api/my_system_api_wasix.cc
++  WASIX has no CPU affinity API and no cgroups. The number of VCPUs comes
++  from sysconf(), and the cgroup queries report that no limits apply.
++*/
++
++uint32_t num_vcpus_using_affinity() { return 0; }
++
++uint32_t num_vcpus_using_config() {
++  const long num_vcpus = sysconf(_SC_NPROCESSORS_ONLN);
++  return num_vcpus > 0 ? static_cast<uint32_t>(num_vcpus) : 0;
++}
++
++bool is_running_in_cgroup() { return false; }
++
++bool does_cgroup_limit_resources() { return false; }
++
++uint64_t my_cgroup_mem_limit() { return 0; }
