@@ -1,16 +1,26 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    io::{Read as _, Write as _},
+    io::{BufRead as _, IsTerminal as _, Read as _, Write as _},
+    os::fd::AsFd as _,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use nix::{
+    poll::{PollFd, PollFlags, PollTimeout, poll},
+    sys::{
+        signal::{SigSet, SigmaskHow, Signal, pthread_sigmask},
+        signalfd::{SfdFlags, SignalFd},
+    },
+};
 
 use crate::{
     cache::{self, ModuleCache},
     discovery::ServiceIndex,
+    host::protocol::{Reply, Run},
     manager::HostProcess,
     manifest::Manifest,
     runtime::Runtime,
@@ -49,6 +59,12 @@ enum Command {
         /// Without it the initializer does not run.
         #[arg(long, value_name = "FILE")]
         recipe: Option<PathBuf>,
+        /// Wait for Enter on the terminal, or SIGUSR1, then freeze the
+        /// service and fork this many clones, printing their endpoints;
+        /// each further one forks as many again. Runs until the last
+        /// clone exits.
+        #[arg(long, value_name = "N")]
+        clones: Option<std::num::NonZeroUsize>,
     },
     /// Inspect installed service packages.
     Services {
@@ -111,12 +127,21 @@ fn run_with(
             println!("serve is not implemented yet");
             Ok(())
         }
-        Command::Run { service, recipe } => {
+        Command::Run {
+            service,
+            recipe,
+            clones,
+        } => {
             let search_dirs = service_dirs(cli.services_dir, environment_dirs);
             let services = ServiceIndex::discover(&search_dirs)?;
             let manifest = find_service(&services, &service)?;
             let recipe = recipe.map(|path| read_recipe(&path)).transpose()?;
-            run_service(manifest, recipe.as_deref(), &cache_dir()?)
+            run_service(
+                manifest,
+                recipe.as_deref(),
+                &cache_dir()?,
+                clones.map(std::num::NonZeroUsize::get),
+            )
         }
         Command::Services { command } => {
             let search_dirs = service_dirs(cli.services_dir, environment_dirs);
@@ -240,7 +265,15 @@ fn read_recipe(path: &Path) -> Result<Vec<u8>> {
 
 /// Brings a service up in a host — prepare, start, the initializer when a
 /// recipe was given — prints its endpoint, and waits for the guest to exit.
-fn run_service(manifest: &Manifest, recipe: Option<&[u8]>, cache_dir: &Path) -> Result<()> {
+fn run_service(
+    manifest: &Manifest,
+    recipe: Option<&[u8]>,
+    cache_dir: &Path,
+    clones: Option<usize>,
+) -> Result<()> {
+    // Taken before anything is printed, so a SIGUSR1 sent as soon as the
+    // endpoint appears is queued rather than fatal.
+    let mut signals = clones.map(|_| fork_signal()).transpose()?;
     let manifest_path = manifest.directory().join("service.toml");
     let mut host = HostProcess::spawn(&manifest_path, cache_dir)?;
     if manifest.prepare.is_some() {
@@ -271,17 +304,148 @@ fn run_service(manifest: &Manifest, recipe: Option<&[u8]>, cache_dir: &Path) -> 
         .flush()
         .context("failed to write the endpoint")?;
     eprintln!(
-        "\n==> {} is listening on host port {} ({endpoint}; guest port {}). Ctrl-C to stop.\n",
+        "\n==> {} is listening on host port {} ({endpoint}; guest port {}). Ctrl-C to stop.",
         manifest.service.name,
         endpoint.port(),
         manifest.guest.listen_port
     );
+    if let Some(count) = clones {
+        eprintln!(
+            "==> Enter here, or `kill -USR1 {}`, freezes it and forks {count} clone{}.",
+            std::process::id(),
+            if count == 1 { "" } else { "s" }
+        );
+    }
+    eprintln!();
 
-    let status = host.wait_exit()?;
+    let status = match (clones, signals.as_mut()) {
+        (Some(count), Some(signals)) => run_with_clones(&mut host, count, signals)?,
+        _ => host.wait_exit()?,
+    };
     if status != 0 {
         bail!("{} exited with status {status}", manifest.service.name);
     }
     Ok(())
+}
+
+/// A descriptor SIGUSR1 can be read from, the signal blocked so that it
+/// goes there.
+fn fork_signal() -> Result<SignalFd> {
+    let mut mask = SigSet::empty();
+    mask.add(Signal::SIGUSR1);
+    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), None).context("failed to block SIGUSR1")?;
+    SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC).context("failed to open a signal descriptor")
+}
+
+/// Serves `template`, freezing it and forking `count` clones each time a
+/// line arrives on a terminal stdin or a signal on `signals`; the clones'
+/// endpoints go to stdout. Runs until the guest exits, or once frozen
+/// until the last clone has: the exit status, non-zero if any clone's was.
+fn run_with_clones(
+    template: &mut HostProcess,
+    count: usize,
+    signals: &mut SignalFd,
+) -> Result<i32> {
+    let stdin = std::io::stdin();
+    let mut terminal = stdin.is_terminal();
+    let mut clones: Vec<HostProcess> = Vec::new();
+    let mut frozen = false;
+    let mut clone_failed = false;
+    loop {
+        let (template_ready, signal_ready, stdin_ready) = {
+            let mut fds = vec![
+                PollFd::new(template.as_fd(), PollFlags::POLLIN),
+                PollFd::new(signals.as_fd(), PollFlags::POLLIN),
+            ];
+            if terminal {
+                fds.push(PollFd::new(stdin.as_fd(), PollFlags::POLLIN));
+            }
+            match poll(&mut fds, PollTimeout::NONE) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => return Err(error).context("poll failed"),
+            }
+            let ready = |fd: &PollFd| fd.revents().is_some_and(|events| !events.is_empty());
+            (
+                ready(&fds[0]),
+                ready(&fds[1]),
+                fds.get(2).is_some_and(ready),
+            )
+        };
+
+        if template_ready {
+            match template.read_event()? {
+                Reply::Exited {
+                    run: Run::Guest,
+                    status,
+                    ..
+                } => return Ok(status),
+                Reply::Exited {
+                    status,
+                    pid: Some(pid),
+                    ..
+                } => {
+                    clones.retain(|clone| clone.pid() != pid);
+                    clone_failed |= status != 0;
+                    eprintln!("==> clone {pid} exited with status {status}");
+                    if clones.is_empty() {
+                        eprintln!("==> every clone has exited");
+                        return Ok(i32::from(clone_failed));
+                    }
+                }
+                other => bail!("unexpected event from the template: {other:?}"),
+            }
+        }
+
+        let mut fork = false;
+        if signal_ready {
+            signals.read_signal().context("failed to read the signal")?;
+            fork = true;
+        }
+        if stdin_ready {
+            let mut line = String::new();
+            if stdin
+                .lock()
+                .read_line(&mut line)
+                .context("failed to read stdin")?
+                == 0
+            {
+                // End of input: stop watching it.
+                terminal = false;
+            } else {
+                fork = true;
+            }
+        }
+        if !fork {
+            continue;
+        }
+
+        if !frozen {
+            let started = Instant::now();
+            let threads = template.freeze()?;
+            frozen = true;
+            eprintln!(
+                "==> frozen: {threads} guest thread{} in {:.1?}",
+                if threads == 1 { "" } else { "s" },
+                started.elapsed()
+            );
+        }
+        for _ in 0..count {
+            let started = Instant::now();
+            let (clone, endpoint) = template.fork()?;
+            let elapsed = started.elapsed();
+            println!("{endpoint}");
+            std::io::stdout()
+                .flush()
+                .context("failed to write the endpoint")?;
+            eprintln!(
+                "==> clone {} is listening on host port {} ({endpoint}), forked in {elapsed:.1?}",
+                clone.pid(),
+                endpoint.port()
+            );
+            clones.push(clone);
+        }
+    }
 }
 
 fn check_services(services: &ServiceIndex, runtime: &Runtime) -> Result<()> {

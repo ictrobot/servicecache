@@ -4,7 +4,7 @@
 use std::{
     net::{SocketAddr, TcpListener},
     os::{
-        fd::{AsRawFd, IntoRawFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd},
         unix::process::CommandExt,
     },
     path::Path,
@@ -246,28 +246,39 @@ impl HostProcess {
         }
     }
 
-    /// Waits for the guest to exit; its exit status.
+    /// Reads one message the host sent unprompted: `Exited`, for the guest
+    /// or for a clone the host reaped. Blocks until one arrives; the host
+    /// can be polled first (`AsFd`).
     ///
     /// # Errors
     ///
     /// Fails on `error`, on a closed channel, or on a reply that is not an
     /// event.
+    pub fn read_event(&mut self) -> Result<Reply> {
+        let Some(Frame { message, .. }) = self.channel.recv::<Reply>()? else {
+            bail!("host {} closed its control channel", self.pid);
+        };
+        match message {
+            Reply::Error { text } => bail!("host {} refused: {text}", self.pid),
+            Reply::Exited { .. } => Ok(message),
+            other => bail!("unexpected reply from host {}: {other:?}", self.pid),
+        }
+    }
+
+    /// Waits for the guest to exit; its exit status.
+    ///
+    /// # Errors
+    ///
+    /// As `read_event`.
     pub fn wait_exit(&mut self) -> Result<i32> {
         loop {
-            let Some(Frame { message, .. }) = self.channel.recv::<Reply>()? else {
-                bail!("host {} closed its control channel", self.pid);
-            };
-            match message {
-                Reply::Error { text } => bail!("host {} refused: {text}", self.pid),
+            match self.read_event()? {
                 Reply::Exited {
                     run: Run::Guest,
                     status,
                     ..
                 } => return Ok(status),
-                Reply::Exited {
-                    run: Run::Child, ..
-                } => self.events.push(message),
-                other => bail!("unexpected reply from host {}: {other:?}", self.pid),
+                event => self.events.push(event),
             }
         }
     }
@@ -315,5 +326,11 @@ impl HostProcess {
         let Self { channel, .. } = self;
         let fd: std::os::fd::OwnedFd = channel.into();
         fd.into_raw_fd()
+    }
+}
+
+impl AsFd for HostProcess {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.channel.as_fd()
     }
 }

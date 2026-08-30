@@ -31,7 +31,7 @@ help:
 	@echo "lifecycle-tests-release         the quick matrix on a release build, for latency figures"
 	@echo "lifecycle-tests-long-release    the long matrix on a release build"
 	@echo "services-list                   list services assembled under work/services"
-	@echo "run-service-<name>-<version>    run one service through a host and print its endpoint; RECIPE=<file> feeds the initializer"
+	@echo "run-service-<name>-<version>    run one service through a host and print its endpoint; RECIPE=<file> feeds the initializer, CLONES=<n> forks clones on Enter"
 	@echo "check                           lint, test and smoke-toolchain"
 	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
 	@echo "clean-services                  remove every service's build and output; keep source checkouts"
@@ -112,7 +112,7 @@ smoke-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO
 	services/$(1)/smoke/smoke.sh $(2)
 
 run-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO | setup-wasmer
-	SERVICECACHE_SERVICES_DIR=work/services cargo run --release -- run $(1)@$(2) $$(if $$(RECIPE),--recipe $$(RECIPE))
+	SERVICECACHE_SERVICES_DIR=work/services cargo run --release -- run $(1)@$(2) $$(if $$(RECIPE),--recipe $$(RECIPE)) $$(if $$(CLONES),--clones $$(CLONES))
 
 clean-service-$(1)-$(2):
 	toolchain/clean.sh $(1) $(2)

@@ -266,6 +266,12 @@ impl Channel {
     }
 }
 
+impl AsFd for Channel {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 impl AsRawFd for Channel {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
