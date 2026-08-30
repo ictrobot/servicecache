@@ -44,6 +44,14 @@ const WASM_STACK_SIZE: usize = 16 << 20;
 /// How often the control loop checks the guest and reaps children.
 const TICK: Duration = Duration::from_millis(100);
 
+/// How long one slice of a frozen guest's zero-page scan runs: the most a
+/// fork request waits for it. Forks come first; the scan may take seconds.
+const COMPACTION_SLICE: Duration = Duration::from_millis(1);
+
+/// How long the control channel must be quiet before the next slice: a
+/// burst of requests, such as forks right after the freeze, comes first.
+const COMPACTION_PAUSE: Duration = Duration::from_millis(50);
+
 /// Arguments of the `host` subcommand.
 #[derive(Debug)]
 pub struct HostArgs {
@@ -167,6 +175,8 @@ struct Host {
     events: EventPipe,
     guest: Option<TaskJoinHandle>,
     phase: Phase,
+    /// The zero-page scan of a frozen guest, until it is done.
+    compaction: Option<freeze::Compaction>,
 }
 
 impl Host {
@@ -205,16 +215,25 @@ impl Host {
             events,
             guest: None,
             phase: Phase::Fresh,
+            compaction: None,
         })
     }
 
     fn serve(mut self, mut channel: Channel) -> Result<()> {
         loop {
-            let readable = self.wait(&channel, TICK)?;
+            // While a scan is under way, a slice runs whenever the channel
+            // has been quiet for a moment.
+            let timeout = if self.compaction.is_some() {
+                COMPACTION_PAUSE
+            } else {
+                TICK
+            };
+            let readable = self.wait(&channel, timeout)?;
             if self.tick(&channel)? {
                 return Ok(());
             }
             if !readable {
+                self.compact();
                 continue;
             }
             let Some(frame) = channel.recv::<Request>()? else {
@@ -225,12 +244,23 @@ impl Host {
                 Outcome::Continue => {}
                 Outcome::Exit => return Ok(()),
                 Outcome::Child(own) => {
+                    // The guest runs again here: no scan of its memory.
+                    self.compaction = None;
                     // The inherited copy of the template's channel closes
                     // here; the template keeps its own.
                     channel = own;
                     channel.send(&self.forked_reply(std::process::id())?, &[], &[])?;
                 }
             }
+        }
+    }
+
+    /// One slice of the frozen guest's zero-page scan, if one is under way.
+    fn compact(&mut self) {
+        if let Some(compaction) = &mut self.compaction
+            && compaction.step(COMPACTION_SLICE)
+        {
+            self.compaction = None;
         }
     }
 
@@ -473,6 +503,9 @@ impl Host {
         self.phase = Phase::Frozen;
         match freeze::freeze(self) {
             Ok(coroutines) => {
+                // The guest never runs again in this process: its memory is
+                // quiescent, which the scan requires.
+                self.compaction = Some(freeze::Compaction::start());
                 channel.send(&Reply::Frozen { coroutines }, &[], &[])?;
                 Ok(Outcome::Continue)
             }

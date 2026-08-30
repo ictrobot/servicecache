@@ -1,0 +1,167 @@
+Subject: vm: keep a registry of linear memories
+
+An embedder that owns the process, not the stores, has no way to find a
+guest's linear memory: the `Memory` handle needs its store, which lives
+on the guest's thread. Every `WasmMmap` now registers the address of its
+memory definition while it lives and `linear_memories` reads the base
+and current length from each, with whether the mapping is private and
+anonymous. Reading is unsynchronised, so the function is unsafe: it is
+for a process that has stopped every guest thread, such as a host about
+to fork a frozen guest, which drops the memory's all-zero pages first.
+
+diff --git a/lib/vm/src/lib.rs b/lib/vm/src/lib.rs
+index 52770bf..6054d8f 100644
+--- a/lib/vm/src/lib.rs
++++ b/lib/vm/src/lib.rs
+@@ -45,8 +45,8 @@ pub use crate::global::*;
+ pub use crate::imports::Imports;
+ pub use crate::instance::{InstanceAllocator, VMInstance};
+ pub use crate::memory::{
+-    LinearMemory, NotifyLocation, VMMemory, VMOwnedMemory, VMSharedMemory,
+-    initialize_memory_with_data,
++    LinearMemory, LinearMemoryInfo, NotifyLocation, VMMemory, VMOwnedMemory, VMSharedMemory,
++    initialize_memory_with_data, linear_memories,
+ };
+ pub use crate::mmap::{Mmap, MmapType};
+ pub use crate::probestack::PROBESTACK;
+diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
+index de28f44..9332064 100644
+--- a/lib/vm/src/memory.rs
++++ b/lib/vm/src/memory.rs
+@@ -1,5 +1,9 @@
+ // This file contains code from external sources.
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
++//
++// Modified for ServiceCache: every linear memory is
++// registered while it lives, so that an embedder can find its mapping
++// (`linear_memories`).
+ 
+ //! Memory management for linear memories.
+ //!
+@@ -19,10 +23,82 @@ use std::cell::UnsafeCell;
+ use std::convert::TryInto;
+ use std::ptr::NonNull;
+ use std::slice;
+-use std::sync::{Arc, RwLock};
++use std::sync::{Arc, Mutex, RwLock};
+ use std::time::Duration;
+ use wasmer_types::{Bytes, MemoryError, MemoryStyle, MemoryType, Pages, WASM_PAGE_SIZE};
+ 
++/// A linear memory alive in this process, as [`linear_memories`] reports it.
++#[derive(Debug, Clone, Copy)]
++pub struct LinearMemoryInfo {
++    /// Start of the accessible bytes.
++    pub base: *mut u8,
++    /// Number of accessible bytes: the memory's current length.
++    pub len: usize,
++    /// The mapping is private and anonymous (`MAP_PRIVATE | MAP_ANONYMOUS`
++    /// with no backing file), so dropping a page with
++    /// `madvise(MADV_DONTNEED)` affects this process alone and the page reads
++    /// as zeros afterwards.
++    pub private_anonymous: bool,
++}
++
++/// A registry entry: where the memory's definition lives, which compiled
++/// code reads too, so that the base and length are always the current ones.
++struct RegisteredMemory {
++    definition: NonNull<VMMemoryDefinition>,
++    private_anonymous: bool,
++}
++
++// SAFETY: the pointer is only dereferenced by `linear_memories`, under its
++// own contract; the registry itself just stores it.
++unsafe impl Send for RegisteredMemory {}
++
++static LINEAR_MEMORIES: Mutex<Vec<RegisteredMemory>> = Mutex::new(Vec::new());
++
++fn register_memory(definition: NonNull<VMMemoryDefinition>, private_anonymous: bool) {
++    LINEAR_MEMORIES
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .push(RegisteredMemory {
++            definition,
++            private_anonymous,
++        });
++}
++
++fn unregister_memory(definition: NonNull<VMMemoryDefinition>) {
++    LINEAR_MEMORIES
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .retain(|entry| entry.definition != definition);
++}
++
++/// Every linear memory alive in this process, with its base and current
++/// length as compiled code sees them.
++///
++/// # Safety
++///
++/// The base and length are read from each memory's definition without
++/// synchronisation, and a memory's definition may live in its instance's
++/// context. The caller must ensure that, while it calls this and uses the
++/// result, no guest code runs, no memory grows and no store is dropped: for
++/// example a process that has been drained to one thread.
++pub unsafe fn linear_memories() -> Vec<LinearMemoryInfo> {
++    LINEAR_MEMORIES
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .iter()
++        .map(|entry| {
++            // SAFETY: the caller guarantees the definition is alive and not
++            // being written.
++            let definition = unsafe { entry.definition.as_ref() };
++            LinearMemoryInfo {
++                base: definition.base,
++                len: definition.current_length,
++                private_anonymous: entry.private_anonymous,
++            }
++        })
++        .collect()
++}
++
+ // The memory mapped area
+ #[derive(Debug)]
+ struct WasmMmap {
+@@ -167,7 +243,7 @@ impl WasmMmap {
+             .copy(Some(mem_length))
+             .map_err(MemoryError::Generic)?;
+         let base_ptr = alloc.as_mut_ptr();
+-        Ok(Self {
++        let copy = Self {
+             vm_memory_definition: MaybeInstanceOwned::Host(Box::new(UnsafeCell::new(
+                 VMMemoryDefinition {
+                     base: base_ptr,
+@@ -176,7 +252,16 @@ impl WasmMmap {
+             ))),
+             alloc,
+             size: self.size,
+-        })
++        };
++        // `Mmap::copy` always makes a private anonymous mapping.
++        register_memory(copy.get_vm_memory_definition(), true);
++        Ok(copy)
++    }
++}
++
++impl Drop for WasmMmap {
++    fn drop(&mut self) {
++        unregister_memory(self.get_vm_memory_definition());
+     }
+ }
+ 
+@@ -340,6 +425,7 @@ impl VMOwnedMemory {
+             let mapped_pages = memory.minimum;
+             let mapped_bytes = mapped_pages.bytes();
+ 
++            let private_anonymous = backing_file.is_none() && memory_type == MmapType::Private;
+             let mut alloc =
+                 Mmap::accessible_reserved(mapped_bytes.0, request_bytes, backing_file, memory_type)
+                     .map_err(MemoryError::Region)?;
+@@ -368,6 +454,7 @@ impl VMOwnedMemory {
+                 alloc,
+                 size: Bytes::from(mem_length).try_into().unwrap(),
+             };
++            register_memory(mmap.get_vm_memory_definition(), private_anonymous);
+ 
+             Ok(Self {
+                 mmap,

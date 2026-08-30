@@ -15,6 +15,14 @@
 //! waiting on a guest that never runs again, and a clone inherits no live
 //! connection.
 //!
+//! After the freeze the template releases the all-zero pages of the
+//! guest's memory (`Compaction`): an idle guest can hold many, and `fork()`
+//! pays for every mapped page. The scan runs in short slices on the control
+//! thread while the control channel is quiet, so a fork waits for at most
+//! one slice and the freeze itself stays short; the scan takes seconds for
+//! a large guest, and a clone forked before it is done shares the pages as
+//! they were.
+//!
 //! `fork` runs on that one thread. The child rebuilds what the parent
 //! dismantled — a new tokio runtime (a new fork generation, so every timer
 //! re-arms), a new epoll instance for the selector, its own listening socket
@@ -232,4 +240,314 @@ fn rebuild(host: &mut Host, listener: TcpListener) -> Result<()> {
         "clone running"
     );
     Ok(())
+}
+
+/// What a [`Compaction`] found and did, in pages of the host's size.
+#[derive(Debug, Default, Clone, Copy)]
+struct ZeroPages {
+    /// Private anonymous linear memories scanned.
+    memories: usize,
+    /// Pages of those memories within their current length.
+    scanned: usize,
+    /// Of which resident (`mincore`).
+    resident: usize,
+    /// Of which resident and entirely zero.
+    zero: usize,
+    /// Zero pages released with `MADV_DONTNEED`.
+    released: usize,
+    /// Zero pages kept because they sit in a fully resident 2 MiB block
+    /// that is not zero throughout (it may be one huge page).
+    kept: usize,
+    /// `madvise` calls made, one per run of released pages.
+    runs: usize,
+}
+
+/// One linear memory under scan: where it is and how far the scan got.
+#[derive(Debug)]
+struct MemoryScan {
+    base: usize,
+    pages: usize,
+    /// The mapping holds huge pages: a fully resident 2 MiB block is then
+    /// released only when it is zero throughout. Read from `smaps` by the
+    /// first slice (it costs milliseconds for a large process).
+    spare_full_blocks: Option<bool>,
+    /// The next page to scan.
+    next: usize,
+    /// A run of zero pages found but not yet released, as page indices.
+    pending: Option<(usize, usize)>,
+}
+
+/// The release of a frozen guest's all-zero pages, in slices.
+///
+/// Every resident, entirely zero page of each private anonymous linear
+/// memory is given back with `madvise(MADV_DONTNEED)`. The guest cannot
+/// tell: the next touch of such a page reads zeros again. The template keeps
+/// less resident, `fork()` copies fewer page-table entries, and clones share
+/// less. The scan only ever runs with the guest drained and this the only
+/// thread; between slices the process is exactly as it was for a fork.
+///
+/// A 2 MiB-aligned block whose pages are all resident may be one transparent
+/// huge page; dropping part of it would split it into 4 KiB pages, which is
+/// more page-table entries for a fork, not fewer. While the mapping holds any
+/// huge page, such a block is dropped only when it is zero throughout, and
+/// its zero pages are counted as kept otherwise; a mapping without huge
+/// pages (`AnonHugePages` in `smaps`) has nothing to split and every zero
+/// page goes.
+#[derive(Debug)]
+pub(super) struct Compaction {
+    page: usize,
+    huge_page: usize,
+    memories: Vec<MemoryScan>,
+    totals: ZeroPages,
+    started: Instant,
+    busy: Duration,
+}
+
+impl Compaction {
+    /// Prepares the scan of every private anonymous linear memory. For a
+    /// drained, single-threaded process only: right after `freeze`.
+    pub(super) fn start() -> Self {
+        let page = page_size();
+        // SAFETY: the process is single-threaded and the guest is drained:
+        // nothing runs guest code, grows a memory or drops a store.
+        let memories = unsafe { wasmer_vm::linear_memories() };
+        let memories: Vec<MemoryScan> = memories
+            .into_iter()
+            .filter(|memory| memory.private_anonymous && memory.len > 0)
+            .map(|memory| MemoryScan {
+                base: memory.base as usize,
+                pages: memory.len.div_ceil(page),
+                spare_full_blocks: None,
+                next: 0,
+                pending: None,
+            })
+            .collect();
+        let totals = ZeroPages {
+            memories: memories.len(),
+            scanned: memories.iter().map(|memory| memory.pages).sum(),
+            ..ZeroPages::default()
+        };
+        tracing::debug!(
+            memories = totals.memories,
+            pages = totals.scanned,
+            "releasing zero pages in slices"
+        );
+        Self {
+            page,
+            huge_page: huge_page_size(),
+            memories,
+            totals,
+            started: Instant::now(),
+            busy: Duration::ZERO,
+        }
+    }
+
+    /// Scans for about `budget`, block by block; `true` once every memory
+    /// has been scanned.
+    pub(super) fn step(&mut self, budget: Duration) -> bool {
+        let started = Instant::now();
+        while let Some(memory) = self
+            .memories
+            .iter_mut()
+            .find(|memory| memory.next < memory.pages)
+        {
+            scan_block(memory, self.page, self.huge_page, &mut self.totals);
+            if started.elapsed() >= budget {
+                break;
+            }
+        }
+        self.busy += started.elapsed();
+        tracing::trace!(
+            pages = self.memories.iter().map(|memory| memory.next).sum::<usize>(),
+            of = self.totals.scanned,
+            released = self.totals.released,
+            slice = ?started.elapsed(),
+            "zero-page scan slice"
+        );
+        let done = self
+            .memories
+            .iter()
+            .all(|memory| memory.next >= memory.pages);
+        if done {
+            let totals = self.totals;
+            tracing::debug!(
+                memories = totals.memories,
+                scanned = totals.scanned,
+                resident = totals.resident,
+                zero = totals.zero,
+                released = totals.released,
+                kept = totals.kept,
+                runs = totals.runs,
+                released_mb = (totals.released * self.page) >> 20,
+                scan = ?self.busy,
+                after = ?self.started.elapsed(),
+                "zero pages released"
+            );
+        }
+        done
+    }
+}
+
+/// Scans the 2 MiB-aligned block at `memory.next` (clipped to the memory):
+/// marks its zero pages, keeps a fully resident block that is not zero
+/// throughout when the mapping may hold huge pages, and releases runs of
+/// zero pages, merging with the run left pending by the previous block.
+fn scan_block(memory: &mut MemoryScan, page: usize, huge_page: usize, totals: &mut ZeroPages) {
+    let base = memory.base;
+    let end = base + memory.pages * page;
+    let addr = base + memory.next * page;
+    let block_end = ((addr / huge_page) + 1).saturating_mul(huge_page).min(end);
+    let first = memory.next;
+    let last = (block_end - base) / page;
+    let count = last - first;
+    // Unknown counts as present: keeping a few pages is the safe error.
+    let spare_full_blocks = *memory
+        .spare_full_blocks
+        .get_or_insert_with(|| mapping_has_huge_pages(base).unwrap_or(true));
+
+    let mut resident = vec![0_u8; count];
+    // SAFETY: a page-aligned subrange of a mapping of at least `len` bytes,
+    // and `resident` has one byte per page of it.
+    let rc = unsafe {
+        libc::mincore(
+            addr as *mut libc::c_void,
+            count * page,
+            resident.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "mincore failed; the rest of this memory's zero pages are kept"
+        );
+        memory.next = memory.pages;
+        release_pending(memory, page, totals);
+        return;
+    }
+    let full = spare_full_blocks
+        && block_end - addr == huge_page
+        && resident.iter().all(|&byte| byte & 1 != 0);
+
+    let mut drop = vec![false; count];
+    let mut zero_in_block = 0;
+    for (offset, &byte) in resident.iter().enumerate() {
+        if byte & 1 == 0 {
+            continue;
+        }
+        totals.resident += 1;
+        // SAFETY: a resident page of the accessible range; nothing writes it
+        // (the guest is drained and this is the only thread).
+        if unsafe { is_zero(addr + offset * page, page) } {
+            totals.zero += 1;
+            zero_in_block += 1;
+            drop[offset] = true;
+        }
+    }
+    if full && zero_in_block != count {
+        drop.fill(false);
+        totals.kept += zero_in_block;
+    }
+
+    for (offset, &dropped) in drop.iter().enumerate() {
+        let index = first + offset;
+        if !dropped {
+            release_pending(memory, page, totals);
+            continue;
+        }
+        match &mut memory.pending {
+            Some((_, pending_end)) if *pending_end == index => *pending_end += 1,
+            _ => {
+                release_pending(memory, page, totals);
+                memory.pending = Some((index, index + 1));
+            }
+        }
+    }
+    memory.next = last;
+    if memory.next >= memory.pages {
+        release_pending(memory, page, totals);
+    }
+}
+
+/// Releases the pending run of zero pages, if any.
+fn release_pending(memory: &mut MemoryScan, page: usize, totals: &mut ZeroPages) {
+    let Some((start, end)) = memory.pending.take() else {
+        return;
+    };
+    let run = end - start;
+    // SAFETY: a page-aligned subrange of this private anonymous mapping; the
+    // pages are zero, so the guest reads the same after the kernel
+    // zero-fills them again.
+    let rc = unsafe {
+        libc::madvise(
+            (memory.base + start * page) as *mut libc::c_void,
+            run * page,
+            libc::MADV_DONTNEED,
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            pages = run,
+            "madvise(MADV_DONTNEED) failed"
+        );
+        return;
+    }
+    totals.released += run;
+    totals.runs += 1;
+}
+
+/// The host's page size.
+fn page_size() -> usize {
+    // SAFETY: a plain query with no memory arguments.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(size).unwrap_or(4096)
+}
+
+/// The unit transparent huge pages come in: the kernel's PMD size, from
+/// sysfs; 2 MiB (x86-64, arm64 with 4 KiB pages) when it cannot be read.
+fn huge_page_size() -> usize {
+    std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(2 << 20)
+}
+
+/// Whether the mapping containing `addr` holds any transparent huge page,
+/// from `AnonHugePages` in `/proc/self/smaps`. `None` when that cannot be
+/// read, or the mapping is not found.
+fn mapping_has_huge_pages(addr: usize) -> Option<bool> {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+    let mut inside = false;
+    for line in smaps.lines() {
+        if let Some(rest) = line.strip_prefix("AnonHugePages:") {
+            if inside {
+                let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb > 0);
+            }
+            continue;
+        }
+        // A mapping header: `start-end perms offset dev inode [path]`.
+        if let Some((range, _)) = line.split_once(' ')
+            && let Some((start, end)) = range.split_once('-')
+            && let (Ok(start), Ok(end)) = (
+                usize::from_str_radix(start, 16),
+                usize::from_str_radix(end, 16),
+            )
+        {
+            inside = (start..end).contains(&addr);
+        }
+    }
+    None
+}
+
+/// Whether the `len` bytes at `addr` are all zero.
+///
+/// # Safety
+///
+/// `addr` must point to `len` readable bytes, 8-aligned, that nothing
+/// writes meanwhile.
+unsafe fn is_zero(addr: usize, len: usize) -> bool {
+    // SAFETY: the caller's contract; the slice is read only.
+    let words = unsafe { std::slice::from_raw_parts(addr as *const u64, len / 8) };
+    words.iter().all(|&word| word == 0)
 }
