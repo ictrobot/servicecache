@@ -114,10 +114,44 @@ enum Phase {
     Frozen,
 }
 
-/// The self-pipe the guest thread writes to when its listen completes.
+/// The self-pipe that wakes the control loop from other threads: the guest
+/// thread writes to it when its listen completes, and a task on the host
+/// runtime when a run ends. Each byte says which.
 struct EventPipe {
     read: OwnedFd,
     write: Arc<OwnedFd>,
+}
+
+/// What a byte in the event pipe announces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Event {
+    /// The guest's listen completed.
+    Listening = 1,
+    /// A run ended.
+    RunEnded = 2,
+}
+
+impl TryFrom<u8> for Event {
+    type Error = anyhow::Error;
+
+    fn try_from(byte: u8) -> Result<Self> {
+        match byte {
+            1 => Ok(Self::Listening),
+            2 => Ok(Self::RunEnded),
+            other => bail!("unexpected byte {other} in the event pipe"),
+        }
+    }
+}
+
+/// What was written to the event pipe since it was last drained.
+#[derive(Debug, Clone, Copy, Default)]
+struct Events {
+    /// The guest's listen completed.
+    listening: bool,
+    /// A run ended. The loop re-reads the run's status, so a stale byte
+    /// costs nothing.
+    run_ended: bool,
 }
 
 impl EventPipe {
@@ -131,25 +165,32 @@ impl EventPipe {
         })
     }
 
-    fn notifier(&self) -> Arc<dyn Fn() + Send + Sync> {
+    /// A function that announces `event` from any thread.
+    fn notifier(&self, event: Event) -> Arc<dyn Fn() + Send + Sync> {
         let write = self.write.clone();
         Arc::new(move || {
-            let _ = nix::unistd::write(&*write, &[1]);
+            let _ = nix::unistd::write(&*write, &[event as u8]);
         })
     }
 
-    /// Drains the pipe; `true` if anything was written. The read end is
-    /// non-blocking, so this returns as soon as the pipe is empty.
-    fn drain(&self) -> bool {
+    /// Drains the pipe. The read end is non-blocking, so this returns as
+    /// soon as the pipe is empty. Only this process writes the pipe, so a
+    /// byte that is not an event is an error.
+    fn drain(&self) -> Result<Events> {
         let mut buffer = [0_u8; 64];
-        let mut any = false;
+        let mut events = Events::default();
         while let Ok(n) = nix::unistd::read(self.read.as_raw_fd(), &mut buffer) {
             if n == 0 {
                 break;
             }
-            any = true;
+            for &byte in &buffer[..n] {
+                match Event::try_from(byte)? {
+                    Event::Listening => events.listening = true,
+                    Event::RunEnded => events.run_ended = true,
+                }
+            }
         }
-        any
+        Ok(events)
     }
 }
 
@@ -188,7 +229,7 @@ impl Host {
         let events = EventPipe::new()?;
         let networking = Arc::new(HostNetworking::new(
             manifest.guest.listen_port,
-            events.notifier(),
+            events.notifier(Event::Listening),
         ));
         let mounts: Vec<ReadOnlyMount> = manifest
             .prepare
@@ -281,10 +322,24 @@ impl Host {
             .is_some_and(|revents| revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP)))
     }
 
+    /// Wakes the control loop as soon as the run behind `handle` ends: a
+    /// task on the host runtime awaits it and writes the event pipe, so the
+    /// loop does not wait for its tick to notice. In a forked child the
+    /// task belongs to the template's abandoned runtime; the child watches
+    /// again on its own.
+    fn watch_run(&self, handle: &TaskJoinHandle) {
+        let mut handle = handle.clone();
+        let notify = self.events.notifier(Event::RunEnded);
+        self.tasks.handle().spawn(async move {
+            let _ = handle.wait_finished().await;
+            notify();
+        });
+    }
+
     /// Reports what happened since the last tick: the guest listening or
     /// exiting, clones exiting. Returns `true` when the host should end.
     fn tick(&mut self, channel: &Channel) -> Result<bool> {
-        if self.events.drain()
+        if self.events.drain()?.listening
             && let Phase::Running { ready: false } = self.phase
         {
             self.phase = Phase::Running { ready: true };
@@ -400,6 +455,7 @@ impl Host {
                     stdin: &[],
                     network: false,
                 })?;
+                self.watch_run(&handle);
                 match self.wait_run(channel, &handle, Run::Prepare)? {
                     Some(status) => status,
                     None => return Ok(None),
@@ -433,6 +489,7 @@ impl Host {
             stdin: &[],
             network: true,
         })?;
+        self.watch_run(&handle);
         self.guest = Some(handle);
         self.phase = Phase::Running { ready: false };
         tracing::info!(module = %guest.module.display(), "guest started");
@@ -440,7 +497,7 @@ impl Host {
         // Ready, or dead before it listened.
         loop {
             let readable = self.wait(channel, TICK)?;
-            if self.events.drain() {
+            if self.events.drain()?.listening {
                 self.phase = Phase::Running { ready: true };
                 return Ok(Some(self.ready_reply()?));
             }
@@ -479,6 +536,7 @@ impl Host {
             stdin: recipe,
             network: true,
         })?;
+        self.watch_run(&handle);
         match self.wait_run(channel, &handle, Run::Initializer)? {
             Some(status) => {
                 tracing::info!(status, "initializer finished");
@@ -554,6 +612,9 @@ impl Host {
                 rebuilt: Ok(()),
             }) => {
                 self.phase = Phase::Running { ready: true };
+                if let Some(guest) = &self.guest {
+                    self.watch_run(guest);
+                }
                 Ok(Outcome::Child(Channel::from_fd(control)))
             }
             Ok(freeze::Forked::Child {
