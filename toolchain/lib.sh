@@ -128,7 +128,7 @@ sc_apply_series() {
     else
       echo "cannot apply cleanly: $patch_name" >&2
       echo "the checkout has partial or conflicting changes (a patch that changed after it was applied?);" >&2
-      echo "reset it to the pristine tag and rerun: make clean-wasmer or clean-service-<name>-<version>" >&2
+      echo "reset it to the pristine tag and rerun: make clean-wasmer, clean-wasix-libc or clean-service-<name>-<version>" >&2
       return 1
     fi
   done < "$series_file"
@@ -183,6 +183,19 @@ sc_assemble() {
   export SC_OUT_DIR
 }
 
+# The content hash of the patch series the sysroot's libc carries
+# (patches/wasix-libc, in series order): what toolchain/bootstrap.sh stamps
+# each rebuilt libc.a with, and what BUILD-INFO records.
+sc_sysroot_patch_hash() {
+  local root patch_dir patch
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  patch_dir="$root/patches/wasix-libc"
+  while IFS= read -r patch; do
+    [[ -z "$patch" || "$patch" == \#* ]] && continue
+    cat "$patch_dir/$patch"
+  done < "$patch_dir/series" | sha256sum | cut -d' ' -f1
+}
+
 sc_write_build_info() {
   local out_dir="${SC_OUT_DIR:?sc_assemble must run before sc_write_build_info}"
   local upstream_tag="${SC_UPSTREAM_TAG:?sc_clone_tag must run before sc_write_build_info}"
@@ -196,6 +209,7 @@ sc_write_build_info() {
     echo "ServiceCache commit: $servicecache_commit"
     echo "wasixcc: $WASIXCC_VERSION"
     echo "WASIX sysroot: $WASIX_SYSROOT_TAG"
+    echo "WASIX sysroot patches: $(sc_sysroot_patch_hash)"
     echo "WASIX LLVM: $WASIX_LLVM_TAG"
     echo "Binaryen: $BINARYEN_TAG"
     echo "Wasmer: $WASMER_VERSION"

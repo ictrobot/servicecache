@@ -1,0 +1,24 @@
+Patches to wasix-libc, the C library in the WASIX sysroot guests are built
+with.
+
+toolchain/bootstrap.sh checks wasix-libc out at the sysroot's tag under
+work/wasix-libc, applies the series, builds libc from it with wasix-libc's
+own build for each sysroot variant wasixcc can target, and puts that libc.a
+into the downloaded sysroot. A patch goes away when the sysroot tag carries
+the fix.
+
+Except where otherwise noted, Copyright (c) 2026 Ethan Jones.
+
+0001-chdir-lock-relative-path-resolution.patch is wasi-libc commit
+aa9b5c0820fc (https://github.com/WebAssembly/wasi-libc/pull/781, by CPunisher)
+applied to wasix-libc's copy of the file; it remains the copyright of its
+author.
+
+wasi-libc, and wasix-libc with it, is offered under the Apache License 2.0
+with the LLVM exception (LICENSE-Apache-2.0-WITH-LLVM-exception), the Apache
+License 2.0 (LICENSE-Apache-2.0) or the MIT License (LICENSE-MIT), at your
+option; everything in this series is offered under the same three. The files
+the series modifies carry the change notice Apache-2.0 requires.
+
+Context lines are from upstream and remain the copyright of their authors
+under upstream's terms.

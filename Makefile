@@ -10,7 +10,7 @@ CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
 PURGE_SERVICE_TARGETS := $(addprefix purge-,$(SERVICE_TARGETS))
 
 .PHONY: help bootstrap setup-wasmer build test lint check services services-list smoke smoke-toolchain smoke-services lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
-.PHONY: clean clean-services clean-wasmer purge
+.PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS)
 
 help:
@@ -34,6 +34,7 @@ help:
 	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
 	@echo "clean-services                  remove every service's build and output; keep source checkouts"
 	@echo "clean-wasmer                    reset work/wasmer to the pristine tag so setup-wasmer re-applies the series"
+	@echo "clean-wasix-libc                reset work/wasix-libc to the pristine tag so bootstrap re-applies the series"
 	@echo "clean-service-<name>-<version>  the same for one service version"
 	@echo "purge-service-<name>-<version>  also remove its source checkout"
 	@echo "purge                           remove work/ and target/ entirely, including the toolchain"
@@ -83,6 +84,9 @@ clean-services: $(CLEAN_SERVICE_TARGETS)
 
 clean-wasmer:
 	git -C work/wasmer checkout --quiet -- . && git -C work/wasmer clean --quiet -fdx
+
+clean-wasix-libc:
+	git -C work/wasix-libc checkout --quiet -- . && git -C work/wasix-libc clean --quiet -fdx
 
 purge:
 	rm -rf work target

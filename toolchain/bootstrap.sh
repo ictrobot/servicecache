@@ -5,6 +5,8 @@ SC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SC_CHECK=0
 SC_ALL=0
 
+source "$SC_ROOT/toolchain/lib.sh"
+
 fail() {
   echo "error: $*" >&2
   exit 1
@@ -102,6 +104,63 @@ install_sysroot() {
   sysroot_ready || fail "WASIX sysroot verification failed after installation"
 }
 
+# The sysroot's libc carries patches/wasix-libc (see its README): wasix-libc
+# is checked out at the sysroot's tag under work/wasix-libc, the series is
+# applied, and libc is built from it with wasix-libc's own build for every
+# sysroot variant wasixcc can target; that libc.a replaces the downloaded
+# one. A stamp next to each archive holds the series hash, so a fresh
+# download or a changed series is rebuilt. The legacy exception-handling
+# variants (sysroot-eh, sysroot-ehpic) cannot be selected through wasixcc
+# and are left as downloaded. The make arguments are the ones wasix-libc's
+# build32-general.sh uses for each variant.
+SYSROOT_PATCH_VARIANTS=(
+  "sysroot:-f Makefile PIC=no"
+  "sysroot-exnref-eh:-f Makefile-eh EXNREF_EH=yes PIC=no"
+  "sysroot-exnref-ehpic:-f Makefile-eh EXNREF_EH=yes PIC=yes"
+)
+
+sysroot_patched() {
+  local hash entry variant stamp
+  hash="$(sc_sysroot_patch_hash)"
+  for entry in "${SYSROOT_PATCH_VARIANTS[@]}"; do
+    variant="${entry%%:*}"
+    stamp="$WASIXCC_SYSROOT_PREFIX/$variant/lib/wasm32-wasi/libc.a.sc-patched"
+    [[ -f "$stamp" && "$(cat "$stamp")" == "$hash" ]] || return 1
+  done
+}
+
+patch_sysroot() {
+  if sysroot_patched; then
+    echo "WASIX sysroot patches are applied"
+    return
+  fi
+
+  local checkout="$SC_ROOT/work/wasix-libc"
+  (
+    export SC_SOURCE_URL="https://github.com/wasix-org/wasix-libc.git"
+    sc_clone_tag "$WASIX_SYSROOT_TAG" "$checkout"
+    sc_apply_series "$SC_ROOT/patches/wasix-libc" "$checkout"
+  ) || fail "could not prepare the wasix-libc checkout"
+
+  local hash entry variant flags lib
+  hash="$(sc_sysroot_patch_hash)"
+  for entry in "${SYSROOT_PATCH_VARIANTS[@]}"; do
+    variant="${entry%%:*}"
+    flags="${entry#*:}"
+    lib="$WASIXCC_SYSROOT_PREFIX/$variant/lib/wasm32-wasi/libc.a"
+    rm -rf "$checkout/sysroot" "$checkout/build"
+    # shellcheck disable=SC2086
+    (cd "$checkout" && PATH="$WASIXCC_LLVM_LOCATION/bin:$PATH" \
+      TARGET_ARCH=wasm32 TARGET_OS=wasix CC=clang CXX=clang++ \
+      make --silent CHECK_SYMBOLS=yes -j"$(nproc)" $flags) > "$checkout/build.log" 2>&1 ||
+      fail "building wasix-libc for $variant failed; see $checkout/build.log"
+    cp "$checkout/sysroot/lib/wasm32-wasi/libc.a" "$lib"
+    echo "$hash" > "$lib.sc-patched"
+    echo "rebuilt $variant/lib/wasm32-wasi/libc.a from the patched wasix-libc"
+  done
+  rm -rf "$checkout/sysroot" "$checkout/build"
+}
+
 llvm_ready() {
   [[ -x "$WASIXCC_LLVM_LOCATION/bin/clang" ]] || return 1
   [[ "$("$WASIXCC_LLVM_LOCATION/bin/clang" --version 2>&1)" == *"WASIX clang version ${WASIX_LLVM_TAG%.*}"* ]]
@@ -173,6 +232,20 @@ run_smoke() {
   # without any service.
   "$WASIXCC_DIR/bin/wasixcc" -O2 \
     "$SC_ROOT/toolchain/smoke/stdio-net.c" -o "$build_dir/stdio-net.wasm"
+
+  # The libc patch (patches/wasix-libc): two threads making relative-path
+  # syscalls at once must not corrupt each other's paths. Fails on the
+  # unpatched libc. Once per patched sysroot variant that runs as a plain
+  # module.
+  local flags
+  for flags in "" "-fno-exceptions"; do
+    # shellcheck disable=SC2086
+    "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread $flags \
+      "$SC_ROOT/toolchain/smoke/relpath-race.c" -o "$build_dir/relpath-race.wasm"
+    "$WASMER_DIR/bin/wasmer" run "$build_dir/relpath-race.wasm" > /dev/null ||
+      fail "relative-path race smoke test failed (wasixcc ${flags:-default flags})"
+  done
+  echo "WASIX relative-path race test passed"
 }
 
 install_current_set() {
@@ -180,6 +253,7 @@ install_current_set() {
   install_sysroot
   install_llvm
   install_binaryen
+  patch_sysroot
   install_wasmer
   if [[ "$SC_CHECK" -eq 1 ]]; then
     run_smoke
@@ -207,7 +281,7 @@ load_service_set() {
 
 [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] ||
   fail "the pinned binary toolchain is supported only on Linux x86_64"
-for command_name in curl sha256sum tar; do
+for command_name in curl sha256sum tar git make; do
   require_command "$command_name"
 done
 

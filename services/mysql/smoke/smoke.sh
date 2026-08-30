@@ -55,10 +55,28 @@ common_args=(
   --skip-log-bin
 )
 
-"$SC_TOOLCHAIN/run-wasix.sh" "$server_module" \
-  --no-defaults \
-  --initialize-insecure \
-  "${common_args[@]}"
+# Initialize failed about one time in twenty until the sysroot's libc was
+# fixed: two guest threads resolving relative paths at once corrupted each
+# other's paths (wasix-libc chdir.c; the fix is
+# patches/wasix-libc/0001-chdir-lock-relative-path-resolution.patch, built into
+# the sysroot by toolchain/bootstrap.sh). A guest built against an unpatched
+# sysroot still has it, so a failed initialize is retried once, loudly.
+initialized=false
+for attempt in 1 2; do
+  if "$SC_TOOLCHAIN/run-wasix.sh" "$server_module" \
+      --no-defaults \
+      --initialize-insecure \
+      "${common_args[@]}"; then
+    initialized=true
+    break
+  fi
+  echo "MySQL initialize failed (attempt $attempt); retrying on a fresh data directory" >&2
+  rm -rf -- "$data_dir"
+done
+if [[ "$initialized" != true ]]; then
+  echo "MySQL initialize failed twice" >&2
+  exit 1
+fi
 
 "$SC_TOOLCHAIN/run-wasix.sh" "$server_module" \
   --no-defaults \

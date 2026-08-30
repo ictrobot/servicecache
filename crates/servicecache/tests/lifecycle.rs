@@ -147,36 +147,28 @@ impl Subject {
         );
     }
 
-    /// A host brought up and initialized. A prepare step that fails is
-    /// retried once on a fresh host, loudly: it runs before anything is
-    /// frozen and its rare failure is a known, separate issue.
+    /// A host brought up and initialized.
     fn bring_up(&self) -> HostProcess {
-        for attempt in 0..2 {
-            let mut host = HostProcess::spawn_with_binary(binary(), &self.path).expect("spawn");
-            if self.manifest.prepare.is_some() {
-                let status = host.prepare().expect("prepare");
-                if status != 0 {
-                    eprintln!(
-                        "!! {}: prepare exited with {status} (attempt {attempt}); retrying on a fresh host",
-                        self.name
-                    );
-                    host.kill().expect("kill");
-                    continue;
-                }
-            }
-            let endpoint = host.start().expect("start");
-            if self.manifest.initializer.is_some() {
-                assert_eq!(
-                    host.initialize(&self.adapter.recipe()).expect("initialize"),
-                    0,
-                    "{}: initializer",
-                    self.name
-                );
-            }
-            self.adapter.check_initialized(endpoint);
-            return host;
+        let mut host = HostProcess::spawn_with_binary(binary(), &self.path).expect("spawn");
+        if self.manifest.prepare.is_some() {
+            assert_eq!(
+                host.prepare().expect("prepare"),
+                0,
+                "{}: prepare",
+                self.name
+            );
         }
-        panic!("{}: prepare failed twice", self.name);
+        let endpoint = host.start().expect("start");
+        if self.manifest.initializer.is_some() {
+            assert_eq!(
+                host.initialize(&self.adapter.recipe()).expect("initialize"),
+                0,
+                "{}: initializer",
+                self.name
+            );
+        }
+        self.adapter.check_initialized(endpoint);
+        host
     }
 
     /// A template: brought up, initialized and frozen.
@@ -413,21 +405,17 @@ fn case_kill_at_every_phase(subject: &Subject) {
     for phase in phases {
         let mut host = HostProcess::spawn_with_binary(binary(), &subject.path).expect("spawn");
         let mut children = Vec::new();
-        let mut prepare_failed = false;
         'phases: {
             if phase == "spawned" {
                 break 'phases;
             }
             if subject.manifest.prepare.is_some() {
-                let status = host.prepare().expect("prepare");
-                if status != 0 {
-                    eprintln!(
-                        "!! {}: prepare exited with {status}; skipping {phase}",
-                        subject.name
-                    );
-                    prepare_failed = true;
-                    break 'phases;
-                }
+                assert_eq!(
+                    host.prepare().expect("prepare"),
+                    0,
+                    "{}: prepare",
+                    subject.name
+                );
             }
             if phase == "prepared" {
                 break 'phases;
@@ -462,9 +450,6 @@ fn case_kill_at_every_phase(subject: &Subject) {
             "{}: host killed at {phase} lingers",
             subject.name
         );
-        if prepare_failed {
-            continue;
-        }
         for child in children {
             // A clone dies with its template.
             let pid = child.pid();
