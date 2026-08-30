@@ -33,7 +33,10 @@ class Client:
         return self.reply()
 
     def reply(self):
-        line = self.reader.readline().decode().rstrip("\r\n")
+        line = self.reader.readline()
+        if not line:
+            raise ConnectionError("disconnected")
+        line = line.decode().rstrip("\r\n")
         kind, rest = line[0], line[1:]
         if kind in "+:-":
             return rest

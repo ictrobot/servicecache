@@ -11,21 +11,37 @@
 //! back by binding a throwaway socket and reading its address, so refusing the
 //! bind outright would leave the guest with swapped ports. Outbound
 //! connections (the initializer's) go to the host network unchanged.
+//!
+//! Every connection the guest accepts is handed over wrapped in a guard
+//! that records its descriptor and forgets it when the guest drops the
+//! stream, so a freeze can end the template's network presence exactly:
+//! `shut_down_sockets` stops the listener and shuts down each connection
+//! the guest still holds.
 
 use std::{
-    net::{SocketAddr, TcpListener},
+    collections::HashSet,
+    mem::MaybeUninit,
+    net::{Shutdown, SocketAddr, TcpListener},
+    os::fd::{AsRawFd, RawFd},
     sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
+use nix::errno::Errno;
+use virtual_mio::InterestHandler;
 use virtual_net::{
-    NetworkError, VirtualIoSource, VirtualNetworking, VirtualTcpBoundSocket, VirtualTcpListener,
-    VirtualTcpSocket,
-    host::{LocalNetworking, LocalTcpListener},
+    NetworkError, SocketStatus, VirtualConnectedSocket, VirtualIoSource, VirtualNetworking,
+    VirtualSocket, VirtualTcpBoundSocket, VirtualTcpListener, VirtualTcpSocket,
+    host::{LocalNetworking, LocalTcpListener, LocalTcpStream},
 };
 
 type SharedListener = Arc<Mutex<LocalTcpListener>>;
+
+/// The descriptors of the connections the guest holds, kept by the guard
+/// in every `TrackedStream`.
+type Connections = Arc<Mutex<HashSet<RawFd>>>;
 
 /// See the module documentation.
 pub struct HostNetworking {
@@ -37,6 +53,7 @@ pub struct HostNetworking {
     adopted: Mutex<Option<SharedListener>>,
     /// Called once the guest listens on the passed socket.
     on_listen: Arc<dyn Fn() + Send + Sync>,
+    connections: Connections,
 }
 
 impl std::fmt::Debug for HostNetworking {
@@ -60,6 +77,7 @@ impl HostNetworking {
             passed: Mutex::new(None),
             adopted: Mutex::new(None),
             on_listen,
+            connections: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -109,6 +127,44 @@ impl HostNetworking {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .replace_std_listener(listener)
             .context("failed to replace the guest's listening socket")
+    }
+
+    /// Ends the guest's network presence, for a freeze: the listener stops
+    /// accepting (a listening socket shut down for reading refuses new
+    /// connections and resets those waiting in its backlog) and every
+    /// connection the guest holds is shut down both ways, so its peer sees
+    /// the end. The descriptors stay open for the objects owning them.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a shutdown fails for a reason other than the socket not
+    /// being connected.
+    pub fn shut_down_sockets(&self) -> Result<()> {
+        let shut_down = |fd: RawFd, how| match nix::sys::socket::shutdown(fd, how) {
+            Ok(()) | Err(Errno::ENOTCONN) => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("failed to shut down socket {fd}")),
+        };
+        if let Some(shared) = self
+            .adopted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let fd = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_raw_fd();
+            shut_down(fd, nix::sys::socket::Shutdown::Read)?;
+        }
+        for &fd in self
+            .connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            shut_down(fd, nix::sys::socket::Shutdown::Both)?;
+        }
+        Ok(())
     }
 
     /// The address of the socket the guest listens (or will listen) on.
@@ -171,6 +227,7 @@ impl VirtualNetworking for HostNetworking {
         Ok(Box::new(PassedBoundSocket {
             listener: Some(shared),
             on_listen: self.on_listen.clone(),
+            connections: self.connections.clone(),
         }))
     }
 
@@ -208,6 +265,7 @@ impl VirtualNetworking for HostNetworking {
 struct PassedBoundSocket {
     listener: Option<SharedListener>,
     on_listen: Arc<dyn Fn() + Send + Sync>,
+    connections: Connections,
 }
 
 impl std::fmt::Debug for PassedBoundSocket {
@@ -230,7 +288,10 @@ impl VirtualTcpBoundSocket for PassedBoundSocket {
     fn listen(&mut self) -> virtual_net::Result<Box<dyn VirtualTcpListener + Sync>> {
         let listener = self.listener.take().ok_or(NetworkError::InvalidFd)?;
         (self.on_listen)();
-        Ok(Box::new(PassedListener { inner: listener }))
+        Ok(Box::new(PassedListener {
+            inner: listener,
+            connections: self.connections.clone(),
+        }))
     }
 
     fn connect(
@@ -295,16 +356,26 @@ impl VirtualTcpBoundSocket for UnservedBoundSocket {
 #[derive(Debug)]
 struct PassedListener {
     inner: SharedListener,
+    connections: Connections,
 }
 
 impl VirtualTcpListener for PassedListener {
     fn try_accept(
         &mut self,
     ) -> virtual_net::Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
-        self.inner
+        let (stream, addr) = self
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .try_accept()
+            .try_accept_local()?;
+        let guard = ConnectionGuard::track(stream.as_raw_fd(), &self.connections);
+        Ok((
+            Box::new(TrackedStream {
+                _guard: guard,
+                inner: stream,
+            }),
+            addr,
+        ))
     }
 
     fn set_handler(
@@ -359,5 +430,167 @@ impl VirtualIoSource for PassedListener {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .poll_write_ready(cx)
+    }
+}
+
+/// An accepted connection as the guest holds it; its descriptor is known to
+/// `HostNetworking` for as long as the guest keeps the stream.
+#[derive(Debug)]
+struct TrackedStream {
+    /// Held for its drop; before `inner`, so the descriptor is forgotten
+    /// before it is closed.
+    _guard: ConnectionGuard,
+    inner: LocalTcpStream,
+}
+
+/// Keeps one descriptor in `Connections` until dropped.
+#[derive(Debug)]
+struct ConnectionGuard {
+    fd: RawFd,
+    connections: Connections,
+}
+
+impl ConnectionGuard {
+    fn track(fd: RawFd, connections: &Connections) -> Self {
+        connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(fd);
+        Self {
+            fd,
+            connections: connections.clone(),
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.fd);
+    }
+}
+
+impl VirtualIoSource for TrackedStream {
+    fn remove_handler(&mut self) {
+        self.inner.remove_handler();
+    }
+
+    fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<virtual_net::Result<usize>> {
+        self.inner.poll_read_ready(cx)
+    }
+
+    fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<virtual_net::Result<usize>> {
+        self.inner.poll_write_ready(cx)
+    }
+}
+
+impl VirtualSocket for TrackedStream {
+    fn set_ttl(&mut self, ttl: u32) -> virtual_net::Result<()> {
+        self.inner.set_ttl(ttl)
+    }
+
+    fn ttl(&self) -> virtual_net::Result<u32> {
+        self.inner.ttl()
+    }
+
+    fn addr_local(&self) -> virtual_net::Result<SocketAddr> {
+        self.inner.addr_local()
+    }
+
+    fn status(&self) -> virtual_net::Result<SocketStatus> {
+        self.inner.status()
+    }
+
+    fn last_error(&self) -> virtual_net::Result<Option<NetworkError>> {
+        self.inner.last_error()
+    }
+
+    fn set_handler(
+        &mut self,
+        handler: Box<dyn InterestHandler + Send + Sync>,
+    ) -> virtual_net::Result<()> {
+        self.inner.set_handler(handler)
+    }
+}
+
+impl VirtualConnectedSocket for TrackedStream {
+    fn set_linger(&mut self, linger: Option<Duration>) -> virtual_net::Result<()> {
+        self.inner.set_linger(linger)
+    }
+
+    fn linger(&self) -> virtual_net::Result<Option<Duration>> {
+        self.inner.linger()
+    }
+
+    fn try_send(&mut self, data: &[u8]) -> virtual_net::Result<usize> {
+        self.inner.try_send(data)
+    }
+
+    fn try_flush(&mut self) -> virtual_net::Result<()> {
+        self.inner.try_flush()
+    }
+
+    fn close(&mut self) -> virtual_net::Result<()> {
+        self.inner.close()
+    }
+
+    fn try_recv(&mut self, buf: &mut [MaybeUninit<u8>], peek: bool) -> virtual_net::Result<usize> {
+        self.inner.try_recv(buf, peek)
+    }
+}
+
+impl VirtualTcpSocket for TrackedStream {
+    fn set_recv_buf_size(&mut self, size: usize) -> virtual_net::Result<()> {
+        self.inner.set_recv_buf_size(size)
+    }
+
+    fn recv_buf_size(&self) -> virtual_net::Result<usize> {
+        self.inner.recv_buf_size()
+    }
+
+    fn set_send_buf_size(&mut self, size: usize) -> virtual_net::Result<()> {
+        self.inner.set_send_buf_size(size)
+    }
+
+    fn send_buf_size(&self) -> virtual_net::Result<usize> {
+        self.inner.send_buf_size()
+    }
+
+    fn set_nodelay(&mut self, nodelay: bool) -> virtual_net::Result<()> {
+        self.inner.set_nodelay(nodelay)
+    }
+
+    fn nodelay(&self) -> virtual_net::Result<bool> {
+        self.inner.nodelay()
+    }
+
+    fn set_keepalive(&mut self, keepalive: bool) -> virtual_net::Result<()> {
+        self.inner.set_keepalive(keepalive)
+    }
+
+    fn keepalive(&self) -> virtual_net::Result<bool> {
+        self.inner.keepalive()
+    }
+
+    fn set_dontroute(&mut self, dontroute: bool) -> virtual_net::Result<()> {
+        self.inner.set_dontroute(dontroute)
+    }
+
+    fn dontroute(&self) -> virtual_net::Result<bool> {
+        self.inner.dontroute()
+    }
+
+    fn addr_peer(&self) -> virtual_net::Result<SocketAddr> {
+        self.inner.addr_peer()
+    }
+
+    fn shutdown(&mut self, how: Shutdown) -> virtual_net::Result<()> {
+        self.inner.shutdown(how)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
     }
 }

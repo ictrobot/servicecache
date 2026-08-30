@@ -387,10 +387,17 @@ fn case_freeze_mid_request(subject: &Subject) {
     let (child, endpoint) = subject.fork(&mut host);
     subject.adapter.check_initialized(endpoint);
     subject.adapter.check_working(endpoint);
-    // The pending client belongs to the frozen template. It must end one way
-    // or another (the child inherited its connection and may serve it, or
-    // the client gives up) and must never wedge the child.
+    // The pending client belongs to the frozen template, which disconnected
+    // it at the freeze: the request has failed by now rather than being
+    // served by the child through the inherited connection, and it must
+    // never wedge the child.
+    let waited = Instant::now();
     let outcome = pending.finish(Duration::from_secs(30));
+    assert!(
+        waited.elapsed() < Duration::from_secs(2),
+        "{}: the request in flight at the freeze was still pending: {outcome}",
+        subject.name
+    );
     eprintln!(
         "{}: the request in flight at the freeze: {outcome}",
         subject.name

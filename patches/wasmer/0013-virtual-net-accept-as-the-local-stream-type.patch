@@ -1,0 +1,81 @@
+Subject: virtual-net: accept as the local stream type
+
+A host that wraps the connections its guest accepts needs the concrete
+stream and its descriptor: `try_accept_local` returns a `LocalTcpStream`,
+which now implements `AsRawFd`, as does `LocalTcpListener`; `try_accept`
+boxes the stream as before.
+
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index 44576cc..ce700ec 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -300,7 +300,7 @@ pub struct LocalTcpListener {
+     handler_guard: HandlerGuardState,
+     no_delay: Option<bool>,
+     keep_alive: Option<bool>,
+-    backlog: VecDeque<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)>,
++    backlog: VecDeque<(LocalTcpStream, SocketAddr)>,
+     ruleset: Option<Ruleset>,
+ }
+ 
+@@ -350,7 +350,16 @@ impl LocalTcpListener {
+         Ok(())
+     }
+ 
+-    fn try_accept_internal(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
++    /// Accepts a connection as the local stream type, so that a host can
++    /// wrap it before handing it to the guest.
++    pub fn try_accept_local(&mut self) -> Result<(LocalTcpStream, SocketAddr)> {
++        if let Some(child) = self.backlog.pop_front() {
++            return Ok(child);
++        }
++        self.try_accept_internal()
++    }
++
++    fn try_accept_internal(&mut self) -> Result<(LocalTcpStream, SocketAddr)> {
+         match self.stream.accept().map_err(io_err_into_net_error) {
+             Ok((stream, addr)) => {
+                 if let Some(ruleset) = self.ruleset.as_ref()
+@@ -367,7 +376,7 @@ impl LocalTcpListener {
+                 if let Some(keep_alive) = self.keep_alive {
+                     socket.set_keepalive(keep_alive).ok();
+                 }
+-                Ok((Box::new(socket), addr))
++                Ok((socket, addr))
+             }
+             Err(NetworkError::WouldBlock) => {
+                 if let HandlerGuardState::WakerMap(_, map) = &mut self.handler_guard {
+@@ -383,10 +392,8 @@ impl LocalTcpListener {
+ 
+ impl VirtualTcpListener for LocalTcpListener {
+     fn try_accept(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
+-        if let Some(child) = self.backlog.pop_front() {
+-            return Ok(child);
+-        }
+-        self.try_accept_internal()
++        self.try_accept_local()
++            .map(|(socket, addr)| (Box::new(socket) as Box<dyn VirtualTcpSocket + Sync>, addr))
+     }
+ 
+     fn set_handler(&mut self, mut handler: Box<dyn InterestHandler + Send + Sync>) -> Result<()> {
+@@ -634,6 +641,20 @@ impl LocalTcpStream {
+     }
+ }
+ 
++#[cfg(unix)]
++impl AsRawFd for LocalTcpListener {
++    fn as_raw_fd(&self) -> RawFd {
++        self.stream.as_raw_fd()
++    }
++}
++
++#[cfg(unix)]
++impl AsRawFd for LocalTcpStream {
++    fn as_raw_fd(&self) -> RawFd {
++        self.stream.as_raw_fd()
++    }
++}
++
+ impl VirtualTcpSocket for LocalTcpStream {
+     fn set_recv_buf_size(&mut self, size: usize) -> Result<()> {
+         Ok(())

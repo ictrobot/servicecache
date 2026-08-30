@@ -26,7 +26,10 @@ class Client:
         self.reader = self.sock.makefile("rb")
 
     def line(self):
-        return self.reader.readline().decode().rstrip("\r\n")
+        line = self.reader.readline()
+        if not line:
+            raise ConnectionError("disconnected")
+        return line.decode().rstrip("\r\n")
 
     def command(self, text):
         self.sock.sendall((text + "\r\n").encode())

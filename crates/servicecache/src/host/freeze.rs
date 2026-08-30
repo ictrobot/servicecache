@@ -8,7 +8,12 @@
 //! abandoned, never dropped or joined, so no destructor runs after
 //! quiescence. The process is then one thread, which is verified from
 //! `/proc/self/status` before `frozen` is answered. A frozen host is only
-//! ever forked or stopped: nothing can resume it in place.
+//! ever forked or stopped: nothing can resume it in place. Its network
+//! presence ends with it (`HostNetworking::shut_down_sockets`): the
+//! listener stops accepting and every connection the guest holds is shut
+//! down, so a client of the template is disconnected rather than left
+//! waiting on a guest that never runs again, and a clone inherits no live
+//! connection.
 //!
 //! `fork` runs on that one thread. The child rebuilds what the parent
 //! dismantled — a new tokio runtime (a new fork generation, so every timer
@@ -123,6 +128,7 @@ pub(super) fn freeze(host: &mut Host) -> Result<usize> {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+    host.networking.shut_down_sockets()?;
     Ok(quiescence.coroutines)
 }
 

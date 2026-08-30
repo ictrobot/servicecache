@@ -72,6 +72,17 @@ fn every_built_service_comes_up_through_the_host() {
 
 /// `servicecache run` brings the service up, prints its endpoint and keeps
 /// serving until it is killed.
+/// A spawned `servicecache run`, killed when dropped so that a failed
+/// assertion leaves no host behind.
+struct RunCommand(std::process::Child);
+
+impl Drop for RunCommand {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn run_through_cli(manifest_path: &Path) {
     use std::io::{BufRead as _, Write as _};
 
@@ -102,10 +113,10 @@ fn run_through_cli(manifest_path: &Path) {
             .expect("write the recipe");
         command.arg("--recipe").arg(&recipe_path);
     }
-    let mut child = command.spawn().expect("spawn servicecache run");
+    let mut child = RunCommand(command.spawn().expect("spawn servicecache run"));
 
     let mut endpoint = String::new();
-    std::io::BufReader::new(child.stdout.take().expect("stdout"))
+    std::io::BufReader::new(child.0.stdout.take().expect("stdout"))
         .read_line(&mut endpoint)
         .expect("read the endpoint");
     let endpoint: std::net::SocketAddr = endpoint
@@ -114,8 +125,7 @@ fn run_through_cli(manifest_path: &Path) {
         .unwrap_or_else(|_| panic!("{name}: not an endpoint: {endpoint:?}"));
     adapter.check_initialized(endpoint);
 
-    child.kill().expect("kill");
-    child.wait().expect("wait");
+    drop(child);
     let _ = std::fs::remove_file(&recipe_path);
 }
 
@@ -127,8 +137,9 @@ fn every_built_service_runs_through_the_cli() {
 }
 
 /// `run --clones 1`, sent SIGUSR1 once the endpoint is out: the clone's
-/// endpoint follows and answers as initialized, and the clone dies with
-/// the command.
+/// endpoint follows and answers as initialized; a connection opened to the
+/// template before the freeze ends and its port refuses new ones; the
+/// clone dies with the command.
 fn fork_a_clone_through_cli(manifest_path: &Path) {
     use std::io::{BufRead as _, Write as _};
 
@@ -161,8 +172,8 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
             .expect("write the recipe");
         command.arg("--recipe").arg(&recipe_path);
     }
-    let mut child = command.spawn().expect("spawn servicecache run");
-    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    let mut child = RunCommand(command.spawn().expect("spawn servicecache run"));
+    let mut stdout = std::io::BufReader::new(child.0.stdout.take().expect("stdout"));
     let read_endpoint = |stdout: &mut std::io::BufReader<std::process::ChildStdout>| {
         let mut line = String::new();
         stdout.read_line(&mut line).expect("read an endpoint");
@@ -172,8 +183,13 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
     };
     let endpoint = read_endpoint(&mut stdout);
     adapter.check_initialized(endpoint);
+    let mut before_freeze =
+        std::net::TcpStream::connect(endpoint).expect("connect to the template");
+    before_freeze
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
 
-    let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("a pid"));
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(child.0.id()).expect("a pid"));
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGUSR1).expect("send SIGUSR1");
     let clone_endpoint = read_endpoint(&mut stdout);
     assert_ne!(
@@ -182,8 +198,22 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
     );
     adapter.check_initialized(clone_endpoint);
 
-    child.kill().expect("kill");
-    child.wait().expect("wait");
+    // The template's connection ends (after whatever it had already sent)
+    // and its port refuses: nothing waits on a frozen guest, and the clone
+    // did not inherit the connection.
+    let mut buffer = [0; 4096];
+    loop {
+        match std::io::Read::read(&mut before_freeze, &mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    assert!(
+        std::net::TcpStream::connect(endpoint).is_err(),
+        "{name}: the frozen template still accepts connections"
+    );
+
+    drop(child);
     let _ = std::fs::remove_file(&recipe_path);
     let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::net::TcpStream::connect(clone_endpoint).is_ok() {
