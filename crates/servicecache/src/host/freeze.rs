@@ -47,6 +47,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the remaining threads get to end after the drain.
 const DISMANTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the thread count is re-read while the last threads end: the
+/// tokio worker cannot be joined, and a read costs tens of microseconds.
+const DISMANTLE_POLL: Duration = Duration::from_micros(50);
+
 /// Set for the freeze: tokio threads end themselves on their next park.
 static TOKIO_EXIT: AtomicBool = AtomicBool::new(false);
 
@@ -141,7 +145,7 @@ pub(super) fn freeze(host: &mut Host) -> Result<usize> {
                 thread_names().join(", ")
             );
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(DISMANTLE_POLL);
     }
     tracing::debug!(elapsed = ?started.elapsed(), "host threads ended");
     host.networking.shut_down_sockets()?;
