@@ -31,3 +31,10 @@ wasmer-types = { path = "work/wasmer/lib/types" }
 wasmer-vm = { path = "work/wasmer/lib/vm" }
 wasmer-wasix = { path = "work/wasmer/lib/wasix" }
 wasmer-wasix-types = { path = "work/wasmer/lib/wasi-types" }
+
+# Line tables in the bench profile (`cargo build --profile bench`: the same
+# code as release, in the same directory), so that perf attributes samples to
+# functions and lines of this crate and the Wasmer crates. Release builds
+# stay as they are.
+[profile.bench]
+debug = "line-tables-only"
