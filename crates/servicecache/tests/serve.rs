@@ -406,6 +406,104 @@ fn idle_templates_expire() {
     );
 }
 
+/// Without `--recipe-root`, `recipe_files` is refused outright — before
+/// the service is even looked up.
+fn recipe_files_are_refused_without_roots() {
+    let dir = std::env::temp_dir().join(format!("sc-serve-noroots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp services dir");
+    let serve = Serve::start(&dir);
+    let client = serve.client();
+
+    let error = client
+        .create(&api::CreateInstance {
+            service: "anything".to_string(),
+            recipe_files: vec!["/etc/hostname".to_string()],
+            ..api::CreateInstance::default()
+        })
+        .expect_err("recipe files are refused");
+    assert_refused(&error, 403, "recipe-files-refused");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With a root configured, a file outside it is refused and one inside
+/// it is read: an instance created from recipe files matches one created
+/// from the same bytes inline — the log shows a single template fill.
+fn recipe_files_feed_the_initializer() {
+    let Some((manifest_path, manifest)) = manifests().into_iter().find_map(|path| {
+        let manifest = Manifest::load(&path).expect("load the manifest");
+        (manifest.prepare.is_none() && manifest.initializer.is_some()).then_some((path, manifest))
+    }) else {
+        eprintln!("skipped: no built service has an initializer without a prepare step");
+        return;
+    };
+    let name = manifest.service.name.clone();
+    let adapter = ServiceAdapter::find(&repo_root(), &name).expect("adapter");
+
+    let root = std::env::temp_dir().join(format!("sc-serve-reciperoot-{}", std::process::id()));
+    let outside = std::env::temp_dir().join(format!("sc-serve-outside-{}", std::process::id()));
+    for dir in [&root, &outside] {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("temp dir");
+    }
+    let recipe = adapter.recipe();
+    let inside_file = root.join("recipe.sql");
+    let outside_file = outside.join("recipe.sql");
+    std::fs::write(&inside_file, &recipe).expect("write the recipe");
+    std::fs::write(&outside_file, &recipe).expect("write the recipe");
+
+    let mut serve = Serve::start_configured(
+        manifest_path.parent().and_then(Path::parent).expect("dir"),
+        true,
+        &["--recipe-root", root.to_str().expect("utf-8 path")],
+    );
+    let client = serve.client();
+    let request = |recipe: Option<String>, files: Vec<String>| api::CreateInstance {
+        service: name.clone(),
+        version: Some(manifest.service.version.clone()),
+        recipe,
+        recipe_files: files,
+        ..api::CreateInstance::default()
+    };
+
+    let error = client
+        .create(&request(
+            None,
+            vec![outside_file.to_str().expect("utf-8 path").to_owned()],
+        ))
+        .expect_err("a file outside the root is refused");
+    assert_refused(&error, 403, "recipe-files-refused");
+
+    let inline = client
+        .create(&request(Some(api::encode_recipe(&recipe)), Vec::new()))
+        .expect("create from the inline recipe");
+    adapter.check_initialized(inline.endpoint.socket_addr().expect("endpoint"));
+    let from_files = client
+        .create(&request(
+            None,
+            vec![inside_file.to_str().expect("utf-8 path").to_owned()],
+        ))
+        .expect("create from recipe files");
+    adapter.check_initialized(from_files.endpoint.socket_addr().expect("endpoint"));
+
+    // Same bytes, same template key: the log shows the base and one
+    // recipe template filled, and both instances forked.
+    let logs = serve.end_and_logs();
+    assert_eq!(
+        logs.matches("template frozen").count(),
+        2,
+        "{name}: expected one shared recipe template:\n{logs}"
+    );
+    assert_eq!(
+        logs.matches("instance forked").count(),
+        2,
+        "{name}: expected both instances forked:\n{logs}"
+    );
+    for dir in [&root, &outside] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// The server logs every request by default: method, path, status and
 /// timing on stderr.
 fn logs_every_request() {
@@ -543,5 +641,19 @@ fn main() {
         idle_templates_expire();
         Ok(())
     }));
+    trials.push(libtest_mimic::Trial::test(
+        "recipe_files_are_refused_without_roots",
+        || {
+            recipe_files_are_refused_without_roots();
+            Ok(())
+        },
+    ));
+    trials.push(libtest_mimic::Trial::test(
+        "recipe_files_feed_the_initializer",
+        || {
+            recipe_files_feed_the_initializer();
+            Ok(())
+        },
+    ));
     libtest_mimic::run(&args, trials).exit();
 }

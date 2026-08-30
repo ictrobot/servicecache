@@ -7,6 +7,7 @@
 pub mod api;
 pub mod client;
 mod instances;
+mod recipes;
 mod templates;
 
 use std::{
@@ -55,6 +56,9 @@ pub struct Options {
     /// How long an idle template lives ([`DEFAULT_TEMPLATE_TTL`] outside
     /// tests).
     pub template_ttl: Duration,
+    /// Directories requests may name recipe files under; empty keeps the
+    /// feature off.
+    pub recipe_roots: Vec<PathBuf>,
 }
 
 struct App {
@@ -62,6 +66,26 @@ struct App {
     cache_dir: PathBuf,
     registry: Registry,
     templates: Templates,
+    recipe_roots: recipes::Roots,
+}
+
+/// What the listener knows about a connection: the peer's uid from
+/// `SO_PEERCRED`, when the socket yields one.
+#[derive(Debug, Clone, Copy)]
+struct Peer {
+    uid: Option<u32>,
+}
+
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, tokio::net::UnixListener>,
+    > for Peer
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+        Self {
+            uid: stream.io().peer_cred().ok().map(|cred| cred.uid()),
+        }
+    }
 }
 
 /// Serves the API until SIGINT or SIGTERM.
@@ -76,6 +100,7 @@ pub fn run(options: Options) -> Result<()> {
         cache_dir: options.cache_dir,
         registry: Registry::default(),
         templates: Templates::new(options.template_ttl),
+        recipe_roots: recipes::Roots::new(&options.recipe_roots)?,
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -130,10 +155,13 @@ async fn serve_on(socket: &Path, app: Arc<App>) -> Result<()> {
 
     let sweeper = tokio::spawn(sweep(Arc::clone(&app)));
     let router = router(Arc::clone(&app));
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("the server failed")?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<Peer>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("the server failed")?;
     sweeper.abort();
     // Dropping the entries and templates tells their threads to stop
     // their hosts; whatever is still shutting down when the process exits
@@ -253,11 +281,14 @@ async fn list_instances(State(app): State<Arc<App>>) -> Json<Vec<api::Instance>>
         (status = 201, body = api::Instance,
             headers(("Location" = String, description = "The instance's URL"))),
         (status = 400, body = api::Problem, content_type = "application/problem+json"),
+        (status = 403, body = api::Problem, content_type = "application/problem+json"),
         (status = 404, body = api::Problem, content_type = "application/problem+json"),
         (status = 409, body = api::Problem, content_type = "application/problem+json"),
+        (status = 413, body = api::Problem, content_type = "application/problem+json"),
         (status = 500, body = api::Problem, content_type = "application/problem+json")))]
 async fn create_instance(
     State(app): State<Arc<App>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<Peer>,
     body: Bytes,
 ) -> Result<
     (
@@ -270,6 +301,7 @@ async fn create_instance(
     let request: api::CreateInstance =
         serde_json::from_slice(&body).map_err(api::Problem::invalid_body)?;
     let ttl = ttl_duration(request.ttl_seconds)?.unwrap_or(DEFAULT_TTL);
+    let recipe = recipe_bytes(&app, peer, &request).await?;
     let manifest = app
         .services
         .select(&request.service, request.version.as_deref())
@@ -281,11 +313,6 @@ async fn create_instance(
                 api::Problem::ambiguous_version(&request.service, &versions)
             }
         })?;
-    let recipe = request
-        .recipe
-        .as_deref()
-        .map(api::decode_recipe)
-        .transpose()?;
     if recipe.is_some() && manifest.initializer.is_none() {
         return Err(api::Problem::no_initializer(&request.service));
     }
@@ -389,6 +416,53 @@ async fn renew_instance(
     Ok(Json(entry.describe()))
 }
 
+/// The recipe a request carries: decoded from `recipe`, or read from
+/// `recipe_files` when the server opted in with `--recipe-root` and the
+/// connection is from the server's own user. The peer gate matters
+/// because anything forwarding foreign traffic — a proxy on this socket —
+/// connects as itself; only same-uid peers could already read the files
+/// themselves, and the roots bound the exposure even then.
+async fn recipe_bytes(
+    app: &Arc<App>,
+    peer: Peer,
+    request: &api::CreateInstance,
+) -> Result<Option<Vec<u8>>, api::Problem> {
+    match (&request.recipe, request.recipe_files.as_slice()) {
+        (None, []) => Ok(None),
+        (Some(_), [_, ..]) => Err(api::Problem::invalid_body(
+            "give recipe or recipe_files, not both",
+        )),
+        (Some(recipe), []) => Ok(Some(api::decode_recipe(recipe)?)),
+        (None, files) => {
+            if app.recipe_roots.is_empty() {
+                return Err(api::Problem::recipe_files_refused(
+                    "the server was not started with --recipe-root",
+                ));
+            }
+            let server = unsafe { libc::geteuid() };
+            if peer.uid != Some(server) {
+                return Err(api::Problem::recipe_files_refused(
+                    "recipe files are accepted only from the server's own user",
+                ));
+            }
+            // Off the async workers: the files can be large, and a
+            // synchronous read here would stall every request.
+            let app = Arc::clone(app);
+            let files = files.to_vec();
+            tokio::task::spawn_blocking(move || {
+                recipes::read(
+                    &app.recipe_roots,
+                    &files,
+                    crate::host::protocol::MAX_PAYLOAD_LEN,
+                )
+            })
+            .await
+            .map_err(|_| api::Problem::internal("the recipe reader died"))?
+            .map(Some)
+        }
+    }
+}
+
 fn ttl_duration(seconds: Option<u64>) -> Result<Option<Duration>, api::Problem> {
     match seconds {
         None => Ok(None),
@@ -445,6 +519,7 @@ mod tests {
             cache_dir: PathBuf::new(),
             registry: Registry::default(),
             templates: Templates::new(DEFAULT_TEMPLATE_TTL),
+            recipe_roots: recipes::Roots::default(),
         });
         drop(router(app));
         let document = ApiDoc::openapi();

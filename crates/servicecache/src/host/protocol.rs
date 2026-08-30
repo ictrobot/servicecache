@@ -85,7 +85,8 @@ pub enum Reply {
 
 const HEADER_LEN: usize = 8;
 const MAX_JSON_LEN: usize = 64 * 1024;
-const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
+/// The largest payload a frame carries — the bound on a recipe's size.
+pub const MAX_PAYLOAD_LEN: usize = 256 * 1024 * 1024;
 const MAX_FDS: usize = 4;
 
 /// One end of a control channel.

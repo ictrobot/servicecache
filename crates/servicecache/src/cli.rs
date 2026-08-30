@@ -70,6 +70,12 @@ struct Cli {
 enum Command {
     /// Serve the manager's HTTP API on a Unix socket.
     Serve {
+        /// Accept `recipe_files` in requests, for files under DIR, from
+        /// connections by this user. May be repeated. Off by default; no
+        /// environment variable on purpose, so the opt-in is always
+        /// visible in the command line.
+        #[arg(long = "recipe-root", value_name = "DIR")]
+        recipe_roots: Vec<PathBuf>,
         /// Seconds an idle template lives (a testing hook; the default is
         /// the policy).
         #[arg(long, value_name = "SECONDS", hide = true)]
@@ -174,7 +180,10 @@ fn run_with(
     let cache_dir = || cache::directory(cli.cache_dir.as_deref(), environment_cache);
     let socket = move || socket_path(cli.socket, environment_socket);
     match cli.command {
-        Command::Serve { template_ttl } => {
+        Command::Serve {
+            recipe_roots,
+            template_ttl,
+        } => {
             let search_dirs = service_dirs(cli.services_dir, environment_dirs);
             let services = ServiceIndex::discover(&search_dirs)?;
             crate::serve::run(crate::serve::Options {
@@ -183,6 +192,7 @@ fn run_with(
                 cache_dir: cache_dir()?,
                 template_ttl: template_ttl
                     .map_or(crate::serve::DEFAULT_TEMPLATE_TTL, Duration::from_secs),
+                recipe_roots,
             })
         }
         Command::Request { service, recipe } => {
@@ -468,6 +478,7 @@ fn request_instance(client: &Client, service: &str, recipe: Option<&[u8]>) -> Re
         service: name.to_string(),
         version: version.map(str::to_string),
         recipe: recipe.map(api::encode_recipe),
+        recipe_files: Vec::new(),
         ttl_seconds: Some(REQUEST_TTL.as_secs()),
     })?;
     let endpoint = instance

@@ -20,6 +20,12 @@ pub struct CreateInstance {
     /// initializer does not run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe: Option<String>,
+    /// Absolute paths of files whose concatenation is the initializer's
+    /// standard input; an alternative to `recipe`. Only honoured when the
+    /// manager was started with `--recipe-root`, for connections from the
+    /// manager's own user, for files under a root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recipe_files: Vec<String>,
     /// Seconds the instance lives without a renewal; 1 to 86400,
     /// default 300.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,6 +180,23 @@ impl Problem {
     pub fn invalid_ttl(seconds: u64) -> Self {
         Self::new(400, "invalid-ttl", "The TTL is out of range")
             .with_detail(format!("{seconds} seconds; the range is 1 to 86400"))
+    }
+
+    #[must_use]
+    pub fn recipe_files_refused(detail: impl std::fmt::Display) -> Self {
+        Self::new(403, "recipe-files-refused", "Recipe files are not accepted").with_detail(detail)
+    }
+
+    #[must_use]
+    pub fn recipe_file_invalid(path: &str, detail: impl std::fmt::Display) -> Self {
+        Self::new(400, "recipe-file-invalid", "A recipe file cannot be read")
+            .with_detail(format!("{path}: {detail}"))
+    }
+
+    #[must_use]
+    pub fn recipe_too_large(limit: usize) -> Self {
+        Self::new(413, "recipe-too-large", "The recipe is too large")
+            .with_detail(format!("the recipe is limited to {limit} bytes"))
     }
 
     #[must_use]
