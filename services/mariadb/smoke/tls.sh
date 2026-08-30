@@ -116,6 +116,11 @@ fi
 
 probe=("$SC_SERVICE_DIR/smoke/mysql-probe.py" --host "$address" --port "$port")
 
+# $1 < $2, comparing dotted version numbers.
+version_lt() {
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
+}
+
 # The server with the given certificate, ready to answer the probe.
 start_server() {
   "$SC_TOOLCHAIN/run-wasix.sh" "$server_module" \
@@ -183,6 +188,7 @@ tls_error='^ERROR 2026 '
 ca=(--ssl-ca="$tls_dir/ca.crt")
 
 start_server server
+server_version="$("${probe[@]}" "SELECT @@version" | tail -n1 | cut -d- -f1)"
 "${probe[@]}" "CREATE USER 'tls-user'@'%' REQUIRE X509" >/dev/null
 check "the client negotiates TLS when the server offers it" "$cipher" "$has_cipher" -u root
 check "verified against the CA" "$version" $'^Ssl_version\tTLSv1\\.[23]$' -u root --ssl --ssl-verify-server-cert "${ca[@]}"
@@ -198,9 +204,19 @@ check "an empty revocation list" "$version" $'^Ssl_version\tTLSv1\\.[23]$' -u ro
 check "a revoked server certificate" "SELECT 1;" "$tls_error" -u root --ssl --ssl-verify-server-cert "${ca[@]}" --ssl-crl="$tls_dir/revoked.crl"
 stop_server
 
-start_server other
-check "a certificate for another name is rejected when verifying" "SELECT 1;" "$tls_error" -u root --ssl --ssl-verify-server-cert "${ca[@]}"
-check "and accepted when not" "$cipher" "$has_cipher" -u root --ssl
-stop_server
+# Hostname/IP-SAN mismatch is only enforced by the older client. Connector/C
+# 3.4.2+ (bundled from MariaDB 11.4.4) skips hostname verification for a
+# connection it classifies as local: with 127.0.0.1, --ssl-verify-server-cert
+# still requests certificate-chain verification but not
+# MARIADB_TLS_VERIFY_HOST, so a mismatched name is not rejected. Assert the
+# rejection only for a client that does enforce it.
+if version_lt "$server_version" 11.4.4; then
+  start_server other
+  check "a certificate for another name is rejected when verifying" "SELECT 1;" "$tls_error" -u root --ssl --ssl-verify-server-cert "${ca[@]}"
+  check "and accepted when not" "$cipher" "$has_cipher" -u root --ssl
+  stop_server
+else
+  echo "skipped: hostname verification of local connections (Connector/C 3.4.2+, server $server_version)"
+fi
 
 echo "MariaDB WASIX TLS test passed."

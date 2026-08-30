@@ -1,0 +1,45 @@
+Subject: [PATCH 6/6] cmake: build the client library against the bundled wolfSSL
+
+With CONC_WITH_SSL=WOLFSSL, hand Connector/C the bundled wolfSSL the
+server is built with: its target, include directories and user settings,
+which the connector's wolfSSL backend reads from WOLFSSL_LIBRARIES,
+WOLFSSL_INCLUDE_DIRS and WOLFSSL_DEFINES. The connector keeps its
+connection in the SSL's app data and asks for SNI, so the bundled build
+gets HAVE_EX_DATA and HAVE_SNI. wolfSSL's LICENSING offers it under GPLv2
+when combined with MariaDB Server or its client libraries.
+
+diff --git a/cmake/mariadb_connector_c.cmake b/cmake/mariadb_connector_c.cmake
+index 47dc56b6..da60c73a 100644
+--- a/cmake/mariadb_connector_c.cmake
++++ b/cmake/mariadb_connector_c.cmake
+@@ -22,6 +22,15 @@ IF(NOT CONC_WITH_SSL)
+   ENDIF()
+ ENDIF()
+ 
++# The client library on the bundled wolfSSL the server is built with: its
++# target, include directories and settings, for the connector's wolfSSL
++# backend.
++IF(CONC_WITH_SSL STREQUAL "WOLFSSL")
++  SET(WOLFSSL_LIBRARIES wolfssl)
++  SET(WOLFSSL_INCLUDE_DIRS ${SSL_INCLUDE_DIRS})
++  SET(WOLFSSL_DEFINES -DWOLFSSL_USER_SETTINGS)
++ENDIF()
++
+ SET(CONC_WITH_CURL OFF)
+ SET(CONC_WITH_MYSQLCOMPAT ON)
+ 
+diff --git a/extra/wolfssl/user_settings.h.in b/extra/wolfssl/user_settings.h.in
+index c184641f..c5c26b46 100644
+--- a/extra/wolfssl/user_settings.h.in
++++ b/extra/wolfssl/user_settings.h.in
+@@ -40,6 +40,10 @@
+ #define NO_WOLFSSL_STUB
+ // #define OPENSSL_ALL
+ #define OPENSSL_EXTRA
++/* The client library keeps its connection in the SSL's app data. */
++#define HAVE_EX_DATA
++/* The client library asks for SNI (SSL_set_tlsext_host_name). */
++#define HAVE_SNI
+ #define WOLFSSL_ALLOW_TLSV10
+ #define NO_OLD_TIMEVAL_NAME
+ #define HAVE_SECURE_RENEGOTIATION

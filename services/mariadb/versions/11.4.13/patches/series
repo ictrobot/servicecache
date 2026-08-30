@@ -1,0 +1,6 @@
+0001-cmake-support-wasix-cross-builds.patch
+0002-adapt-mysys-to-wasix.patch
+0003-adapt-server-lifecycle.patch
+0004-adapt-innodb-to-wasix-filesystems.patch
+0005-build-batch-only-mariadb-client.patch
+0006-build-the-client-library-against-the-bundled-wolfssl.patch

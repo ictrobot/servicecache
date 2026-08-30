@@ -16,12 +16,12 @@ Early development.
 
 ServiceCache is designed to be generic: the manager knows how to run, freeze, snapshot and clone a WASIX guest, not what the guest is. It is currently tested against:
 
-| Service    | Version  |
-|------------|----------|
-| MariaDB    | 10.11.19 |
-| MySQL      | 8.0.40   |
-| Valkey     | 9.1.1    |
-| beanstalkd | 1.13     |
+| Service    | Versions                          |
+|------------|-----------------------------------|
+| MariaDB    | 10.11.19, 11.4.13, 11.8.9, 12.3.3 |
+| MySQL      | 8.0.40                            |
+| Valkey     | 9.1.1                             |
+| beanstalkd | 1.13                              |
 
 Each service is built from an exact upstream release plus a small patch series for WASIX.
 

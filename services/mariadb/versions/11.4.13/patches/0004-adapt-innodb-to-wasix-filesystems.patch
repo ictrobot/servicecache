@@ -1,0 +1,41 @@
+Subject: [PATCH 4/6] innodb: adapt to WASIX filesystems
+
+InnoDB locks its files with fcntl and syncs them with fdatasync, neither
+of which WASIX provides. A service instance owns its data directory, so
+os_file_lock succeeds without locking; os_file_sync_posix uses fsync.
+
+diff --git a/storage/innobase/os/os0file.cc b/storage/innobase/os/os0file.cc
+index 72f6bab8..a49241b4 100644
+--- a/storage/innobase/os/os0file.cc
++++ b/storage/innobase/os/os0file.cc
+@@ -320,6 +320,13 @@ class SyncFileIO
+ @return 0 on success */
+ int os_file_lock(int fd, const char *name) noexcept
+ {
++#ifdef __wasm__
++	/* WASIX does not provide POSIX advisory locks. A service instance has
++	   exclusive ownership of its data directory. */
++	(void) fd;
++	(void) name;
++	return 0;
++#else
+ 	struct flock lk;
+ 
+ 	lk.l_type = F_WRLCK;
+@@ -344,6 +351,7 @@ int os_file_lock(int fd, const char *name) noexcept
+ 	}
+ 
+ 	return(0);
++#endif
+ }
+ #endif /* !_WIN32 */
+ 
+@@ -801,7 +809,7 @@ the global variable errno is set to indicate the error.
+ @return 0 if success, -1 otherwise */
+ static int os_file_sync_posix(os_file_t file) noexcept
+ {
+-#if !defined(HAVE_FDATASYNC) || HAVE_DECL_FDATASYNC == 0
++#if defined(__wasm__) || !defined(HAVE_FDATASYNC) || HAVE_DECL_FDATASYNC == 0
+   auto func= fsync;
+   auto func_name= "fsync()";
+ #else

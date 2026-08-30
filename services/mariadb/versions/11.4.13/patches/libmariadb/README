@@ -1,0 +1,8 @@
+These patches modify MariaDB Connector/C at commit
+8153da40fe720b1d25db12aa3f993918da15bd3b for WASIX.
+
+Copyright (c) 2026 Ethan Jones
+
+They are licensed under the GNU Lesser General Public License, version 2.1
+(LICENSE). Context lines are from upstream and remain the copyright of their
+authors under upstream's terms.

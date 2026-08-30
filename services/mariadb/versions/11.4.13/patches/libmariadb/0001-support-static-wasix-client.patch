@@ -1,0 +1,70 @@
+Subject: [PATCH 1/2] connector-c: support static WASIX clients
+
+Use built-in client plugins without dlopen and avoid the unavailable getlogin
+interface when Connector/C is linked into the WASIX MariaDB client.
+
+diff --git a/libmariadb/ma_client_plugin.c.in b/libmariadb/ma_client_plugin.c.in
+index 5c0741d..cc88e1c 100644
+--- a/libmariadb/ma_client_plugin.c.in
++++ b/libmariadb/ma_client_plugin.c.in
+@@ -42,7 +42,29 @@
+ #include "errmsg.h"
+ #include <mysql/client_plugin.h>
+ 
+-#ifndef WIN32
++#if defined(__wasm__)
++static void *dlopen(const char *path, int mode)
++{
++  (void) path;
++  (void) mode;
++  return NULL;
++}
++static void *dlsym(void *handle, const char *symbol)
++{
++  (void) handle;
++  (void) symbol;
++  return NULL;
++}
++static int dlclose(void *handle)
++{
++  (void) handle;
++  return 0;
++}
++static const char *dlerror(void)
++{
++  return "dynamic client plugins are unavailable on WASIX";
++}
++#elif !defined(WIN32)
+ #include <dlfcn.h>
+ #endif
+ 
+@@ -511,4 +533,3 @@ mysql_client_find_plugin(MYSQL *mysql, const char *name, int type)
+   /* not found, load it */
+   return mysql_load_plugin(mysql, name, type, 0);
+ }
+-
+diff --git a/libmariadb/mariadb_lib.c b/libmariadb/mariadb_lib.c
+index 24d5d2d..da0d88b 100644
+--- a/libmariadb/mariadb_lib.c
++++ b/libmariadb/mariadb_lib.c
+@@ -562,6 +562,12 @@ char* getlogin(void);
+ #if !defined(_WIN32)
+ void read_user_name(char *name)
+ {
++#ifdef __wasm__
++  const char *str= getenv("USER");
++  if (!str && !(str= getenv("LOGNAME")) && !(str= getenv("LOGIN")))
++    str= "UNKNOWN_USER";
++  ma_strmake(name, str, USERNAME_LENGTH);
++#else
+   if (geteuid() == 0)
+     strcpy(name,"root");		/* allow use of surun */
+   else
+@@ -585,6 +591,7 @@ void read_user_name(char *name)
+     ma_strmake(name,"UNKNOWN_USER", USERNAME_LENGTH);
+ #endif
+   }
++#endif
+   return;
+ }
+ 

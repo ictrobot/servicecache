@@ -86,6 +86,9 @@ fn run_through_cli(manifest_path: &Path) {
         eprintln!("skipped: {name} has no adapter");
         return;
     };
+    // Several versions of a service can be installed at once, so name the
+    // exact one under test.
+    let spec = format!("{name}@{}", manifest.service.version);
     let services_dir = manifest_path
         .parent()
         .and_then(Path::parent)
@@ -96,7 +99,7 @@ fn run_through_cli(manifest_path: &Path) {
         .arg("--services-dir")
         .arg(services_dir)
         .arg("run")
-        .arg(&name)
+        .arg(&spec)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped());
     let recipe_path =
@@ -136,6 +139,7 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
         eprintln!("skipped: {name} has no adapter");
         return;
     };
+    let spec = format!("{name}@{}", manifest.service.version);
     let services_dir = manifest_path
         .parent()
         .and_then(Path::parent)
@@ -146,7 +150,7 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
         .arg("--services-dir")
         .arg(services_dir)
         .arg("run")
-        .arg(&name)
+        .arg(&spec)
         .arg("--clones")
         .arg("1")
         .arg("--log")
@@ -292,10 +296,10 @@ fn main() {
     let args = libtest_mimic::Arguments::from_args();
     let mut trials = Vec::new();
     for manifest in manifests() {
-        let name = Manifest::load(&manifest)
+        let service = Manifest::load(&manifest)
             .expect("load the manifest")
-            .service
-            .name;
+            .service;
+        let (name, version) = (service.name, service.version);
         if ServiceAdapter::find(&repo_root(), &name).is_none() {
             eprintln!("skipped: {name} has no adapter");
             continue;
@@ -303,7 +307,7 @@ fn main() {
         for &(case, run) in CASES {
             let manifest = manifest.clone();
             trials.push(libtest_mimic::Trial::test(
-                format!("{name}::{case}"),
+                format!("{name}::{version}::{case}"),
                 move || {
                     run(&manifest);
                     Ok(())

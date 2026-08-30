@@ -503,15 +503,15 @@ fn main() {
                 eprintln!("skipped: {} has no adapter", manifest.display());
                 continue;
             };
+            let id = format!("{}::{}", subject.name, subject.manifest.service.version);
             for &(case, run, long) in CASES {
                 let manifest = manifest.clone();
-                let trial =
-                    libtest_mimic::Trial::test(format!("{}::{case}", subject.name), move || {
-                        let subject = Subject::load(&manifest).expect("the adapter was found");
-                        run(&subject);
-                        subject.report_timings(case);
-                        Ok(())
-                    });
+                let trial = libtest_mimic::Trial::test(format!("{id}::{case}"), move || {
+                    let subject = Subject::load(&manifest).expect("the adapter was found");
+                    run(&subject);
+                    subject.report_timings(case);
+                    Ok(())
+                });
                 trials.push(trial.with_ignored_flag(long));
             }
         }
