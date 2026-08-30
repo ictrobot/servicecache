@@ -9,10 +9,14 @@ SMOKE_SERVICE_TARGETS := $(addprefix smoke-,$(SERVICE_TARGETS))
 CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
 PURGE_SERVICE_TARGETS := $(addprefix purge-,$(SERVICE_TARGETS))
 RUN_SERVICE_TARGETS := $(addprefix run-,$(SERVICE_TARGETS))
+# Per-name aggregates that fan out to every installed version of a service.
+SERVICE_NAMES := $(sort $(foreach file,$(SERVICE_VERSION_FILES),$(word 2,$(subst /, ,$(file)))))
+SERVICE_NAME_TARGETS := $(foreach verb,service smoke-service clean-service purge-service,$(addprefix $(verb)-,$(SERVICE_NAMES)))
 
 .PHONY: help bootstrap setup-wasmer build test lint check services services-list smoke smoke-toolchain smoke-services lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_SERVICE_TARGETS)
+.PHONY: $(SERVICE_NAME_TARGETS)
 
 help:
 	@echo "bootstrap                       install the pinned WASIX toolchain into work/toolchains"
@@ -39,6 +43,7 @@ help:
 	@echo "clean-wasix-libc                reset work/wasix-libc to the pristine tag so bootstrap re-applies the series"
 	@echo "clean-service-<name>-<version>  the same for one service version"
 	@echo "purge-service-<name>-<version>  also remove its source checkout"
+	@echo "service-<name>                  (also smoke-/clean-/purge-service-<name>) the same across every installed version"
 	@echo "purge                           remove work/ and target/ entirely, including the toolchain"
 
 bootstrap:
@@ -122,3 +127,13 @@ purge-service-$(1)-$(2):
 endef
 
 $(foreach file,$(SERVICE_VERSION_FILES),$(eval $(call service_version_rules,$(word 2,$(subst /, ,$(file))),$(word 4,$(subst /, ,$(file))))))
+
+# service-<name>, smoke-service-<name>, clean-service-<name>, purge-service-<name>:
+# every version of that service. There is no run-<name>: run starts one guest.
+define service_name_rules
+service-$(1): $(filter service-$(1)-%,$(SERVICE_TARGETS))
+smoke-service-$(1): $(filter smoke-service-$(1)-%,$(SMOKE_SERVICE_TARGETS))
+clean-service-$(1): $(filter clean-service-$(1)-%,$(CLEAN_SERVICE_TARGETS))
+purge-service-$(1): $(filter purge-service-$(1)-%,$(PURGE_SERVICE_TARGETS))
+endef
+$(foreach name,$(SERVICE_NAMES),$(eval $(call service_name_rules,$(name))))
