@@ -9,13 +9,14 @@ SMOKE_SERVICE_TARGETS := $(addprefix smoke-,$(SERVICE_TARGETS))
 CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
 PURGE_SERVICE_TARGETS := $(addprefix purge-,$(SERVICE_TARGETS))
 RUN_SERVICE_TARGETS := $(addprefix run-,$(SERVICE_TARGETS))
+LIFECYCLE_SERVICE_TARGETS := $(addprefix lifecycle-,$(SERVICE_TARGETS))
 # Per-name aggregates that fan out to every installed version of a service.
 SERVICE_NAMES := $(sort $(foreach file,$(SERVICE_VERSION_FILES),$(word 2,$(subst /, ,$(file)))))
-SERVICE_NAME_TARGETS := $(foreach verb,service smoke-service clean-service purge-service,$(addprefix $(verb)-,$(SERVICE_NAMES)))
+SERVICE_NAME_TARGETS := $(foreach verb,service smoke-service clean-service purge-service lifecycle-service,$(addprefix $(verb)-,$(SERVICE_NAMES)))
 
 .PHONY: help bootstrap setup-wasmer build test lint check serve services services-list smoke smoke-toolchain smoke-services lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
-.PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_SERVICE_TARGETS)
+.PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_SERVICE_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
 .PHONY: $(SERVICE_NAME_TARGETS)
 
 help:
@@ -34,6 +35,7 @@ help:
 	@echo "lifecycle-tests-long            the same plus the long cases (thousands of forks)"
 	@echo "lifecycle-tests-release         the quick matrix on a release build, for latency figures"
 	@echo "lifecycle-tests-long-release    the long matrix on a release build"
+	@echo "lifecycle-service-<name>-<version> build if needed, then run its quick lifecycle trials"
 	@echo "serve                           serve the manager's HTTP API for services under work/services (--socket/SERVICECACHE_SOCKET overrides the socket)"
 	@echo "services-list                   list services assembled under work/services"
 	@echo "run-service-<name>-<version>    run one service through a host and print its endpoint; RECIPE=<file> feeds the initializer, CLONES=<n> forks clones on Enter"
@@ -44,7 +46,7 @@ help:
 	@echo "clean-wasix-libc                reset work/wasix-libc to the pristine tag so bootstrap re-applies the series"
 	@echo "clean-service-<name>-<version>  the same for one service version"
 	@echo "purge-service-<name>-<version>  also remove its source checkout"
-	@echo "service-<name>                  (also smoke-/clean-/purge-service-<name>) the same across every installed version"
+	@echo "service-<name>                  (also smoke-/clean-/purge-/lifecycle-service-<name>) the same across every installed version"
 	@echo "purge                           remove work/ and target/ entirely, including the toolchain"
 
 bootstrap:
@@ -123,6 +125,9 @@ smoke-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO
 run-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO | setup-wasmer
 	SERVICECACHE_SERVICES_DIR=work/services cargo run --release -- run $(1)@$(2) $$(if $$(RECIPE),--recipe $$(RECIPE)) $$(if $$(CLONES),--clones $$(CLONES))
 
+lifecycle-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO | setup-wasmer
+	SERVICECACHE_LIFECYCLE=1 cargo test --test lifecycle -- '$(1)::$(2)::'
+
 clean-service-$(1)-$(2):
 	toolchain/clean.sh $(1) $(2)
 
@@ -132,12 +137,17 @@ endef
 
 $(foreach file,$(SERVICE_VERSION_FILES),$(eval $(call service_version_rules,$(word 2,$(subst /, ,$(file))),$(word 4,$(subst /, ,$(file))))))
 
-# service-<name>, smoke-service-<name>, clean-service-<name>, purge-service-<name>:
-# every version of that service. There is no run-<name>: run starts one guest.
+# service-<name>, smoke-service-<name>, clean-service-<name>,
+# purge-service-<name>, lifecycle-service-<name>: every version of that
+# service. There is no run-<name>: run starts one guest. The lifecycle
+# aggregate is one cargo run with a name filter, so its trials share the
+# harness's parallelism.
 define service_name_rules
 service-$(1): $(filter service-$(1)-%,$(SERVICE_TARGETS))
 smoke-service-$(1): $(filter smoke-service-$(1)-%,$(SMOKE_SERVICE_TARGETS))
 clean-service-$(1): $(filter clean-service-$(1)-%,$(CLEAN_SERVICE_TARGETS))
 purge-service-$(1): $(filter purge-service-$(1)-%,$(PURGE_SERVICE_TARGETS))
+lifecycle-service-$(1): $(patsubst service-$(1)-%,work/services/$(1)-%/BUILD-INFO,$(filter service-$(1)-%,$(SERVICE_TARGETS))) | setup-wasmer
+	SERVICECACHE_LIFECYCLE=1 cargo test --test lifecycle -- '$(1)::'
 endef
 $(foreach name,$(SERVICE_NAMES),$(eval $(call service_name_rules,$(name))))
