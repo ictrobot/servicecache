@@ -112,7 +112,7 @@ smoke-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO
 	services/$(1)/smoke/smoke.sh $(2)
 
 run-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO | setup-wasmer
-	SERVICECACHE_SERVICES_DIR=work/services cargo run -- run $(1)@$(2) $$(if $$(RECIPE),--recipe $$(RECIPE))
+	SERVICECACHE_SERVICES_DIR=work/services cargo run --release -- run $(1)@$(2) $$(if $$(RECIPE),--recipe $$(RECIPE))
 
 clean-service-$(1)-$(2):
 	toolchain/clean.sh $(1) $(2)
