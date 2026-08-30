@@ -14,14 +14,16 @@ case "$OPENSSL_VERSION" in
   3.5.8) openssl_sha256=a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2 ;;
   *) sc_fail "unsupported OpenSSL version: $OPENSSL_VERSION"; return 1 2>/dev/null || exit 1 ;;
 esac
-case "$BOOST_VERSION" in
+# MySQL 8.4 and later bundle Boost; 8.0 pins the release to download.
+case "${BOOST_VERSION:-}" in
+  "") ;;
   1.77.0) boost_sha256=fc9f85fc030e233142908241af7a846e60630aa7388de9a5fafb1f3a26840854 ;;
   *) sc_fail "unsupported Boost version: $BOOST_VERSION"; return 1 2>/dev/null || exit 1 ;;
 esac
 
 MYSQL_DEPS_DIR="$SC_WORK/deps/mysql"
 MYSQL_OPENSSL_DIR="$MYSQL_DEPS_DIR/openssl-$OPENSSL_VERSION"
-MYSQL_BOOST_DIR="$MYSQL_DEPS_DIR/boost-$BOOST_VERSION"
+MYSQL_BOOST_DIR="${BOOST_VERSION:+$MYSQL_DEPS_DIR/boost-$BOOST_VERSION}"
 export MYSQL_DEPS_DIR MYSQL_OPENSSL_DIR MYSQL_BOOST_DIR
 
 download() {
@@ -143,4 +145,6 @@ for command_name in curl grep make perl sha256sum tar; do
 done
 
 install_openssl
-install_boost_source
+if [[ -n "${BOOST_VERSION:-}" ]]; then
+  install_boost_source
+fi

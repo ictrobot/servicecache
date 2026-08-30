@@ -5,3 +5,4 @@
 0005-adapt-innodb-to-wasix-filesystems.patch
 0006-disable-cross-process-myisam-locking.patch
 0007-build-batch-only-mysql-client.patch
+0009-innodb-use-fsync-instead-of-fdatasync-under-wasmer.patch

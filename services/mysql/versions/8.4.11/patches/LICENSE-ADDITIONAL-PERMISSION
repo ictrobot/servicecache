@@ -1,0 +1,10 @@
+Additional permission for the MySQL WASIX patches
+
+These patches are designed to work with certain software (including but not
+limited to OpenSSL) that is licensed under separate terms, as designated by
+the authors of MySQL in a particular file or component or in included license
+documentation. Without limiting your rights under the GPLv2, the copyright
+holder of these patches hereby grants you an additional permission to link
+the patched program and your derivative works with the separately licensed
+software that the authors of MySQL have either included with the program or
+referenced in the documentation.

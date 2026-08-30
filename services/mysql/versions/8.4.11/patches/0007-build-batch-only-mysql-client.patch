@@ -1,0 +1,123 @@
+Subject: [PATCH 7/7] client: build batch-only mysql module for WASIX
+
+Build the standard mysql client without its terminal editing path. Standard
+input and --execute retain the upstream batch parser and direct TCP/TLS client
+implementation.
+
+diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
+index 4ca14701..a217c891 100644
+--- a/client/CMakeLists.txt
++++ b/client/CMakeLists.txt
+@@ -43,6 +43,10 @@ MYSQL_ADD_EXECUTABLE(mysql
+   LINK_LIBRARIES mysqlclient ${EDITLINE_LIBRARY}
+   )
+ 
++IF(WASIX)
++  TARGET_COMPILE_DEFINITIONS(mysql PRIVATE MYSQL_BATCH_ONLY)
++ENDIF()
++
+ MYSQL_ADD_EXECUTABLE(mysqltest
+   mysqltest.cc
+   mysqltest/error_names.cc
+diff --git a/client/mysql.cc b/client/mysql.cc
+index aea2613f..7faae599 100644
+--- a/client/mysql.cc
++++ b/client/mysql.cc
+@@ -91,12 +91,14 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
+ 
+ // Not using syslog but EventLog on Win32, so a dummy facility is enough.
+ #define LOG_USER 0
+-#else
++#elif !defined(MYSQL_BATCH_ONLY)
+ #include <readline.h>
+ #include <syslog.h>
+ 
+ #define HAVE_READLINE
+ #define USE_POPEN
++#else
++#include <syslog.h>
+ #endif
+ 
+ #include <mysqld_error.h>
+@@ -370,11 +372,13 @@ static void init_pager();
+ static void end_pager();
+ static void init_tee(const char *);
+ static void end_tee();
++#ifndef MYSQL_BATCH_ONLY
+ static const char *construct_prompt();
+ static inline void reset_prompt(char *in_string, bool *ml_comment);
+-static char *get_arg(char *line, bool get_next_arg);
+ static void init_username();
+ static void add_int_to_prompt(int toadd);
++#endif
++static char *get_arg(char *line, bool get_next_arg);
+ static int get_result_width(MYSQL_RES *res);
+ static int get_field_disp_length(MYSQL_FIELD *field);
+ static int normalize_dbname(const char *line, char *buff, uint buff_size);
+@@ -1316,12 +1320,18 @@ int main(int argc, char *argv[]) {
+       my_stpcpy(default_pager, tmp);
+     }
+   }
++#ifdef MYSQL_BATCH_ONLY
++  status.batch = true;
++  opt_silent = 1;
++  ignore_errors = false;
++#else
+   if (!isatty(0) || !isatty(1)) {
+     status.batch = true;
+     opt_silent = 1;
+     ignore_errors = false;
+   } else
+     status.add_to_history = true;
++#endif
+   status.exit_status = 1;
+ 
+   {
+@@ -2375,6 +2385,9 @@ static int read_and_execute(bool interactive) {
+       line_number++;
+       if (!glob_buffer.length()) status.query_start_line = line_number;
+     } else {
++#ifdef MYSQL_BATCH_ONLY
++      line = nullptr;
++#else
+       const char *prompt;
+       if (ml_comment) {
+         prompt = "   /*> ";
+@@ -2434,6 +2447,7 @@ static int read_and_execute(bool interactive) {
+         continue;
+       }
+ #endif /* defined(_WIN32) */
++#endif /* MYSQL_BATCH_ONLY */
+       /*
+         When Ctrl+d or Ctrl+z is pressed, the line may be NULL on some OS
+         which may cause coredump.
+@@ -2534,11 +2548,13 @@ static int read_and_execute(bool interactive) {
+   return status.exit_status;
+ }
+ 
++#ifndef MYSQL_BATCH_ONLY
+ static inline void reset_prompt(char *in_string, bool *ml_comment) {
+   glob_buffer.length(0);
+   *ml_comment = false;
+   *in_string = 0;
+ }
++#endif
+ 
+ /**
+    It checks if the input is a short form command. It returns the command's
+@@ -5647,6 +5663,7 @@ static void mysql_end_timer(ulong start_time, char *buff) {
+   my_stpcpy(strend(buff), ")");
+ }
+ 
++#ifndef MYSQL_BATCH_ONLY
+ static const char *construct_prompt() {
+   processed_prompt.mem_free();          // Erase the old prompt
+   const time_t lclock = time(nullptr);  // Get the date struct
+@@ -5817,6 +5834,7 @@ static void init_username() {
+     (void)mysql_fetch_row(result);  // Read eof
+   }
+ }
++#endif
+ 
+ // Get the current OS user name.
+ static void get_current_os_user() {

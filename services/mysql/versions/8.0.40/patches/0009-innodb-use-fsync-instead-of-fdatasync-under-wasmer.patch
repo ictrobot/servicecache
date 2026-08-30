@@ -1,0 +1,57 @@
+Subject: [PATCH] innodb: use fsync() instead of fdatasync() under Wasmer
+
+Works around a Wasmer bug, not a WASIX limitation. Observed with Wasmer
+7.3.0 (WASIX sysroot v2026-07-30.1, wasixcc 0.4.5), the newest release on
+2026-08-29: fdatasync() on a file that another thread is concurrently
+writing eventually never returns, and once it has stalled the process can
+no longer exit either. fsync() under the same concurrency is fine.
+
+A small standalone WASIX program reproduces it without MySQL: one thread
+pwrite()s 8 KiB blocks to a file while a second thread loops fdatasync() on
+the same descriptor, with a watchdog thread that reports when both counters
+stop moving. The fsync() variant completes 4000 writes every time; every
+variant with fdatasync() anywhere stalls within seconds, whether or not a
+second descriptor to the file is involved.
+
+InnoDB's redo log writer and flusher are exactly that pair of threads. With
+innodb_use_fdatasync=ON the flusher stalls inside fdatasync() while holding
+the flusher mutex, the writer blocks on that mutex when it marks the first
+redo file full (log_files_produce_file), and --initialize hangs silently
+with every thread idle: 8.4 buffers the error log until after InnoDB
+initialization, so nothing is printed. 8.4 defaults innodb_use_fdatasync=ON,
+so this patch is required there; earlier versions default it OFF and hit the
+hang only when the flag is set.
+
+srv_use_fdatasync is consulted in exactly one place, os_file_fsync_posix(),
+so compile the pre-existing fsync() fallback (the branch upstream uses where
+configure finds no fdatasync()) on wasm builds. The system variable still
+exists and can be set; it has no effect.
+
+After upgrading Wasmer, re-run the reproduction described above (or
+build with this patch omitted and run the MySQL smoke test); if fdatasync()
+returns, this patch can be dropped.
+
+diff --git a/storage/innobase/os/os0file.cc b/storage/innobase/os/os0file.cc
+index 7a23b9f4..ce0e0222 100644
+--- a/storage/innobase/os/os0file.cc
++++ b/storage/innobase/os/os0file.cc
+@@ -2829,11 +2829,16 @@ static int os_file_fsync_posix(os_file_t file) {
+     meb_mutex.unlock();
+ #endif /* UNIV_HOTBACKUP */
+ 
+-#if defined(HAVE_FDATASYNC) && defined(HAVE_DECL_FDATASYNC)
++#if defined(HAVE_FDATASYNC) && defined(HAVE_DECL_FDATASYNC) && \
++    !defined(__wasm__)
+     const auto ret = srv_use_fdatasync ? fdatasync(file) : fsync(file);
+-#else  /* !(HAVE_FDATASYNC && HAVE_DECL_FDATASYNC) */
++#else  /* !(HAVE_FDATASYNC && HAVE_DECL_FDATASYNC) || __wasm__ */
++    /* Under Wasmer 7.3.0, fdatasync() racing with a write to the same file
++    from another thread eventually never returns, and the redo log flusher
++    and writer are exactly that pair. fsync() does not stall, so
++    innodb_use_fdatasync is ignored on WASIX. */
+     const auto ret = fsync(file);
+-#endif /* !(HAVE_FDATASYNC && HAVE_DECL_FDATASYNC) */
++#endif /* !(HAVE_FDATASYNC && HAVE_DECL_FDATASYNC) || __wasm__ */
+ 
+     if (ret == 0) {
+       return (ret);

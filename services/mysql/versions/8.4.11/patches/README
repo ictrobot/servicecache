@@ -1,4 +1,4 @@
-These patches modify MySQL 8.0.40 for WASIX.
+These patches modify MySQL 8.4.11 for WASIX.
 
 Copyright (c) 2026 Ethan Jones
 
@@ -17,7 +17,3 @@ in each:
 
 Context lines are from upstream and remain the copyright of their authors
 under upstream's terms.
-
-0009-innodb-use-fsync-instead-of-fdatasync-under-wasmer.patch works around a
-bug in Wasmer 7.3.0 rather than a WASIX limitation; its message explains how
-to re-test it after a Wasmer upgrade so it can be dropped.

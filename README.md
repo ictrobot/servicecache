@@ -19,7 +19,7 @@ ServiceCache is designed to be generic: the manager knows how to run, freeze, sn
 | Service    | Versions                          |
 |------------|-----------------------------------|
 | MariaDB    | 10.11.19, 11.4.13, 11.8.9, 12.3.3 |
-| MySQL      | 8.0.40, 8.0.46                     |
+| MySQL      | 8.0.40, 8.0.46, 8.4.11            |
 | Valkey     | 9.1.1                             |
 | beanstalkd | 1.13                              |
 

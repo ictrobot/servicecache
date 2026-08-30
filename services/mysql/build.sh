@@ -17,6 +17,33 @@ if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+# Dependencies, plugins and bundled libraries that differ between MySQL
+# release series. 8.0 downloads Boost; 8.4 bundles it.
+case "$SC_VERSION" in
+  8.0.*)
+    series_options=(
+      -DWITH_BOOST="$MYSQL_BOOST_DIR"
+      -DDOWNLOAD_BOOST=OFF
+      -DWITH_INNODB_MEMCACHED=OFF
+      -DWITH_AUTHENTICATION_FIDO=OFF
+      -DWITH_LIBEVENT=bundled
+    )
+    ;;
+  8.4.*)
+    # 8.4 is C++20. Upstream injects -std=c++20 through its default compiler
+    # options, which this build turns off, and the compile feature MySQL sets
+    # on its convenience libraries does not reach their object libraries.
+    series_options=(
+      -DWITH_AUTHENTICATION_WEBAUTHN=OFF
+      -DCMAKE_CXX_STANDARD=20
+      -DCMAKE_CXX_EXTENSIONS=OFF
+    )
+    ;;
+  *)
+    sc_fail "no CMake options defined for MySQL $SC_VERSION"
+    ;;
+esac
+
 servicecache_revision="$(git -C "$SC_ROOT" rev-parse --short HEAD)"
 cmake -S "$SC_SRC" -B "$SC_BUILD" \
   -G "Unix Makefiles" \
@@ -29,7 +56,6 @@ cmake -S "$SC_SRC" -B "$SC_BUILD" \
   -DTMPDIR=/tmp \
   -DFORCE_UNSUPPORTED_COMPILER=ON \
   -DWITH_DEFAULT_COMPILER_OPTIONS=OFF \
-  -DWITH_BUILD_ID=OFF \
   -DWITH_UNIT_TESTS=OFF \
   -DWITH_ROUTER=OFF \
   -DWITH_MYSQLX=OFF \
@@ -39,13 +65,11 @@ cmake -S "$SC_SRC" -B "$SC_BUILD" \
   -DWITH_ARCHIVE_STORAGE_ENGINE=OFF \
   -DWITH_BLACKHOLE_STORAGE_ENGINE=OFF \
   -DWITH_FEDERATED_STORAGE_ENGINE=OFF \
-  -DWITH_INNODB_MEMCACHED=OFF \
-  -DWITH_AUTHENTICATION_FIDO=OFF \
+  -DWITH_NDBCLUSTER_STORAGE_ENGINE=OFF \
   -DWITH_AUTHENTICATION_LDAP=OFF \
   -DWITH_AUTHENTICATION_KERBEROS=OFF \
   -DWITH_AUTHENTICATION_CLIENT_PLUGINS=OFF \
   -DWITH_EDITLINE=none \
-  -DWITH_KEYRING_TEST=OFF \
   -DWITH_TEST_TRACE_PLUGIN=OFF \
   -DWITH_LDAP=none \
   -DWITH_KERBEROS=none \
@@ -55,14 +79,12 @@ cmake -S "$SC_SRC" -B "$SC_BUILD" \
   -DOPENSSL_INCLUDE_DIR="$MYSQL_OPENSSL_DIR/include" \
   -DOPENSSL_LIBRARY="$MYSQL_OPENSSL_DIR/lib/libssl.a" \
   -DCRYPTO_LIBRARY="$MYSQL_OPENSSL_DIR/lib/libcrypto.a" \
-  -DWITH_BOOST="$MYSQL_BOOST_DIR" \
-  -DDOWNLOAD_BOOST=OFF \
   -DWITH_ZLIB=bundled \
   -DWITH_ZSTD=bundled \
   -DWITH_LZ4=bundled \
   -DWITH_ICU=bundled \
-  -DWITH_LIBEVENT=bundled \
   -DWITH_PROTOBUF=bundled \
+  "${series_options[@]}" \
   -DMYSQL_SERVER_SUFFIX=-servicecache \
   -DCOMPILATION_COMMENT_SERVER="WASIX build for ServiceCache, rev $servicecache_revision"
 
