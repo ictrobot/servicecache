@@ -1,4 +1,4 @@
-This patch modifies the protobuf 24.4 sources bundled with MySQL 8.0.40 for
+This patch modifies the protobuf 24.4 sources bundled with MySQL for
 WASIX. It is licensed under the BSD-3-Clause License (see LICENSE), the same
 terms as upstream protobuf. Context lines are from upstream and remain the
 copyright of their authors under that licence.

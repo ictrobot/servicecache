@@ -1,0 +1,32 @@
+Subject: [PATCH] cmake: pass zlib's detected HAVE_UNISTD_H to the compiler
+
+The zlib 1.3.2 bundled since MySQL 8.0.46 ships a zconf.h in its source tree,
+which zlib.h finds before the generated one that carries the HAVE_UNISTD_H
+detected at configure time. Upstream zlib instead defines _LARGEFILE64_SOURCE
+on its own library targets, which MySQL's wrapper skips. Linux builds get that
+macro from the global -D_GNU_SOURCE; WASIX builds get neither, so gzlib.c and
+gzread.c call lseek(), read() and close() undeclared, an error with current
+Clang. Define HAVE_UNISTD_H for the bundled zlib when the check found it.
+
+diff --git a/extra/zlib/zlib-1.3.2/CMakeLists.txt b/extra/zlib/zlib-1.3.2/CMakeLists.txt
+index 878df1ad..a8decb80 100644
+--- a/extra/zlib/zlib-1.3.2/CMakeLists.txt
++++ b/extra/zlib/zlib-1.3.2/CMakeLists.txt
+@@ -155,6 +155,17 @@ set(ZLIB_SRCS
+     zutil.c)
+ 
+ 
++# zlib.h includes the zconf.h beside it in the source tree, so the
++# HAVE_UNISTD_H that check_include_file() wrote into the generated zconf.h
++# never reaches the compiler.  Upstream zlib also lets _LARGEFILE64_SOURCE
++# imply <unistd.h>, but only defines it on the targets skipped below.  Without
++# either, gzlib.c and gzread.c call lseek(), read() and close() undeclared,
++# which is an error with current Clang.  Linux builds get _LARGEFILE64_SOURCE
++# from the global -D_GNU_SOURCE instead.
++IF(HAVE_UNISTD_H)
++  ADD_DEFINITIONS(-DHAVE_UNISTD_H=1)
++ENDIF()
++
+ ADD_CONVENIENCE_LIBRARY(zlib
+   ${ZLIB_SRCS} ${ZLIB_PUBLIC_HDRS} ${ZLIB_PRIVATE_HDRS})
+ 

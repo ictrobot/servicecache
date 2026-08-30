@@ -1,5 +1,5 @@
-These patches modify the MySQL C API client library (libmysqlclient) in
-MySQL 8.0.40 for WASIX.
+These patches modify the MySQL C API client library (libmysqlclient)
+for WASIX.
 
 Copyright (c) 2026 Ethan Jones
 
