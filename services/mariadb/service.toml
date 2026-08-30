@@ -1,0 +1,18 @@
+[service]
+name = "mariadb"
+version = "{version}"
+
+[prepare]
+fs = { "/usr/share/mariadb" = "share/" }
+module = "mariadbd.wasm"
+args = ["--no-defaults", "--bootstrap", "--silent-startup", "--user=root", "--basedir=/", "--datadir=/data", "--tmpdir=/tmp", "--lc-messages-dir=/usr/share/mariadb", "--character-sets-dir=/usr/share/mariadb/charsets", "--skip-log-error", "--log-warnings=0", "--enforce-storage-engine=", "--max-allowed-packet=8M", "--net-buffer-length=16K", "--innodb-buffer-pool-size=16M", "--innodb-log-file-size=16M", "--skip-log-bin"]
+stdin_file = "share/bootstrap.sql"
+
+[guest]
+module = "mariadbd.wasm"
+args = ["--no-defaults", "--user=root", "--basedir=/", "--datadir=/data", "--tmpdir=/tmp", "--lc-messages-dir=/usr/share/mariadb", "--character-sets-dir=/usr/share/mariadb/charsets", "--port=3306", "--bind-address=127.0.0.1", "--socket=", "--pid-file=/data/mariadbd.pid", "--innodb-buffer-pool-size=16M", "--innodb-log-file-size=16M", "--innodb-open-files=64", "--innodb-read-io-threads=1", "--innodb-write-io-threads=2", "--innodb-purge-threads=1", "--skip-log-bin", "--console"]
+listen_port = 3306
+
+[initializer]
+module = "mariadb.wasm"
+args = ["-h", "{host}", "-P", "{port}", "-u", "root", "--batch"]

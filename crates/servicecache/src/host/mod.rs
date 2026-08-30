@@ -449,10 +449,11 @@ impl Host {
         let status = match &self.manifest.prepare {
             Some(prepare) if prepare.module.is_some() => {
                 let module = prepare.module.clone().expect("checked");
+                let stdin = prepare.read_stdin()?;
                 let handle = self.guests.spawn(&GuestRun {
                     module: &module,
                     args: prepare.args.clone(),
-                    stdin: &[],
+                    stdin: &stdin,
                     network: false,
                 })?;
                 self.watch_run(&handle);

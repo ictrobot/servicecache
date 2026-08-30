@@ -31,6 +31,7 @@ pub struct Prepare {
     pub fs: BTreeMap<PathBuf, PathBuf>,
     pub module: Option<PathBuf>,
     pub args: Vec<String>,
+    pub stdin_file: Option<PathBuf>,
 }
 
 /// The serving module and its runtime settings.
@@ -65,6 +66,7 @@ struct RawPrepare {
     module: Option<PathBuf>,
     #[serde(default)]
     args: Vec<String>,
+    stdin_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +165,27 @@ impl Manifest {
     }
 }
 
+impl Prepare {
+    /// Read the package file configured as the prepare module's standard input.
+    ///
+    /// An absent `stdin_file` produces an empty input stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured file can no longer be read.
+    pub fn read_stdin(&self) -> Result<Vec<u8>> {
+        self.stdin_file
+            .as_ref()
+            .map(|path| {
+                fs::read(path).with_context(|| {
+                    format!("failed to read prepare stdin file {}", path.display())
+                })
+            })
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
 fn resolve_prepare(raw: RawPrepare, directory: &Path) -> Result<Prepare> {
     let mut mounts = BTreeMap::new();
     for (guest, source) in raw.fs {
@@ -193,15 +216,25 @@ fn resolve_prepare(raw: RawPrepare, directory: &Path) -> Result<Prepare> {
         .as_deref()
         .map(|path| resolve_module(directory, path, "prepare module"))
         .transpose()?;
+    let stdin_file = raw
+        .stdin_file
+        .as_deref()
+        .map(|path| resolve_file(directory, path, "prepare stdin file"))
+        .transpose()?;
 
     Ok(Prepare {
         fs: mounts,
         module,
         args: raw.args,
+        stdin_file,
     })
 }
 
 fn resolve_module(directory: &Path, path: &Path, description: &str) -> Result<PathBuf> {
+    resolve_file(directory, path, description)
+}
+
+fn resolve_file(directory: &Path, path: &Path, description: &str) -> Result<PathBuf> {
     reject_absolute(path, description)?;
     let resolved = directory.join(path);
     ensure!(
@@ -280,6 +313,7 @@ mod tests {
         let directory = TestDirectory::new();
         fs::create_dir(directory.0.join("share")).expect("create mounted directory");
         directory.write("prepare.wasm", "prepare");
+        directory.write("bootstrap.sql", "select 1;\n");
         directory.write("server.wasm", "server");
         directory.write("client.wasm", "client");
         directory.write(
@@ -293,6 +327,7 @@ mod tests {
                 fs = { "/usr/share/example" = "share" }
                 module = "prepare.wasm"
                 args = ["--prepare"]
+                stdin_file = "bootstrap.sql"
 
                 [guest]
                 module = "server.wasm"
@@ -312,6 +347,8 @@ mod tests {
             Some(&directory.0.join("share"))
         );
         assert_eq!(prepare.module, Some(directory.0.join("prepare.wasm")));
+        assert_eq!(prepare.stdin_file, Some(directory.0.join("bootstrap.sql")));
+        assert_eq!(prepare.read_stdin().expect("read stdin"), b"select 1;\n");
         assert_eq!(manifest.guest.module, directory.0.join("server.wasm"));
         assert_eq!(
             manifest.initializer.as_ref().expect("initializer").module,
@@ -420,5 +457,51 @@ mod tests {
         let missing_error = Manifest::load(&directory.0.join("service.toml"))
             .expect_err("missing mount source should fail");
         assert!(missing_error.to_string().contains("is not a directory"));
+    }
+
+    #[test]
+    fn rejects_absolute_and_missing_prepare_stdin_files() {
+        let directory = TestDirectory::new();
+        directory.write("prepare.wasm", "prepare");
+        directory.write("server.wasm", "server");
+        directory.write(
+            "service.toml",
+            r#"
+                [service]
+                name = "example"
+                version = "1"
+
+                [prepare]
+                module = "prepare.wasm"
+                stdin_file = "/bootstrap.sql"
+
+                [guest]
+                module = "server.wasm"
+                listen_port = 1234
+            "#,
+        );
+        let absolute_error = Manifest::load(&directory.0.join("service.toml"))
+            .expect_err("absolute stdin path should fail");
+        assert!(absolute_error.to_string().contains("must be relative"));
+
+        directory.write(
+            "service.toml",
+            r#"
+                [service]
+                name = "example"
+                version = "1"
+
+                [prepare]
+                module = "prepare.wasm"
+                stdin_file = "missing.sql"
+
+                [guest]
+                module = "server.wasm"
+                listen_port = 1234
+            "#,
+        );
+        let missing_error = Manifest::load(&directory.0.join("service.toml"))
+            .expect_err("missing stdin path should fail");
+        assert!(missing_error.to_string().contains("is not a file"));
     }
 }

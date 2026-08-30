@@ -1,0 +1,186 @@
+Subject: [PATCH 2/6] mysys: adapt locking, durability and memory to WASIX
+
+WASIX has no POSIX advisory file locks, no fdatasync, no directory sync
+and no large pages, and its mmap gives anonymous private memory only. A
+service instance owns its data directory, so my_lock succeeds without
+locking; my_sync uses fsync and tolerates the errors WASIX reports for
+directories, and my_sync_dir does nothing; the virtual memory helpers
+reserve and commit with plain mmap; the F_*LCK constants and _GNU_SOURCE
+are defined where WASIX's headers lack them; user switching is a no-op,
+as on Windows.
+
+diff --git a/include/my_global.h b/include/my_global.h
+index 52d89a94..f221a866 100644
+--- a/include/my_global.h
++++ b/include/my_global.h
+@@ -190,7 +190,7 @@
+ #endif
+ 
+ /* Fix problem with S_ISLNK() on Linux */
+-#if defined(TARGET_OS_LINUX) || defined(__GLIBC__)
++#if defined(TARGET_OS_LINUX) || defined(__GLIBC__) || defined(__wasm__)
+ #undef  _GNU_SOURCE
+ #define _GNU_SOURCE 1
+ #endif
+@@ -310,6 +310,12 @@ C_MODE_END
+ #ifdef HAVE_FCNTL_H
+ #include <fcntl.h>
+ #endif
++#if defined(__wasm__) && !defined(F_UNLCK)
++/* WASIX omits advisory record-lock constants from its default fcntl.h. */
++#define F_RDLCK 0
++#define F_WRLCK 1
++#define F_UNLCK 2
++#endif
+ #ifdef HAVE_SYS_STAT_H
+ #include <sys/stat.h>
+ #endif
+diff --git a/include/my_sys.h b/include/my_sys.h
+index 43f26351..857b455f 100644
+--- a/include/my_sys.h
++++ b/include/my_sys.h
+@@ -676,6 +676,10 @@ extern void *my_memmem(const void *haystack, size_t haystacklen,
+ extern int      my_access(const char *path, int amode);
+ #define my_check_user(A,B) (NULL)
+ #define my_set_user(A,B,C) (0)
++#elif defined(__wasm__)
++#define my_access access
++#define my_check_user(A,B) (NULL)
++#define my_set_user(A,B,C) (0)
+ #else
+ #define my_access access
+ struct passwd *my_check_user(const char *user, myf MyFlags);
+diff --git a/mysys/my_largepage.c b/mysys/my_largepage.c
+index 66f45b84..f36d873c 100644
+--- a/mysys/my_largepage.c
++++ b/mysys/my_largepage.c
+@@ -20,7 +20,7 @@
+ #ifdef __linux__
+ #include <dirent.h>
+ #endif
+-#if defined(__linux__) || defined(MAP_ALIGNED)
++#if defined(__linux__) || defined(MAP_ALIGNED) || defined(MAP_HUGE_SHIFT)
+ #include "my_bit.h"
+ #endif
+ #ifdef HAVE_LINUX_MMAN_H
+diff --git a/mysys/my_lock.c b/mysys/my_lock.c
+index 7597436f..10850550 100644
+--- a/mysys/my_lock.c
++++ b/mysys/my_lock.c
+@@ -148,7 +148,17 @@ int my_lock(File fd, int locktype, my_off_t start, my_off_t length,
+   if (my_disable_locking && ! (MyFlags & MY_FORCE_LOCK))
+     DBUG_RETURN(0);
+ 
+-#if defined(_WIN32)
++#if defined(__wasm__)
++  /* A WASIX service instance has exclusive ownership of its data directory.
++     Retain MariaDB's in-process table locks without unavailable POSIX
++     cross-process record locks. */
++  (void) fd;
++  (void) locktype;
++  (void) start;
++  (void) length;
++  (void) MyFlags;
++  DBUG_RETURN(0);
++#elif defined(_WIN32)
+   {
+     int timeout_sec;
+     if (MyFlags & MY_NO_WAIT)
+diff --git a/mysys/my_sync.c b/mysys/my_sync.c
+index 6f8760c3..61a667f7 100644
+--- a/mysys/my_sync.c
++++ b/mysys/my_sync.c
+@@ -80,7 +80,9 @@ int my_sync(File fd, myf my_flags)
+     /* Some file systems don't support F_FULLFSYNC and fail above: */
+     DBUG_PRINT("info",("fcntl(F_FULLFSYNC) failed, falling back"));
+ #endif
+-#if defined(HAVE_FDATASYNC) && HAVE_DECL_FDATASYNC
++#if defined(__wasm__)
++    res= fsync(fd);
++#elif defined(HAVE_FDATASYNC) && HAVE_DECL_FDATASYNC
+     res= fdatasync(fd);
+ #elif defined(HAVE_FSYNC)
+     res= fsync(fd);
+@@ -102,7 +104,11 @@ int my_sync(File fd, myf my_flags)
+     if (after_sync_wait)
+       (*after_sync_wait)();
+     if ((my_flags & MY_IGNORE_BADFD) &&
+-        (er == EBADF || er == EINVAL || er == EROFS))
++        (er == EBADF || er == EINVAL || er == EROFS
++#ifdef __wasm__
++         || er == EACCES || er == EISDIR
++#endif
++        ))
+     {
+       DBUG_PRINT("info", ("ignoring errno %d", er));
+       res= 0;
+@@ -134,7 +140,9 @@ int my_sync(File fd, myf my_flags)
+ int my_sync_dir(const char *dir_name __attribute__((unused)),
+                 myf my_flags __attribute__((unused)))
+ {
+-#ifdef NEED_EXPLICIT_SYNC_DIR
++#if defined(__wasm__)
++  return 0;
++#elif defined(NEED_EXPLICIT_SYNC_DIR)
+   static const char cur_dir_name[]= {FN_CURLIB, 0};
+   File dir_fd;
+   int res= 0;
+diff --git a/mysys/my_virtual_mem.c b/mysys/my_virtual_mem.c
+index acd63a9b..85c63d4a 100644
+--- a/mysys/my_virtual_mem.c
++++ b/mysys/my_virtual_mem.c
+@@ -41,7 +41,11 @@
+ */
+ char *my_virtual_mem_reserve(size_t *size)
+ {
+-#ifdef _WIN32
++#if defined(__wasm__)
++  void *ptr= mmap(NULL, *size, PROT_READ | PROT_WRITE,
++                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++  return ptr == MAP_FAILED ? NULL : (char *) ptr;
++#elif defined(_WIN32)
+   DWORD flags= my_use_large_pages
+     ? MEM_LARGE_PAGES | MEM_RESERVE | MEM_COMMIT
+     : MEM_RESERVE;
+@@ -78,7 +82,15 @@ static my_bool is_memory_committed(char *ptr, size_t size)
+ */
+ char *my_virtual_mem_commit(char *ptr, size_t size)
+ {
+-#ifdef _WIN32
++#if defined(__wasm__)
++  if (!ptr)
++  {
++    ptr= mmap(NULL, size, PROT_READ | PROT_WRITE,
++              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (ptr == MAP_FAILED)
++      return NULL;
++  }
++#elif defined(_WIN32)
+   if (!ptr)
+     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+   if (my_use_large_pages)
+@@ -144,7 +156,9 @@ char *my_virtual_mem_commit(char *ptr, size_t size)
+ 
+ void my_virtual_mem_decommit(char *ptr, size_t size)
+ {
+-#ifdef _WIN32
++#if defined(__wasm__)
++  (void) ptr;
++#elif defined(_WIN32)
+   DBUG_ASSERT(is_memory_committed(ptr, size));
+   if (!my_use_large_pages)
+   {
+@@ -205,7 +219,12 @@ void my_virtual_mem_release(char *ptr, size_t size)
+ void my_virtual_mem_protect(void *ptr, size_t size, enum my_vmem_prot prot)
+ {
+   int res __attribute__((unused));
+-#ifdef _WIN32
++#if defined(__wasm__)
++  (void) ptr;
++  (void) size;
++  (void) prot;
++  res= 0;
++#elif defined(_WIN32)
+   DWORD old_prot;
+   res= !VirtualProtect(ptr, size, prot ? PAGE_READWRITE : PAGE_READONLY, &old_prot);
+ #else

@@ -1,0 +1,15 @@
+These patches modify MariaDB 10.11.19 for WASIX.
+
+Copyright (c) 2026 Ethan Jones
+
+The patches in this directory are licensed under the GNU General Public
+License, version 2 (LICENSE).
+
+One subdirectory holds a separate series with its own terms; see its README:
+
+- libmariadb/ changes MariaDB Connector/C, at the commit the server release
+  pins. It is licensed like it, under the GNU Lesser General Public License,
+  version 2.1.
+
+Context lines are from upstream and remain the copyright of their authors
+under upstream's terms.

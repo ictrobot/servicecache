@@ -16,11 +16,12 @@ Early development.
 
 ServiceCache is designed to be generic: the manager knows how to run, freeze, snapshot and clone a WASIX guest, not what the guest is. It is currently tested against:
 
-| Service    | Version |
-|------------|---------|
-| MySQL      | 8.0.40  |
-| Valkey     | 9.1.1   |
-| beanstalkd | 1.13    |
+| Service    | Version  |
+|------------|----------|
+| MariaDB    | 10.11.19 |
+| MySQL      | 8.0.40   |
+| Valkey     | 9.1.1    |
+| beanstalkd | 1.13     |
 
 Each service is built from an exact upstream release plus a small patch series for WASIX.
 
@@ -34,6 +35,7 @@ This repository distributes patches and build scripts, not built binaries. A gue
 
 ServiceCache is an independent project. It is not affiliated with, sponsored by, or endorsed by the trademark owners noted below, or by the maintainers of the software it builds and depends on.
 
+- MariaDB is a registered trademark of MariaDB plc.
 - Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its affiliates.
 - Valkey and the Valkey logo are trademarks of LF Projects, LLC.
 - Wasmer is a trademark of Wasmer, Inc.

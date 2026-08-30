@@ -57,6 +57,7 @@ version = "1.2.3"
 fs     = { "/usr/share/exampledb" = "share/" }  # read-only trees from the package
 module = "exampledbd.wasm"                      # optional: run to exit 0 on that filesystem, no network
 args   = ["--init", "--data=/data"]
+stdin_file = "share/bootstrap.sql"              # optional: package file piped to the module's stdin
 
 [guest]                                         # the server
 module      = "exampledbd.wasm"
@@ -69,7 +70,7 @@ args   = ["--host", "{host}", "--port", "{port}"]
 ```
 
 - Paths are relative to the manifest's directory; absolute paths are an error.
-- The writable filesystem always starts clean; no state is shipped. `[prepare]` builds what `[guest]` starts on: `fs` mounts read-only trees shipped in the package, and `module`, if present, runs to completion on that filesystem with no network.
+- The writable filesystem always starts clean; no state is shipped. `[prepare]` builds what `[guest]` starts on: `fs` mounts read-only trees shipped in the package, and `module`, if present, runs to completion on that filesystem with no network; `stdin_file`, if present, is a package file piped to that run's standard input.
 - `listen_port` is the port the server binds inside the guest. The socket it gets is the one the manager passed, so a guest never binds a real host port; a bind on any other port is refused.
 - `[initializer]` runs against the guest's endpoint with `{host}` and `{port}` substituted, receives the recipe on stdin, and must exit 0. The manager never interprets its arguments.
 - Manifests are plain files; the manager never merges or inherits them.

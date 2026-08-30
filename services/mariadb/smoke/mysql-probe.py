@@ -1,0 +1,1 @@
+../../mysql/smoke/mysql-probe.py

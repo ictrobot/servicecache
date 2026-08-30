@@ -1,0 +1,185 @@
+Subject: [PATCH 2/2] connector-c: add a wolfSSL backend
+
+WITH_SSL=WOLFSSL builds the OpenSSL backend against wolfSSL's OpenSSL
+layer, as MariaDB Server builds against it, from what the parent provides
+in WOLFSSL_LIBRARIES, WOLFSSL_INCLUDE_DIRS and WOLFSSL_DEFINES. The
+differences from OpenSSL, under HAVE_WOLFSSL: MariaDB builds wolfSSL
+without socket I/O of its own (WOLFSSL_USER_IO), so the connection reads
+and writes through its pvio, as the server does through its vio, and
+since that send reports a full socket buffer as want-write, the handshake
+waits for writability in that case, as upstream now does, instead of for
+data; the client key is loaded with SSL_CTX_use_PrivateKey_file, as the
+server loads its own, since wolfSSL's SSL_CTX_use_PrivateKey rejects the
+key its PEM_read_PrivateKey returns and that reads no key after a
+certificate in the same file; openssl/pem.h is included where
+PEM_read_PrivateKey is used (OpenSSL's ssl.h happens to pull it in,
+wolfSSL's does not); OPENSSL_config and ERR_remove_thread_state are left
+out, since wolfSSL provides them only as stubs, which MariaDB's build
+disables; wolfSSL reports an OpenSSL version below 1.0 while providing
+the TLSv1.1 and TLSv1.2 options and X509_check_host, so those are used
+as they are.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 07a05d7..92174fd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -419,6 +419,15 @@ IF(NOT WITH_SSL STREQUAL "OFF")
+       MESSAGE1(TLS_LIBRARY_VERSION "OpenSSL/LibreSSL not found")
+     ENDIF()
+   ENDIF()
++  IF(WITH_SSL STREQUAL "WOLFSSL")
++    # The OpenSSL backend on wolfSSL's OpenSSL layer. The parent provides
++    # the library, its include directories and its settings.
++    ADD_DEFINITIONS(-DHAVE_OPENSSL -DHAVE_WOLFSSL -DHAVE_TLS -DHAVE_OPENSSL_CHECK_HOST ${WOLFSSL_DEFINES})
++    SET(SSL_SOURCES "${CC_SOURCE_DIR}/libmariadb/secure/openssl.c")
++    SET(SSL_LIBRARIES ${WOLFSSL_LIBRARIES})
++    INCLUDE_DIRECTORIES(BEFORE ${WOLFSSL_INCLUDE_DIRS})
++    SET(TLS_LIBRARY_VERSION "wolfSSL")
++  ENDIF()
+   IF(WITH_SSL STREQUAL "GNUTLS")
+     FIND_PACKAGE(GnuTLS "3.4.2" REQUIRED)
+     IF(GNUTLS_FOUND)
+diff --git a/libmariadb/secure/openssl.c b/libmariadb/secure/openssl.c
+index 1c24554..360de7b 100644
+--- a/libmariadb/secure/openssl.c
++++ b/libmariadb/secure/openssl.c
+@@ -26,6 +26,7 @@
+ #include <mysql/client_plugin.h>
+ #include <string.h>
+ #include <openssl/ssl.h> /* SSL and SSL_CTX */
++#include <openssl/pem.h> /* PEM_read_PrivateKey */
+ #include <openssl/err.h> /* error reporting */
+ #include <openssl/conf.h>
+ #include <openssl/md4.h>
+@@ -44,8 +45,13 @@
+ #endif
+ 
+ #if OPENSSL_VERSION_NUMBER < 0x10000000L
++#ifndef HAVE_WOLFSSL
+ #define SSL_OP_NO_TLSv1_1 0L
+ #define SSL_OP_NO_TLSv1_2 0L
++#else
++/* wolfSSL names only a stub; the id callback it implements is used. */
++#undef CRYPTO_THREADID_set_callback
++#endif
+ #define CRYPTO_THREADID_set_callback CRYPTO_set_id_callback
+ #define CRYPTO_THREADID_get_callback CRYPTO_get_id_callback
+ #endif
+@@ -83,6 +89,49 @@ static int ma_bio_write(BIO *h, const char *buf, int size);
+ static BIO_METHOD ma_BIO_method;
+ #endif
+ 
++#ifdef HAVE_WOLFSSL
++/* MariaDB builds wolfSSL without socket I/O of its own (WOLFSSL_USER_IO):
++   read and write through the connection's pvio, as the server does through
++   its vio. */
++static int ma_wolfssl_recv(WOLFSSL *ssl, char *buf, int size, void *ctx)
++{
++  MARIADB_PVIO *pvio= (MARIADB_PVIO *)ctx;
++  ssize_t rc;
++  (void)ssl;
++  rc= pvio->methods->read(pvio, (uchar *)buf, (size_t)size);
++  if (rc > 0)
++    return (int)rc;
++  if (rc == 0)
++    return WOLFSSL_CBIO_ERR_CONN_CLOSE;
++  if (socket_errno == SOCKET_EAGAIN || socket_errno == SOCKET_EWOULDBLOCK)
++    return WOLFSSL_CBIO_ERR_WANT_READ;
++  return WOLFSSL_CBIO_ERR_GENERAL;
++}
++
++static int ma_wolfssl_send(WOLFSSL *ssl, char *buf, int size, void *ctx)
++{
++  MARIADB_PVIO *pvio= (MARIADB_PVIO *)ctx;
++  ssize_t rc;
++  (void)ssl;
++  rc= pvio->methods->write(pvio, (const uchar *)buf, (size_t)size);
++  if (rc >= 0)
++    return (int)rc;
++  if (socket_errno == SOCKET_EAGAIN || socket_errno == SOCKET_EWOULDBLOCK)
++    return WOLFSSL_CBIO_ERR_WANT_WRITE;
++  return WOLFSSL_CBIO_ERR_GENERAL;
++}
++
++static int ma_wolfssl_passwd_cb(char *buf, int size, int rwflag, void *userdata)
++{
++  size_t len= strlen((const char *)userdata);
++  (void)rwflag;
++  if (len > (size_t)size)
++    len= (size_t)size;
++  memcpy(buf, userdata, len);
++  return (int)len;
++}
++#endif
++
+ 
+ static long ma_tls_version_options(const char *version)
+ {
+@@ -227,7 +276,7 @@ int ma_tls_start(char *errmsg __attribute__((unused)), size_t errmsg_len __attri
+     goto end;
+   }
+   SSL_library_init();
+-#if SSLEAY_VERSION_NUMBER >= 0x00907000L
++#if SSLEAY_VERSION_NUMBER >= 0x00907000L && !defined(HAVE_WOLFSSL)
+   OPENSSL_config(NULL);
+ #endif
+ #endif
+@@ -292,7 +341,9 @@ void ma_tls_end()
+     if (mariadb_deinitialize_ssl)
+     {
+ #ifndef HAVE_OPENSSL_1_1_API
++#ifndef HAVE_WOLFSSL
+       ERR_remove_thread_state(NULL);
++#endif
+       EVP_cleanup();
+       CRYPTO_cleanup_all_ex_data();
+       ERR_free_strings();
+@@ -380,6 +431,18 @@ static int ma_tls_set_certs(MYSQL *mysql, SSL_CTX *ctx)
+ 
+   if (keyfile && keyfile[0])
+   {
++#ifdef HAVE_WOLFSSL
++    /* wolfSSL's SSL_CTX_use_PrivateKey rejects the key its
++       PEM_read_PrivateKey returns, and that reads no key after a
++       certificate in the same file: load the file as the server does. */
++    if (pw)
++    {
++      SSL_CTX_set_default_passwd_cb_userdata(ctx, pw);
++      SSL_CTX_set_default_passwd_cb(ctx, ma_wolfssl_passwd_cb);
++    }
++    if (SSL_CTX_use_PrivateKey_file(ctx, keyfile, SSL_FILETYPE_PEM) != 1)
++      goto error;
++#else
+     FILE *fp;
+     if ((fp= fopen(keyfile, "rb")))
+     {
+@@ -400,6 +463,7 @@ static int ma_tls_set_certs(MYSQL *mysql, SSL_CTX *ctx)
+                    CER(CR_FILE_NOT_FOUND), keyfile);
+       return 1;
+     }
++#endif
+   }
+   /* verify key */
+   if (certfile && SSL_CTX_check_private_key(ctx) != 1)
+@@ -485,6 +549,12 @@ my_bool ma_tls_connect(MARIADB_TLS *ctls)
+ #else
+   SSL_set_fd(ssl, (int)mysql_get_socket(mysql));
+ #endif
++#ifdef HAVE_WOLFSSL
++  wolfSSL_SSLSetIORecv(ssl, ma_wolfssl_recv);
++  wolfSSL_SSLSetIOSend(ssl, ma_wolfssl_send);
++  wolfSSL_SetIOReadCtx(ssl, pvio);
++  wolfSSL_SetIOWriteCtx(ssl, pvio);
++#endif
+ 
+   while (try_connect && (rc= SSL_connect(ssl)) == -1)
+   {
+@@ -494,7 +564,7 @@ my_bool ma_tls_connect(MARIADB_TLS *ctls)
+         try_connect= 0;
+       break;
+     case SSL_ERROR_WANT_WRITE:
+-      if (pvio->methods->wait_io_or_timeout(pvio, TRUE, mysql->options.connect_timeout) < 1)
++      if (pvio->methods->wait_io_or_timeout(pvio, FALSE, mysql->options.connect_timeout) < 1)
+         try_connect= 0;
+       break;
+     default:

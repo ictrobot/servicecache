@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Test adapter for MariaDB, over the wire protocol of mysql-probe.py.
+
+usage: adapter recipe
+       adapter check-initialized HOST PORT
+       adapter check-working HOST PORT
+       adapter diverge HOST PORT TAG
+       adapter check-diverged HOST PORT TAG
+       adapter blocking-request HOST PORT
+
+Every verb exits 0 on success and non-zero with a message on stderr
+otherwise. `recipe` prints the initializer's stdin: a table of ROWS rows
+of about 230 bytes, well over the guest's 16 MB buffer pool, so that
+reads reach the data files. `blocking-request` runs a request that blocks
+in the server and prints how it ended.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+import time
+
+ROWS = 100_000
+
+_spec = importlib.util.spec_from_loader(
+    "mysql_probe",
+    importlib.machinery.SourceFileLoader(
+        "mysql_probe", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mysql-probe.py")
+    ),
+)
+probe = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(probe)
+
+
+class Session:
+    """One connection; `rows(sql)` returns the result rows as lists."""
+
+    def __init__(self, host, port):
+        self.sock = probe.connect(host, int(port), "root")
+
+    def rows(self, sql):
+        result = probe.query(self.sock, sql)
+        # An OK packet (no result set) comes back as an empty list.
+        return result[1] if result else []
+
+    def scalar(self, sql):
+        rows = self.rows(sql)
+        if not rows or not rows[0]:
+            raise SystemExit(f"no value for {sql}")
+        return rows[0][0]
+
+    def close(self):
+        try:
+            probe.write_packet(self.sock, 0, b"\x01")
+        finally:
+            self.sock.close()
+
+
+def expect(actual, expected, what):
+    if actual != expected:
+        raise SystemExit(f"{what}: expected {expected!r}, got {actual!r}")
+
+
+def eventually(seconds, check):
+    deadline = time.monotonic() + seconds
+    while True:
+        if check():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+def recipe():
+    out = sys.stdout
+    out.write("CREATE DATABASE adapter;\n")
+    out.write(
+        "CREATE TABLE adapter.t (id INT PRIMARY KEY, v VARCHAR(64), pad CHAR(200)) ENGINE=InnoDB;\n"
+    )
+    for chunk in range(ROWS // 1000):
+        values = ",".join(
+            f"({i}, 'row-{i}', 'p')" for i in range(chunk * 1000, chunk * 1000 + 1000)
+        )
+        out.write(f"INSERT INTO adapter.t VALUES {values};\n")
+
+
+def check_initialized(host, port):
+    s = Session(host, port)
+    expect(s.scalar("SELECT COUNT(*) FROM adapter.t WHERE id < 1000000"), str(ROWS), "row count")
+    version = s.scalar("SELECT VERSION()")
+    if not version.endswith("-servicecache"):
+        raise SystemExit(f"unexpected server: {version}")
+    s.close()
+
+
+def metric(s, name):
+    return int(s.scalar(f"SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = '{name}'"))
+
+
+def status(s, name):
+    return int(s.rows(f"SHOW GLOBAL STATUS LIKE '{name}'")[0][1])
+
+
+def check_working(host, port):
+    # Commits on two connections.
+    first = Session(host, port)
+    base = int(first.scalar("SELECT COUNT(*) FROM adapter.t WHERE id >= 2000000"))
+    for i in range(2):
+        s = Session(host, port)
+        s.rows("BEGIN")
+        s.rows(f"INSERT INTO adapter.t VALUES ({2000000 + base + i}, 'commit', 'c')")
+        s.rows("COMMIT")
+        s.close()
+    expect(
+        int(first.scalar("SELECT COUNT(*) FROM adapter.t WHERE id >= 2000000")),
+        base + 2,
+        "commits from two connections",
+    )
+
+    # A timed wait fires on time.
+    started = time.monotonic()
+    first.rows("SELECT SLEEP(1)")
+    elapsed = time.monotonic() - started
+    if not 0.95 <= elapsed < 5:
+        raise SystemExit(f"SLEEP(1) took {elapsed:.2f}s")
+
+    # The page cleaner flushes dirty pages, purge keeps running, and a scan
+    # of a table larger than the buffer pool reads from the data files.
+    # The purge counters are off by default. MariaDB's page cleaner leaves a
+    # few dirty pages alone while idle, so it is asked to flush everything.
+    first.rows("SET GLOBAL innodb_monitor_enable = 'purge%'")
+    first.rows("SET GLOBAL innodb_max_dirty_pages_pct = 0")
+    purge_before = metric(first, "purge_invoked")
+    reads_before = status(first, "Innodb_data_reads")
+    first.rows("UPDATE adapter.t SET v = CONCAT(v, '-u') WHERE id BETWEEN 1 AND 2000")
+    flushed = eventually(15, lambda: status(first, "Innodb_buffer_pool_pages_dirty") == 0)
+    first.rows("SET GLOBAL innodb_max_dirty_pages_pct = DEFAULT")
+    if not flushed:
+        raise SystemExit("dirty pages were not flushed")
+    if not eventually(15, lambda: metric(first, "purge_invoked") > purge_before):
+        raise SystemExit("purge did not run")
+    expect(first.scalar("SELECT COUNT(*) FROM adapter.t WHERE pad = 'p'"), str(ROWS), "full scan")
+    if status(first, "Innodb_data_reads") <= reads_before:
+        raise SystemExit("the scan did not read from the data files")
+    first.close()
+
+
+def diverge(host, port, tag):
+    s = Session(host, port)
+    s.rows(f"INSERT INTO adapter.t VALUES ({1000000 + int(tag)}, 'tag', 't')")
+    s.close()
+
+
+def check_diverged(host, port, tag):
+    s = Session(host, port)
+    ids = [row[0] for row in s.rows("SELECT id FROM adapter.t WHERE id >= 1000000 AND id < 2000000 ORDER BY id")]
+    expect(ids, [str(1000000 + int(tag))], f"clone {tag}'s own row")
+    s.close()
+
+
+def blocking_request(host, port):
+    result = subprocess.run(
+        [
+            "timeout", "20", sys.executable,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "mysql-probe.py"),
+            "--host", host, "--port", str(port), "SELECT SLEEP(3)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    print(f"SLEEP(3) ended with status {result.returncode}: {result.stdout.strip()!r}")
+
+
+def main(argv):
+    if not argv:
+        raise SystemExit(__doc__)
+    verb, args = argv[0], argv[1:]
+    if verb == "recipe":
+        return recipe()
+    if verb == "check-initialized":
+        return check_initialized(*args)
+    if verb == "check-working":
+        return check_working(*args)
+    if verb == "diverge":
+        return diverge(*args)
+    if verb == "check-diverged":
+        return check_diverged(*args)
+    if verb == "blocking-request":
+        return blocking_request(*args)
+    raise SystemExit(f"unknown verb {verb}\n{__doc__}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

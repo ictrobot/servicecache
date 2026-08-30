@@ -1,0 +1,91 @@
+Subject: [PATCH 5/6] client: build a batch-only mariadb client
+
+Build the mariadb command-line client for batch use only: no readline or
+libedit, no interactive input, no pager through popen, and SIGINT ends
+the client instead of the running query.
+
+diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
+index a8e80bc8..ea6d8e75 100644
+--- a/client/CMakeLists.txt
++++ b/client/CMakeLists.txt
+@@ -38,11 +38,14 @@ SET(CLIENT_LIB mariadbclient mysys)
+ ADD_DEFINITIONS(${SSL_DEFINES})
+ MYSQL_ADD_EXECUTABLE(mariadb completion_hash.cc mysql.cc readline.cc
+                            ${CMAKE_SOURCE_DIR}/sql/sql_string.cc)
++IF(WASIX)
++  TARGET_COMPILE_DEFINITIONS(mariadb PRIVATE MYSQL_BATCH_ONLY)
++ENDIF()
+ TARGET_LINK_LIBRARIES(mariadb ${CLIENT_LIB})
+-IF(UNIX)
++IF(UNIX AND NOT WASIX)
+   TARGET_LINK_LIBRARIES(mariadb ${MY_READLINE_LIBRARY})
+   SET_TARGET_PROPERTIES(mariadb PROPERTIES ENABLE_EXPORTS TRUE)
+-ENDIF(UNIX)
++ENDIF()
+ 
+ MYSQL_ADD_EXECUTABLE(mariadb-test mysqltest.cc ${CMAKE_SOURCE_DIR}/sql/sql_string.cc COMPONENT Test)
+ SET_SOURCE_FILES_PROPERTIES(mysqltest.cc PROPERTIES COMPILE_FLAGS "-DTHREADS ${PCRE2_DEBIAN_HACK}")
+diff --git a/client/mysql.cc b/client/mysql.cc
+index 0ebc8114..0a491f38 100644
+--- a/client/mysql.cc
++++ b/client/mysql.cc
+@@ -88,7 +88,7 @@ extern "C" {
+ #endif /* defined(HAVE_CURSES_H) && defined(HAVE_TERM_H) */
+ 
+ #undef bcmp				// Fix problem with new readline
+-#if !defined(_WIN32)
++#if !defined(_WIN32) && !defined(MYSQL_BATCH_ONLY)
+ # ifdef __APPLE__
+ #  include <editline/readline.h>
+ # else
+@@ -99,7 +99,9 @@ extern "C" {
+ # endif
+ #define HAVE_READLINE
+ #endif
++#if !defined(MYSQL_BATCH_ONLY)
+ #define USE_POPEN
++#endif
+ }
+ 
+ static CHARSET_INFO *charset_info= &my_charset_latin1;
+@@ -1321,6 +1323,10 @@ int main(int argc,char *argv[])
+       strmov(default_pager, tmp);
+     }
+   }
++#ifdef MYSQL_BATCH_ONLY
++  status.batch=1; opt_silent=1;
++  ignore_errors=0;
++#else
+   if (!isatty(0) || !isatty(1))
+   {
+     status.batch=1; opt_silent=1;
+@@ -1328,6 +1334,7 @@ int main(int argc,char *argv[])
+   }
+   else
+     status.add_to_history=1;
++#endif
+   status.exit_status=1;
+ 
+   {
+@@ -1683,7 +1690,9 @@ sig_handler handle_sigint(int sig)
+   */
+   if (!executing_query)
+   {
+-#ifndef _WIN32
++#ifdef MYSQL_BATCH_ONLY
++    end_in_sig_handler(sig);
++#elif !defined(_WIN32)
+     tee_fprintf(stdout, "^C\n");
+ #ifdef USE_LIBEDIT_INTERFACE
+     /* Libedit will regenerate it outside of the signal handler. */
+@@ -2354,7 +2363,9 @@ static int read_and_execute(bool interactive)
+       if (opt_outfile && glob_buffer.is_empty())
+ 	fflush(OUTFILE);
+ 
+-#if defined(_WIN32)
++#if defined(MYSQL_BATCH_ONLY)
++      line= NULL; /* The batch-only build never reaches interactive input. */
++#elif defined(_WIN32)
+       tee_fputs(prompt, stdout);
+       line= win_readline();
+ #else
