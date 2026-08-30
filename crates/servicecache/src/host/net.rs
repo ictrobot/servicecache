@@ -101,6 +101,10 @@ impl HostNetworking {
         {
             bail!("the guest has already bound its listening socket");
         }
+        let addr = listener
+            .local_addr()
+            .context("the passed listener has no address")?;
+        tracing::debug!(%addr, "listening socket passed");
         *self
             .passed
             .lock()
@@ -164,6 +168,14 @@ impl HostNetworking {
         {
             shut_down(fd, nix::sys::socket::Shutdown::Both)?;
         }
+        tracing::debug!(
+            connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            "listener and connections shut down"
+        );
         Ok(())
     }
 
@@ -209,6 +221,7 @@ impl VirtualNetworking for HostNetworking {
         _reuse_addr: bool,
     ) -> virtual_net::Result<Box<dyn VirtualTcpBoundSocket + Sync>> {
         if addr.port() != self.listen_port {
+            tracing::trace!(%addr, "bind on another port: unserved");
             return Ok(Box::new(UnservedBoundSocket { addr }));
         }
         let listener = self
@@ -287,6 +300,7 @@ impl VirtualTcpBoundSocket for PassedBoundSocket {
 
     fn listen(&mut self) -> virtual_net::Result<Box<dyn VirtualTcpListener + Sync>> {
         let listener = self.listener.take().ok_or(NetworkError::InvalidFd)?;
+        tracing::debug!("guest listening on the passed socket");
         (self.on_listen)();
         Ok(Box::new(PassedListener {
             inner: listener,
@@ -369,6 +383,7 @@ impl VirtualTcpListener for PassedListener {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .try_accept_local()?;
         let guard = ConnectionGuard::track(stream.as_raw_fd(), &self.connections);
+        tracing::trace!(peer = %addr, fd = stream.as_raw_fd(), "connection accepted");
         Ok((
             Box::new(TrackedStream {
                 _guard: guard,
@@ -465,6 +480,7 @@ impl ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        tracing::trace!(fd = self.fd, "connection released by the guest");
         self.connections
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

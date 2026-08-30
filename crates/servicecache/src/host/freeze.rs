@@ -105,11 +105,18 @@ pub(super) fn freeze(host: &mut Host) -> Result<usize> {
     if in_flight > 0 {
         bail!("{in_flight} host-side task(s) in flight; a fork would lose them");
     }
+    let started = Instant::now();
+    tracing::info!("freezing");
 
     wasmer_vm::suspend::close_gate();
     let quiescence = wasmer_vm::suspend::drain(DRAIN_TIMEOUT)
         .map_err(|err| anyhow::anyhow!("{err}"))
         .context("draining the guest")?;
+    tracing::debug!(
+        coroutines = quiescence.coroutines,
+        elapsed = ?started.elapsed(),
+        "guest drained"
+    );
 
     host.networking.selector().halt();
 
@@ -128,7 +135,13 @@ pub(super) fn freeze(host: &mut Host) -> Result<usize> {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+    tracing::debug!(elapsed = ?started.elapsed(), "host threads ended");
     host.networking.shut_down_sockets()?;
+    tracing::info!(
+        coroutines = quiescence.coroutines,
+        elapsed = ?started.elapsed(),
+        "frozen"
+    );
     Ok(quiescence.coroutines)
 }
 
@@ -180,9 +193,15 @@ pub(super) fn fork(host: &mut Host, child_control: OwnedFd, listener: OwnedFd) -
 /// In the child: rebuild the host machinery the parent dismantled and
 /// resume every coroutine.
 fn rebuild(host: &mut Host, listener: TcpListener) -> Result<()> {
+    let started = Instant::now();
     // The parent-death signal does not survive a fork; the template is
     // this clone's parent.
     die_with_parent()?;
+    tracing::debug!(
+        pid = std::process::id(),
+        template = nix::unistd::getppid().as_raw(),
+        "rebuilding in the clone"
+    );
 
     TOKIO_EXIT.store(false, Ordering::SeqCst);
     let runtime = build_tokio()?;
@@ -197,7 +216,7 @@ fn rebuild(host: &mut Host, listener: TcpListener) -> Result<()> {
         .context("failed to rebuild the selector")?;
     host.networking.replace_listener(listener)?;
 
-    wasmer_vm::resurrect_all(&mut |body| {
+    let resurrected = wasmer_vm::resurrect_all(&mut |body| {
         std::thread::Builder::new()
             .name("guest".to_owned())
             .stack_size(super::tasks::DRIVER_STACK_SIZE)
@@ -206,5 +225,11 @@ fn rebuild(host: &mut Host, listener: TcpListener) -> Result<()> {
     })
     .map_err(|err| anyhow::anyhow!("{err}"))
     .context("resurrecting the guest threads")?;
+    tracing::info!(
+        pid = std::process::id(),
+        threads = resurrected.threads,
+        elapsed = ?started.elapsed(),
+        "clone running"
+    );
     Ok(())
 }

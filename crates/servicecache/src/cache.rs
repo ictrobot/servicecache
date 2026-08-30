@@ -104,6 +104,7 @@ impl ModuleCache {
         let entry = entry_dir.join(format!("{:x}.bin", Sha256::digest(&bytes)));
 
         if let Some(module) = load_entry(engine, path, &entry) {
+            tracing::debug!(module = %path.display(), entry = %entry.display(), "module cache hit");
             return Ok(module);
         }
 
@@ -129,11 +130,19 @@ impl ModuleCache {
             .lock()
             .with_context(|| format!("failed to lock {}", lock_path.display()))?;
         if let Some(module) = load_entry(engine, path, &entry) {
+            tracing::debug!(module = %path.display(), "module cache hit after waiting for the lock");
             return Ok(module);
         }
 
+        let started = std::time::Instant::now();
         let module = compile(engine, &bytes)
             .with_context(|| format!("failed to compile {}", path.display()))?;
+        tracing::info!(
+            module = %path.display(),
+            bytes = bytes.len(),
+            elapsed = ?started.elapsed(),
+            "compiled module"
+        );
         // Written whole under another name, then renamed: a reader sees
         // either no artifact or a complete one.
         let partial = entry_dir.join(format!(
@@ -164,10 +173,11 @@ fn load_entry(engine: &Engine, path: &Path, entry: &Path) -> Option<Module> {
     match unsafe { Module::deserialize_from_file(engine, entry) } {
         Ok(module) => Some(module),
         Err(error) => {
-            eprintln!(
-                "recompiling {}: cached artifact {} did not load: {error}",
-                path.display(),
-                entry.display()
+            tracing::warn!(
+                module = %path.display(),
+                entry = %entry.display(),
+                %error,
+                "cached artifact did not load; recompiling"
             );
             None
         }

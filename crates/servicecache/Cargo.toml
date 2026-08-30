@@ -18,10 +18,12 @@ serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1.39", features = ["rt-multi-thread", "time"] }
 toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # TODO(upstream): Track Wasmer's migration from the unmaintained proc-macro-error2 crate:
 # https://github.com/wasmerio/wasmer/issues/6692
 wasmer = { version = "=7.3.0", default-features = false, features = ["cranelift"] }
-wasmer-vm = { version = "=7.3.0" }
+wasmer-vm = { version = "=7.3.0", features = ["tracing"] }
 wasmer-wasix = { version = "=0.703.0", default-features = false, features = ["host-fs", "host-vnet", "sys-minimal"] }
 virtual-fs = { version = "=0.703.0", default-features = false, features = ["host-fs"] }
 virtual-mio = { version = "=0.703.0", default-features = false, features = ["sys"] }

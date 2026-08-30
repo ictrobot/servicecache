@@ -63,6 +63,13 @@ pub fn run(args: &HostArgs) -> Result<()> {
     die_with_parent()?;
     enable_suspension();
     let manifest = Manifest::load(&args.manifest)?;
+    tracing::info!(
+        pid = std::process::id(),
+        service = %manifest.service.name,
+        manifest = %args.manifest.display(),
+        cache = %args.cache_dir.display(),
+        "host started"
+    );
     // The descriptor was inherited from the manager and is ours to close.
     let channel = Channel::from_fd(unsafe { OwnedFd::from_raw_fd(args.control_fd) });
     let host = Host::new(manifest, ModuleCache::new(args.cache_dir.clone()))?;
@@ -256,6 +263,7 @@ impl Host {
         if self.phase != Phase::Frozen
             && let Some(status) = self.guest.as_ref().and_then(exit_status)
         {
+            tracing::info!(status, "guest exited");
             channel.send(
                 &Reply::Exited {
                     run: Run::Guest,
@@ -269,24 +277,30 @@ impl Host {
         }
         loop {
             match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::Exited(pid, status)) => channel.send(
-                    &Reply::Exited {
-                        run: Run::Child,
-                        status,
-                        pid: Some(pid.as_raw().unsigned_abs()),
-                    },
-                    &[],
-                    &[],
-                )?,
-                Ok(WaitStatus::Signaled(pid, signal, _)) => channel.send(
-                    &Reply::Exited {
-                        run: Run::Child,
-                        status: 128 + signal as i32,
-                        pid: Some(pid.as_raw().unsigned_abs()),
-                    },
-                    &[],
-                    &[],
-                )?,
+                Ok(WaitStatus::Exited(pid, status)) => {
+                    tracing::info!(clone = pid.as_raw(), status, "clone exited");
+                    channel.send(
+                        &Reply::Exited {
+                            run: Run::Child,
+                            status,
+                            pid: Some(pid.as_raw().unsigned_abs()),
+                        },
+                        &[],
+                        &[],
+                    )?;
+                }
+                Ok(WaitStatus::Signaled(pid, signal, _)) => {
+                    tracing::info!(clone = pid.as_raw(), ?signal, "clone killed");
+                    channel.send(
+                        &Reply::Exited {
+                            run: Run::Child,
+                            status: 128 + signal as i32,
+                            pid: Some(pid.as_raw().unsigned_abs()),
+                        },
+                        &[],
+                        &[],
+                    )?;
+                }
                 _ => break,
             }
         }
@@ -294,8 +308,10 @@ impl Host {
     }
 
     fn ready_reply(&self) -> Result<Reply> {
+        let endpoint = self.networking.endpoint()?;
+        tracing::info!(%endpoint, "guest listening");
         Ok(Reply::Ready {
-            endpoint: self.networking.endpoint()?.to_string(),
+            endpoint: endpoint.to_string(),
         })
     }
 
@@ -308,6 +324,7 @@ impl Host {
 
     /// Handles one request.
     fn handle(&mut self, channel: &Channel, frame: Frame<Request>) -> Result<Outcome> {
+        tracing::debug!(request = ?frame.message, fds = frame.fds.len(), phase = ?self.phase, "request");
         let reply = match frame.message {
             Request::Prepare => self.prepare(channel),
             Request::Start => self.start(channel, frame.fds),
@@ -319,19 +336,23 @@ impl Host {
         match reply {
             Ok(Some(reply)) => channel.send(&reply, &[], &[])?,
             Ok(None) => return Ok(Outcome::Exit),
-            Err(error) => channel.send(
-                &Reply::Error {
-                    text: format!("{error:#}"),
-                },
-                &[],
-                &[],
-            )?,
+            Err(error) => {
+                tracing::warn!(error = format!("{error:#}"), "request failed");
+                channel.send(
+                    &Reply::Error {
+                        text: format!("{error:#}"),
+                    },
+                    &[],
+                    &[],
+                )?;
+            }
         }
         Ok(Outcome::Continue)
     }
 
     /// Answers a request with `error` and keeps serving.
     fn refuse(channel: &Channel, text: String) -> Result<Outcome> {
+        tracing::warn!(%text, "request refused");
         channel.send(&Reply::Error { text }, &[], &[])?;
         Ok(Outcome::Continue)
     }
@@ -356,6 +377,7 @@ impl Host {
             }
             _ => 0,
         };
+        tracing::info!(status, "prepare finished");
         self.phase = Phase::Prepared;
         Ok(Some(Reply::Exited {
             run: Run::Prepare,
@@ -383,6 +405,7 @@ impl Host {
         })?;
         self.guest = Some(handle);
         self.phase = Phase::Running { ready: false };
+        tracing::info!(module = %guest.module.display(), "guest started");
 
         // Ready, or dead before it listened.
         loop {
@@ -427,11 +450,14 @@ impl Host {
             network: true,
         })?;
         match self.wait_run(channel, &handle, Run::Initializer)? {
-            Some(status) => Ok(Some(Reply::Exited {
-                run: Run::Initializer,
-                status,
-                pid: None,
-            })),
+            Some(status) => {
+                tracing::info!(status, "initializer finished");
+                Ok(Some(Reply::Exited {
+                    run: Run::Initializer,
+                    status,
+                    pid: None,
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -479,6 +505,7 @@ impl Host {
         let control = fds.pop().expect("two descriptors");
         match freeze::fork(self, control, listener) {
             Ok(freeze::Forked::Parent { pid, endpoint }) => {
+                tracing::info!(clone = pid, %endpoint, "forked a clone");
                 channel.send(
                     &Reply::Forked {
                         pid,
@@ -500,6 +527,7 @@ impl Host {
                 control,
                 rebuilt: Err(error),
             }) => {
+                tracing::error!(error = format!("{error:#}"), "the clone failed to rebuild");
                 // A child with nothing to serve: say so on its own channel
                 // and end.
                 Channel::from_fd(control)

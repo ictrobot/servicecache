@@ -42,6 +42,16 @@ struct Cli {
     #[arg(long, value_name = "DIR", global = true)]
     cache_dir: Option<PathBuf>,
 
+    /// Log more, to stderr; repeat for more
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Log filter directives, such as "warn,servicecache=debug".
+    /// Overrides -v and the variable SERVICECACHE_LOG.
+    #[allow(clippy::doc_markdown)] // clap shows this text as is
+    #[arg(long, value_name = "DIRECTIVES", global = true)]
+    log: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -121,6 +131,7 @@ fn run_with(
     environment_dirs: Option<OsString>,
     environment_cache: Option<&OsStr>,
 ) -> Result<()> {
+    crate::logging::init(cli.verbose, cli.log.as_deref())?;
     let cache_dir = || cache::directory(cli.cache_dir.as_deref(), environment_cache);
     match cli.command {
         Command::Serve => {

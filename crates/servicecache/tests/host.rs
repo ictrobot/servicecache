@@ -149,8 +149,11 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
         .arg(&name)
         .arg("--clones")
         .arg("1")
+        .arg("--log")
+        .arg("servicecache=info")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     let recipe_path = std::env::temp_dir().join(format!(
         "servicecache-clone-recipe-{}-{name}",
         std::process::id()
@@ -163,6 +166,14 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
     }
     let mut child = RunCommand(command.spawn().expect("spawn servicecache run"));
     let mut stdout = std::io::BufReader::new(child.0.stdout.take().expect("stdout"));
+    // The hosts log to the command's stderr; drained on a thread so that
+    // the guest's own output never fills the pipe.
+    let mut stderr = child.0.stderr.take().expect("stderr");
+    let logs = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        text
+    });
     let read_endpoint = |stdout: &mut std::io::BufReader<std::process::ChildStdout>| {
         let mut line = String::new();
         stdout.read_line(&mut line).expect("read an endpoint");
@@ -204,6 +215,13 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
 
     drop(child);
     let _ = std::fs::remove_file(&recipe_path);
+    let logs = logs.join().expect("the log reader");
+    for expected in ["host started", "frozen", "forked a clone", "clone running"] {
+        assert!(
+            logs.contains(expected),
+            "{name}: no {expected:?} in the hosts' logs:\n{logs}"
+        );
+    }
     let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::net::TcpStream::connect(clone_endpoint).is_ok() {
         assert!(

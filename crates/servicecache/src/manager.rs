@@ -66,6 +66,9 @@ impl HostProcess {
             .arg("--cache-dir")
             .arg(cache_dir)
             .stdin(Stdio::null());
+        if let Some(directives) = crate::logging::directives() {
+            command.arg("--log").arg(directives);
+        }
         // Runs in the child between fork and exec: only async-signal-safe
         // calls, no allocation.
         unsafe {
@@ -85,6 +88,7 @@ impl HostProcess {
         }
         let child = command.spawn().context("failed to spawn the host")?;
         drop(theirs);
+        tracing::debug!(pid = child.id(), manifest = %manifest.display(), "spawned a host");
         Ok(Self {
             pid: child.id(),
             channel: ours,
@@ -217,6 +221,13 @@ impl HostProcess {
     ///
     /// Fails if the host answered `error`, exited, or the channel broke.
     pub fn request(&mut self, request: Request, payload: &[u8], fds: &[i32]) -> Result<Reply> {
+        tracing::trace!(
+            host = self.pid,
+            ?request,
+            payload = payload.len(),
+            fds = fds.len(),
+            "request"
+        );
         self.channel.send(&request, payload, fds)?;
         self.reply()
     }
@@ -240,8 +251,14 @@ impl HostProcess {
                 } => bail!("the guest in host {} exited with status {status}", self.pid),
                 Reply::Exited {
                     run: Run::Child, ..
-                } => self.events.push(message),
-                other => return Ok(other),
+                } => {
+                    tracing::debug!(host = self.pid, event = ?message, "event while waiting");
+                    self.events.push(message);
+                }
+                other => {
+                    tracing::trace!(host = self.pid, reply = ?other, "reply");
+                    return Ok(other);
+                }
             }
         }
     }
@@ -260,7 +277,10 @@ impl HostProcess {
         };
         match message {
             Reply::Error { text } => bail!("host {} refused: {text}", self.pid),
-            Reply::Exited { .. } => Ok(message),
+            Reply::Exited { .. } => {
+                tracing::debug!(host = self.pid, event = ?message, "event");
+                Ok(message)
+            }
             other => bail!("unexpected reply from host {}: {other:?}", self.pid),
         }
     }
