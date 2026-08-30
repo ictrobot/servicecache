@@ -21,7 +21,7 @@ rm -rf "$SC_BUILD" "$SC_OUT/$SC_SERVICE-$SC_VERSION"
 
 if [[ "$sources" -eq 1 ]]; then
   rm -rf "$SC_SRC"
-elif [[ -d "$SC_SRC/.git" ]]; then
+elif [[ -e "$SC_SRC/.git" ]]; then
   git -C "$SC_SRC" checkout --quiet -- .
   git -C "$SC_SRC" clean --quiet -fdx
 fi

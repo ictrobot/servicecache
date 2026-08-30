@@ -3,7 +3,9 @@ set -euo pipefail
 
 source "$(dirname "$0")/../../toolchain/lib.sh"
 sc_init mariadb "${1:?usage: $0 version}"
-sc_clone_tag "$MARIADB_TAG" "$SC_SRC"
+: "${SC_SOURCE_URL:=https://github.com/MariaDB/server.git}"
+: "${MARIADB_TAG:=mariadb-$SC_VERSION}"
+sc_checkout "$SC_SOURCE_URL" "$MARIADB_TAG" "$SC_SRC"
 
 # MariaDB's CMake invokes git after the WASIX environment has replaced
 # envsubst. Populate only the required submodules with host tools — the
@@ -12,8 +14,9 @@ sc_clone_tag "$MARIADB_TAG" "$SC_SRC"
 env PATH=/usr/bin:/bin git -C "$SC_SRC" submodule update --init --depth 1 libmariadb extra/wolfssl/wolfssl
 
 sc_apply_series "$SC_VERSION_DIR/patches" "$SC_SRC"
+# The connector series applies at the commit the release pins.
 mariadb_tag="$SC_UPSTREAM_TAG"
-SC_UPSTREAM_TAG="$MARIADB_CONNECTOR_COMMIT"
+SC_UPSTREAM_TAG="$(git -C "$SC_SRC" rev-parse HEAD:libmariadb)"
 sc_apply_series "$SC_VERSION_DIR/patches/libmariadb" "$SC_SRC/libmariadb"
 SC_UPSTREAM_TAG="$mariadb_tag"
 export SC_UPSTREAM_TAG

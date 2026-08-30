@@ -3,7 +3,9 @@ set -euo pipefail
 
 source "$(dirname "$0")/../../toolchain/lib.sh"
 sc_init mysql "${1:?usage: $0 version}"
-sc_clone_tag "$MYSQL_TAG" "$SC_SRC"
+: "${SC_SOURCE_URL:=https://github.com/mysql/mysql-server.git}"
+: "${MYSQL_TAG:=mysql-$SC_VERSION}"
+sc_checkout "$SC_SOURCE_URL" "$MYSQL_TAG" "$SC_SRC"
 sc_apply_series "$SC_VERSION_DIR/patches" "$SC_SRC"
 sc_apply_series "$SC_VERSION_DIR/patches/protobuf" "$SC_SRC"
 sc_apply_series "$SC_VERSION_DIR/patches/libmysql" "$SC_SRC"

@@ -38,28 +38,41 @@ sc_init() {
   export SC_SERVICE_DIR SC_VERSION_DIR SC_SRC SC_BUILD SC_OUT
 }
 
-sc_clone_tag() {
-  if [[ $# -ne 2 ]]; then
-    sc_fail "usage: sc_clone_tag tag destination"
+# sc_checkout url tag tree: the tag checked out at tree, detached, as a
+# worktree of a bare repository shared by every checkout of the same
+# remote, work/git/<url with non-alphanumerics as underscores>. A tag is
+# fetched alone and at depth 1, so versions of one project share their
+# objects.
+sc_checkout() {
+  if [[ $# -ne 3 ]]; then
+    sc_fail "usage: sc_checkout url tag tree"
     return 1
   fi
 
-  SC_UPSTREAM_TAG="$1"
-  local destination="$2"
-  local source_url="${SC_SOURCE_URL:?SC_SOURCE_URL is not set}"
+  local url="$1" tree="$3"
+  SC_UPSTREAM_TAG="$2"
+  local root
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  local cache="$root/work/git/${url//[^[:alnum:]]/_}"
 
-  mkdir -p "$(dirname "$destination")"
-  if [[ ! -e "$destination" ]]; then
-    git clone --branch "$SC_UPSTREAM_TAG" --depth 1 --single-branch \
-      "$source_url" "$destination"
-  elif [[ ! -d "$destination/.git" ]]; then
-    sc_fail "source path exists but is not a Git checkout: $destination"
+  if [[ ! -e "$tree" ]]; then
+    mkdir -p "$(dirname "$tree")"
+    if [[ ! -d "$cache" ]]; then
+      git init --quiet --bare "$cache"
+    fi
+    if ! git --git-dir="$cache" rev-parse --verify --quiet "refs/tags/$SC_UPSTREAM_TAG^{commit}" >/dev/null; then
+      git --git-dir="$cache" fetch --depth=1 --no-tags "$url" tag "$SC_UPSTREAM_TAG"
+    fi
+    git --git-dir="$cache" worktree prune
+    git --git-dir="$cache" worktree add --quiet --detach "$tree" "refs/tags/$SC_UPSTREAM_TAG"
+  elif ! git -C "$tree" rev-parse --git-dir >/dev/null 2>&1; then
+    sc_fail "source path exists but is not a Git checkout: $tree"
     return 1
   fi
 
   local expected_commit actual_commit
-  expected_commit="$(git -C "$destination" rev-list -n 1 "$SC_UPSTREAM_TAG" 2>/dev/null || true)"
-  actual_commit="$(git -C "$destination" rev-parse HEAD)"
+  expected_commit="$(git -C "$tree" rev-list -n 1 "$SC_UPSTREAM_TAG" 2>/dev/null || true)"
+  actual_commit="$(git -C "$tree" rev-parse HEAD)"
   if [[ -z "$expected_commit" || "$actual_commit" != "$expected_commit" ]]; then
     sc_fail "source checkout is not at the exact $SC_UPSTREAM_TAG commit"
     return 1
@@ -77,7 +90,7 @@ sc_apply_series() {
   local patch_dir="$1"
   local source_dir="$2"
   local series_file="$patch_dir/series"
-  local expected_tag="${SC_UPSTREAM_TAG:?sc_clone_tag must run before sc_apply_series}"
+  local expected_tag="${SC_UPSTREAM_TAG:?sc_checkout must run before sc_apply_series}"
 
   if ! git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
     sc_fail "not a Git checkout: $source_dir"
@@ -198,7 +211,7 @@ sc_sysroot_patch_hash() {
 
 sc_write_build_info() {
   local out_dir="${SC_OUT_DIR:?sc_assemble must run before sc_write_build_info}"
-  local upstream_tag="${SC_UPSTREAM_TAG:?sc_clone_tag must run before sc_write_build_info}"
+  local upstream_tag="${SC_UPSTREAM_TAG:?sc_checkout must run before sc_write_build_info}"
   local servicecache_commit
   servicecache_commit="$(git -C "$SC_ROOT" rev-parse HEAD)"
 

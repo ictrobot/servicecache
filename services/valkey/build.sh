@@ -3,7 +3,9 @@ set -euo pipefail
 
 source "$(dirname "$0")/../../toolchain/lib.sh"
 sc_init valkey "${1:?usage: $0 version}"
-sc_clone_tag "$VALKEY_TAG" "$SC_SRC"
+: "${SC_SOURCE_URL:=https://github.com/valkey-io/valkey.git}"
+: "${VALKEY_TAG:=$SC_VERSION}"
+sc_checkout "$SC_SOURCE_URL" "$VALKEY_TAG" "$SC_SRC"
 sc_apply_series "$SC_VERSION_DIR/patches" "$SC_SRC"
 sc_apply_series "$SC_VERSION_DIR/patches/cli" "$SC_SRC"
 
