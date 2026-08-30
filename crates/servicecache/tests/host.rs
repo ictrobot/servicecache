@@ -1,8 +1,9 @@
 //! Every assembled service comes up through `servicecache host`: prepare,
 //! start on a socket the manager passed, initialize with the recipe its
 //! adapter provides, answer the adapter's check, stop — once driven from
-//! this process, once through `servicecache run`. Skipped for services that
-//! are not built or have no adapter.
+//! this process, once through `servicecache run`, once forking a clone. A
+//! trial per built service and case, discovered at run time
+//! (`libtest-mimic`); services without an adapter get none.
 
 #[path = "support/service_adapter.rs"]
 mod service_adapter;
@@ -63,13 +64,6 @@ fn run_through_host(manifest_path: &Path) {
     host.stop().expect("stop");
 }
 
-#[test]
-fn every_built_service_comes_up_through_the_host() {
-    for manifest in manifests() {
-        run_through_host(&manifest);
-    }
-}
-
 /// `servicecache run` brings the service up, prints its endpoint and keeps
 /// serving until it is killed.
 /// A spawned `servicecache run`, killed when dropped so that a failed
@@ -106,7 +100,7 @@ fn run_through_cli(manifest_path: &Path) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped());
     let recipe_path =
-        std::env::temp_dir().join(format!("servicecache-recipe-{}", std::process::id()));
+        std::env::temp_dir().join(format!("servicecache-recipe-{}-{name}", std::process::id()));
     if manifest.initializer.is_some() {
         std::fs::File::create(&recipe_path)
             .and_then(|mut file| file.write_all(&adapter.recipe()))
@@ -127,13 +121,6 @@ fn run_through_cli(manifest_path: &Path) {
 
     drop(child);
     let _ = std::fs::remove_file(&recipe_path);
-}
-
-#[test]
-fn every_built_service_runs_through_the_cli() {
-    for manifest in manifests() {
-        run_through_cli(&manifest);
-    }
 }
 
 /// `run --clones 1`, sent SIGUSR1 once the endpoint is out: the clone's
@@ -164,8 +151,10 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
         .arg("1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped());
-    let recipe_path =
-        std::env::temp_dir().join(format!("servicecache-clone-recipe-{}", std::process::id()));
+    let recipe_path = std::env::temp_dir().join(format!(
+        "servicecache-clone-recipe-{}-{name}",
+        std::process::id()
+    ));
     if manifest.initializer.is_some() {
         std::fs::File::create(&recipe_path)
             .and_then(|mut file| file.write_all(&adapter.recipe()))
@@ -225,17 +214,9 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
     }
 }
 
-#[test]
-fn every_built_service_forks_a_clone_through_the_cli() {
-    for manifest in manifests() {
-        fork_a_clone_through_cli(&manifest);
-    }
-}
-
 /// A guest reads ports back the way it bound and the client connected
 /// (wasix-libc probes the port byte order with a throwaway bind, which the
 /// host must answer). Uses the toolchain smoke fixture `netprobe.wasm`.
-#[test]
 fn guest_sees_correct_ports() {
     use std::io::Read as _;
 
@@ -278,4 +259,46 @@ fn guest_sees_correct_ports() {
     );
     assert_eq!(host.wait_exit().expect("the guest exits"), 0);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A case, given the manifest of the service under test.
+type Case = fn(&Path);
+
+const CASES: &[(&str, Case)] = &[
+    ("comes_up_through_the_host", run_through_host),
+    ("runs_through_the_cli", run_through_cli),
+    ("forks_a_clone_through_the_cli", fork_a_clone_through_cli),
+];
+
+fn main() {
+    let args = libtest_mimic::Arguments::from_args();
+    let mut trials = Vec::new();
+    for manifest in manifests() {
+        let name = Manifest::load(&manifest)
+            .expect("load the manifest")
+            .service
+            .name;
+        if ServiceAdapter::find(&repo_root(), &name).is_none() {
+            eprintln!("skipped: {name} has no adapter");
+            continue;
+        }
+        for &(case, run) in CASES {
+            let manifest = manifest.clone();
+            trials.push(libtest_mimic::Trial::test(
+                format!("{name}::{case}"),
+                move || {
+                    run(&manifest);
+                    Ok(())
+                },
+            ));
+        }
+    }
+    trials.push(libtest_mimic::Trial::test(
+        "guest_sees_correct_ports",
+        || {
+            guest_sees_correct_ports();
+            Ok(())
+        },
+    ));
+    libtest_mimic::run(&args, trials).exit();
 }

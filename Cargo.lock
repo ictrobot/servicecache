@@ -2994,6 +2994,7 @@ dependencies = [
  "async-trait",
  "clap",
  "libc",
+ "libtest-mimic",
  "nix 0.29.0",
  "rayon",
  "serde",

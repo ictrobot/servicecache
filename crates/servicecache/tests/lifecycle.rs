@@ -1,9 +1,11 @@
 //! The lifecycle tests: freeze-is-terminal and resume, proven on every
-//! assembled service. `make lifecycle-tests` (`SERVICECACHE_LIFECYCLE=quick`)
-//! runs the matrix; `make lifecycle-tests-long` (`SERVICECACHE_LIFECYCLE=long`)
-//! adds thousands of forks. Unset, the test is skipped.
-//! `SERVICECACHE_LIFECYCLE_ONLY=<substring>` restricts it to matching service
-//! directories.
+//! assembled service. A trial per service and case, discovered at run time
+//! (`libtest-mimic`, so `cargo test`'s filters and thread count and nextest
+//! apply): `make lifecycle-tests` runs the matrix, `make lifecycle-tests-long`
+//! includes the ignored trials with thousands of forks; a name filter such
+//! as `cargo test --test lifecycle <service>` selects trials. Without
+//! `SERVICECACHE_LIFECYCLE` set there are no trials, so `make test` skips
+//! the matrix.
 //!
 //! The matrix, per service: freeze; fork N children sequentially; live
 //! siblings at once; a chain (child → freeze → fork); freeze while a client
@@ -34,27 +36,6 @@ fn binary() -> &'static Path {
 fn cache_dir() -> PathBuf {
     servicecache::cache::directory(None, std::env::var_os("SERVICECACHE_CACHE_DIR").as_deref())
         .expect("a cache directory")
-}
-
-/// `quick` or `long` from `SERVICECACHE_LIFECYCLE`; `None` when unset.
-fn mode() -> Option<String> {
-    let mode = std::env::var("SERVICECACHE_LIFECYCLE").ok()?;
-    assert!(
-        mode == "quick" || mode == "long",
-        "SERVICECACHE_LIFECYCLE must be quick or long, not {mode:?}"
-    );
-    Some(mode)
-}
-
-fn long_mode() -> bool {
-    mode().is_some_and(|mode| mode == "long")
-}
-
-fn selected(manifest: &Path) -> bool {
-    match std::env::var("SERVICECACHE_LIFECYCLE_ONLY") {
-        Ok(only) => manifest.to_string_lossy().contains(&only),
-        Err(_) => true,
-    }
 }
 
 fn manifests() -> Vec<PathBuf> {
@@ -127,10 +108,7 @@ impl Subject {
     fn load(manifest_path: &Path) -> Option<Self> {
         let manifest = Manifest::load(manifest_path).expect("load the manifest");
         let name = manifest.service.name.clone();
-        let Some(adapter) = ServiceAdapter::find(&repo_root(), &name) else {
-            eprintln!("skipped: {name} has no adapter");
-            return None;
-        };
+        let adapter = ServiceAdapter::find(&repo_root(), &name)?;
         Some(Self {
             manifest,
             path: manifest_path.to_path_buf(),
@@ -320,7 +298,6 @@ fn case_sequential_children(subject: &Subject, count: usize) {
         started.elapsed(),
         started.elapsed() / u32::try_from(count).expect("count fits")
     );
-    subject.report_timings("sequential children");
     template.stop().expect("stop the template");
 }
 
@@ -493,35 +470,53 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     }
 }
 
-fn run_matrix(subject: &Subject) {
-    let name = &subject.name;
-    let long = long_mode();
-    eprintln!("== {name}: freeze and fork");
-    case_freeze_and_fork(subject);
-    eprintln!("== {name}: sequential children");
-    case_sequential_children(subject, if long { 2000 } else { 5 });
-    eprintln!("== {name}: live siblings");
-    case_live_siblings(subject, if long { 8 } else { 3 });
-    eprintln!("== {name}: chain");
-    case_chain(subject);
-    eprintln!("== {name}: freeze mid-request");
-    case_freeze_mid_request(subject);
-    eprintln!("== {name}: kill at every phase");
-    case_kill_at_every_phase(subject);
-    subject.report_timings("whole matrix");
-}
+/// A case of the matrix, given the service under test.
+type Case = fn(&Subject);
 
-#[test]
-fn lifecycle_of_every_built_service() {
-    if mode().is_none() {
-        eprintln!(
-            "skipped: set SERVICECACHE_LIFECYCLE=quick or long (make lifecycle-tests, make lifecycle-tests-long)"
-        );
-        return;
-    }
-    for manifest in manifests().iter().filter(|m| selected(m)) {
-        if let Some(subject) = Subject::load(manifest) {
-            run_matrix(&subject);
+/// The matrix: name, case, and whether it is a long case, run only with
+/// `--include-ignored`.
+const CASES: &[(&str, Case, bool)] = &[
+    ("freeze_and_fork", case_freeze_and_fork, false),
+    (
+        "sequential_children",
+        |s| case_sequential_children(s, 5),
+        false,
+    ),
+    ("live_siblings", |s| case_live_siblings(s, 3), false),
+    ("chain", case_chain, false),
+    ("freeze_mid_request", case_freeze_mid_request, false),
+    ("kill_at_every_phase", case_kill_at_every_phase, false),
+    (
+        "sequential_children_long",
+        |s| case_sequential_children(s, 2000),
+        true,
+    ),
+    ("live_siblings_long", |s| case_live_siblings(s, 8), true),
+];
+
+fn main() {
+    let args = libtest_mimic::Arguments::from_args();
+    let mut trials = Vec::new();
+    if std::env::var_os("SERVICECACHE_LIFECYCLE").is_some() {
+        for manifest in manifests() {
+            let Some(subject) = Subject::load(&manifest) else {
+                eprintln!("skipped: {} has no adapter", manifest.display());
+                continue;
+            };
+            for &(case, run, long) in CASES {
+                let manifest = manifest.clone();
+                let trial =
+                    libtest_mimic::Trial::test(format!("{}::{case}", subject.name), move || {
+                        let subject = Subject::load(&manifest).expect("the adapter was found");
+                        run(&subject);
+                        subject.report_timings(case);
+                        Ok(())
+                    });
+                trials.push(trial.with_ignored_flag(long));
+            }
         }
+    } else {
+        eprintln!("skipped: set SERVICECACHE_LIFECYCLE=1 (make lifecycle-tests)");
     }
+    libtest_mimic::run(&args, trials).exit();
 }

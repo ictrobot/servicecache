@@ -27,7 +27,7 @@ help:
 	@echo "test                            setup-wasmer, then cargo test"
 	@echo "lint                            setup-wasmer, then cargo fmt --check and cargo clippy"
 	@echo "lifecycle-tests                 freeze and fork every built service through the host (quick matrix)"
-	@echo "lifecycle-tests-long            the same with thousands of forks"
+	@echo "lifecycle-tests-long            the same plus the long cases (thousands of forks)"
 	@echo "lifecycle-tests-release         the quick matrix on a release build, for latency figures"
 	@echo "lifecycle-tests-long-release    the long matrix on a release build"
 	@echo "services-list                   list services assembled under work/services"
@@ -64,16 +64,16 @@ lint: setup-wasmer
 check: lint test smoke-toolchain
 
 lifecycle-tests: setup-wasmer
-	SERVICECACHE_LIFECYCLE=quick cargo test --test lifecycle -- --nocapture
+	SERVICECACHE_LIFECYCLE=1 cargo test --test lifecycle
 
 lifecycle-tests-long: setup-wasmer
-	SERVICECACHE_LIFECYCLE=long cargo test --test lifecycle -- --nocapture
+	SERVICECACHE_LIFECYCLE=1 cargo test --test lifecycle -- --include-ignored
 
 lifecycle-tests-release: setup-wasmer
-	SERVICECACHE_LIFECYCLE=quick cargo test --release --test lifecycle -- --nocapture
+	SERVICECACHE_LIFECYCLE=1 cargo test --release --test lifecycle
 
 lifecycle-tests-long-release: setup-wasmer
-	SERVICECACHE_LIFECYCLE=long cargo test --release --test lifecycle -- --nocapture
+	SERVICECACHE_LIFECYCLE=1 cargo test --release --test lifecycle -- --include-ignored
 
 services-list:
 	SERVICECACHE_SERVICES_DIR=work/services cargo run -- services list

@@ -27,5 +27,18 @@ virtual-fs = { version = "=0.703.0", default-features = false, features = ["host
 virtual-mio = { version = "=0.703.0", default-features = false, features = ["sys"] }
 virtual-net = { version = "=0.703.0", default-features = false, features = ["host-net"] }
 
+[dev-dependencies]
+libtest-mimic = "0.8"
+
+# One trial per built service and case, discovered at run time, so that the
+# harness (or nextest) runs them in parallel.
+[[test]]
+name = "host"
+harness = false
+
+[[test]]
+name = "lifecycle"
+harness = false
+
 [lints]
 workspace = true
