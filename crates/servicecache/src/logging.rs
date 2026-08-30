@@ -9,12 +9,19 @@
 //! everything, wasmer-wasix's syscalls included.
 //!
 //! A host process is given the manager's directives on its command line, so
-//! `-v` on the manager applies to its hosts and their clones.
+//! `-v` on the manager applies to its hosts and their clones. Every line
+//! starts with the pid of the process writing it, to tell the manager, its
+//! hosts and their clones apart.
 
-use std::{io::IsTerminal as _, sync::OnceLock};
+use std::{fmt, io::IsTerminal as _, sync::OnceLock};
 
 use anyhow::{Context as _, Result};
-use tracing_subscriber::EnvFilter;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::{FmtContext, FormatEvent, FormatFields, format::Writer},
+    registry::LookupSpan,
+};
 
 /// The targets the Wasmer patches log under.
 const PATCH_TARGETS: &[&str] = &[
@@ -24,6 +31,30 @@ const PATCH_TARGETS: &[&str] = &[
 ];
 
 static DIRECTIVES: OnceLock<String> = OnceLock::new();
+
+/// An event format that prefixes each line of `inner`'s with the pid of the
+/// process writing it, read for every line: a clone inherits the subscriber
+/// from its template through `fork()`.
+struct WithPid<E> {
+    inner: E,
+}
+
+impl<S, N, E> FormatEvent<S, N> for WithPid<E>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    E: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        write!(writer, "[{}] ", std::process::id())?;
+        self.inner.format_event(ctx, writer, event)
+    }
+}
 
 /// The directives for `-v` repeated `verbosity` times.
 #[must_use]
@@ -66,6 +97,7 @@ pub fn init(verbosity: u8, log: Option<&str>) -> Result<()> {
         .with_target(true)
         .with_thread_names(true)
         .with_ansi(std::io::stderr().is_terminal())
+        .map_event_format(|inner| WithPid { inner })
         .try_init();
     Ok(())
 }
