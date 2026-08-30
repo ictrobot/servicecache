@@ -31,6 +31,11 @@ fn binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_servicecache"))
 }
 
+fn cache_dir() -> PathBuf {
+    servicecache::cache::directory(None, std::env::var_os("SERVICECACHE_CACHE_DIR").as_deref())
+        .expect("a cache directory")
+}
+
 /// `quick` or `long` from `SERVICECACHE_LIFECYCLE`; `None` when unset.
 fn mode() -> Option<String> {
     let mode = std::env::var("SERVICECACHE_LIFECYCLE").ok()?;
@@ -149,7 +154,8 @@ impl Subject {
 
     /// A host brought up and initialized.
     fn bring_up(&self) -> HostProcess {
-        let mut host = HostProcess::spawn_with_binary(binary(), &self.path).expect("spawn");
+        let mut host =
+            HostProcess::spawn_with_binary(binary(), &self.path, &cache_dir()).expect("spawn");
         if self.manifest.prepare.is_some() {
             assert_eq!(
                 host.prepare().expect("prepare"),
@@ -403,7 +409,8 @@ fn case_kill_at_every_phase(subject: &Subject) {
         "forked",
     ];
     for phase in phases {
-        let mut host = HostProcess::spawn_with_binary(binary(), &subject.path).expect("spawn");
+        let mut host =
+            HostProcess::spawn_with_binary(binary(), &subject.path, &cache_dir()).expect("spawn");
         let mut children = Vec::new();
         'phases: {
             if phase == "spawned" {

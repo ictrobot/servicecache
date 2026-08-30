@@ -16,7 +16,10 @@ use wasmer_wasix::{
 };
 
 use super::{net::HostNetworking, tasks::HostTaskManager};
-use crate::runtime::{ReadOnlyMount, read_only_mounts};
+use crate::{
+    cache::ModuleCache,
+    runtime::{ReadOnlyMount, read_only_mounts},
+};
 
 /// One run of a module: the prepare step, the serving guest, or the
 /// initializer.
@@ -37,11 +40,13 @@ pub struct GuestRuntime {
     /// every run, so the prepare step's output is what the guest starts on.
     fs: Arc<MountFileSystem>,
     networking: Arc<HostNetworking>,
+    cache: ModuleCache,
     modules: Mutex<HashMap<PathBuf, Module>>,
 }
 
 impl GuestRuntime {
-    /// A runtime with the given read-only host mounts.
+    /// A runtime with the given read-only host mounts, loading compiled
+    /// modules through `cache`.
     ///
     /// # Errors
     ///
@@ -50,6 +55,7 @@ impl GuestRuntime {
         tasks: HostTaskManager,
         mounts: &[ReadOnlyMount],
         networking: Arc<HostNetworking>,
+        cache: ModuleCache,
     ) -> Result<Self> {
         let fs = read_only_mounts(mounts, &tasks.handle())?;
         Ok(Self {
@@ -57,11 +63,13 @@ impl GuestRuntime {
             tasks,
             fs: Arc::new(fs),
             networking,
+            cache,
             modules: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Compiles a module, once per path.
+    /// The compiled module at `path`, once per path: from the cache, or
+    /// compiled and stored.
     ///
     /// # Errors
     ///
@@ -74,19 +82,18 @@ impl GuestRuntime {
         if let Some(module) = modules.get(path) {
             return Ok(module.clone());
         }
-        // The compiler parallelises with rayon, partly on the global pool,
-        // whose workers would live for the rest of the process: a freeze
-        // cannot allow that, and a forked child could not compile against
-        // the parent's dead workers. A private pool, dropped afterwards,
-        // leaves no threads behind.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("compile-{i}"))
-            .build()
-            .context("failed to create the compiler's thread pool")?;
-        let module = pool
-            .install(|| Module::from_file(&self.engine, path))
-            .with_context(|| format!("failed to compile {}", path.display()))?;
-        drop(pool);
+        let module = self.cache.load(&self.engine, path, |engine, bytes| {
+            // The compiler parallelises with rayon, partly on the global
+            // pool, whose workers would live for the rest of the process: a
+            // freeze cannot allow that, and a forked child could not compile
+            // against the parent's dead workers. A private pool, dropped
+            // afterwards, leaves no threads behind.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .thread_name(|i| format!("compile-{i}"))
+                .build()
+                .map_err(|error| wasmer::CompileError::Resource(error.to_string()))?;
+            pool.install(|| Module::from_binary(engine, bytes))
+        })?;
         modules.insert(path.to_path_buf(), module.clone());
         Ok(module)
     }

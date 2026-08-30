@@ -8,6 +8,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use wasmer::{Engine, Module, Store};
+
+use crate::cache::ModuleCache;
 use wasmer_wasix::{
     Pipe, PluggableRuntime, UnsupportedVirtualNetworking, WasiEnv, WasiError,
     runtime::task_manager::tokio::TokioTaskManager,
@@ -45,6 +47,8 @@ pub struct RunOutput {
 #[derive(Debug, Clone, Default)]
 pub struct Runtime {
     engine: Engine,
+    /// Compiled modules on disk; without it every load compiles.
+    cache: Option<ModuleCache>,
 }
 
 impl Runtime {
@@ -54,13 +58,29 @@ impl Runtime {
         Self::default()
     }
 
+    /// The same runtime, loading compiled modules through `cache`.
+    #[must_use]
+    pub fn with_cache(mut self, cache: ModuleCache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// The compiled module at `path`.
+    fn module(&self, path: &Path) -> Result<Module> {
+        match &self.cache {
+            Some(cache) => cache.load(&self.engine, path, Module::from_binary),
+            None => Module::from_file(&self.engine, path)
+                .with_context(|| format!("failed to compile {}", path.display())),
+        }
+    }
+
     /// Compile a module without running it.
     ///
     /// # Errors
     ///
     /// Returns an error when the module cannot be read or compiled by Wasmer.
     pub fn load(&self, path: &Path) -> Result<()> {
-        Module::from_file(&self.engine, path)
+        self.module(path)
             .with_context(|| format!("failed to load WASIX module {}", path.display()))?;
         Ok(())
     }
@@ -82,12 +102,7 @@ impl Runtime {
             .context("failed to create WASIX task runtime")?;
         let _runtime_guard = tokio_runtime.enter();
 
-        let module = Module::from_file(&self.engine, request.module).with_context(|| {
-            format!(
-                "failed to compile WASIX module {}",
-                request.module.display()
-            )
-        })?;
+        let module = self.module(request.module)?;
         let mut store = Store::new(self.engine.clone());
         let filesystem = read_only_mounts(request.mounts, tokio_runtime.handle())?;
 

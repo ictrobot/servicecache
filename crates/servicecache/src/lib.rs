@@ -1,3 +1,4 @@
+pub mod cache;
 mod cli;
 pub mod discovery;
 pub mod host;

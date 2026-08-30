@@ -42,7 +42,11 @@ fn run_through_host(manifest_path: &Path) {
     };
 
     let binary = Path::new(env!("CARGO_BIN_EXE_servicecache"));
-    let mut host = HostProcess::spawn_with_binary(binary, manifest_path).expect("spawn the host");
+    let cache_dir =
+        servicecache::cache::directory(None, std::env::var_os("SERVICECACHE_CACHE_DIR").as_deref())
+            .expect("a cache directory");
+    let mut host =
+        HostProcess::spawn_with_binary(binary, manifest_path, &cache_dir).expect("spawn the host");
     if manifest.prepare.is_some() {
         assert_eq!(host.prepare().expect("prepare"), 0, "{name}: prepare");
     }

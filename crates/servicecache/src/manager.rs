@@ -34,14 +34,15 @@ pub struct HostProcess {
 
 impl HostProcess {
     /// Spawns `servicecache host` for `manifest` by re-executing this
-    /// binary. The host dies with the calling thread.
+    /// binary, with compiled modules cached under `cache_dir`. The host
+    /// dies with the calling thread.
     ///
     /// # Errors
     ///
     /// Fails if the channel or the process cannot be created.
-    pub fn spawn(manifest: &Path) -> Result<Self> {
+    pub fn spawn(manifest: &Path, cache_dir: &Path) -> Result<Self> {
         let binary = std::env::current_exe().context("failed to locate this binary")?;
-        Self::spawn_with_binary(&binary, manifest)
+        Self::spawn_with_binary(&binary, manifest, cache_dir)
     }
 
     /// Spawns `<binary> host` for `manifest`; for callers that are not the
@@ -50,7 +51,7 @@ impl HostProcess {
     /// # Errors
     ///
     /// Fails if the channel or the process cannot be created.
-    pub fn spawn_with_binary(binary: &Path, manifest: &Path) -> Result<Self> {
+    pub fn spawn_with_binary(binary: &Path, manifest: &Path, cache_dir: &Path) -> Result<Self> {
         let (ours, theirs) = Channel::pair()?;
         let theirs_fd = theirs.as_raw_fd();
         let parent = std::process::id();
@@ -62,6 +63,8 @@ impl HostProcess {
             .arg(manifest)
             .arg("--control-fd")
             .arg(HOST_CONTROL_FD.to_string())
+            .arg("--cache-dir")
+            .arg(cache_dir)
             .stdin(Stdio::null());
         // Runs in the child between fork and exec: only async-signal-safe
         // calls, no allocation.

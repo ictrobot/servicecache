@@ -1,9 +1,17 @@
-use std::{env, ffi::OsString, path::PathBuf};
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::{discovery::ServiceIndex, runtime::Runtime};
+use crate::{
+    cache::{self, ModuleCache},
+    discovery::ServiceIndex,
+    runtime::Runtime,
+};
 
 const SYSTEM_DEFAULTS: [&str; 2] = [
     "/usr/local/share/servicecache/services",
@@ -17,6 +25,10 @@ struct Cli {
     #[arg(long, value_name = "DIR", global = true)]
     services_dir: Vec<PathBuf>,
 
+    /// Where compiled modules are cached (default: ~/.cache/servicecache).
+    #[arg(long, value_name = "DIR", global = true)]
+    cache_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -29,6 +41,11 @@ enum Command {
     Services {
         #[command(subcommand)]
         command: ServicesCommand,
+    },
+    /// Manage the cache of compiled modules.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
     },
     /// Run one guest, driven by the manager over an inherited control
     /// channel (internal).
@@ -51,16 +68,31 @@ enum ServicesCommand {
     Check,
 }
 
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Remove the cache directory and everything in it.
+    Clean,
+}
+
 /// Parse command-line arguments and run the requested command.
 ///
 /// # Errors
 ///
 /// Returns an error when service discovery, hashing, or module loading fails.
 pub fn run() -> Result<()> {
-    run_with(Cli::parse(), env::var_os("SERVICECACHE_SERVICES_DIR"))
+    run_with(
+        Cli::parse(),
+        env::var_os("SERVICECACHE_SERVICES_DIR"),
+        env::var_os("SERVICECACHE_CACHE_DIR").as_deref(),
+    )
 }
 
-fn run_with(cli: Cli, environment_dirs: Option<OsString>) -> Result<()> {
+fn run_with(
+    cli: Cli,
+    environment_dirs: Option<OsString>,
+    environment_cache: Option<&OsStr>,
+) -> Result<()> {
+    let cache_dir = || cache::directory(cli.cache_dir.as_deref(), environment_cache);
     match cli.command {
         Command::Serve => {
             println!("serve is not implemented yet");
@@ -74,15 +106,30 @@ fn run_with(cli: Cli, environment_dirs: Option<OsString>) -> Result<()> {
                     print_services(&services);
                     Ok(())
                 }
-                ServicesCommand::Check => check_services(&services),
+                ServicesCommand::Check => {
+                    let runtime = Runtime::new().with_cache(ModuleCache::new(cache_dir()?));
+                    check_services(&services, &runtime)
+                }
             }
         }
+        Command::Cache { command } => match command {
+            CacheCommand::Clean => {
+                let dir = cache_dir()?;
+                if cache::clean(&dir)? {
+                    println!("removed {}", dir.display());
+                } else {
+                    println!("nothing to remove at {}", dir.display());
+                }
+                Ok(())
+            }
+        },
         Command::Host {
             manifest,
             control_fd,
         } => crate::host::run(&crate::host::HostArgs {
             manifest,
             control_fd,
+            cache_dir: cache_dir()?,
         }),
     }
 }
@@ -131,8 +178,7 @@ fn print_services(services: &ServiceIndex) {
     }
 }
 
-fn check_services(services: &ServiceIndex) -> Result<()> {
-    let runtime = Runtime::new();
+fn check_services(services: &ServiceIndex, runtime: &Runtime) -> Result<()> {
     for (manifest, directory) in services.all_packages() {
         for module in manifest.modules() {
             runtime.load(module).with_context(|| {

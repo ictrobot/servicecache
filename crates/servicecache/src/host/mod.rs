@@ -35,7 +35,7 @@ use self::{
     protocol::{Channel, Frame, Reply, Request, Run},
     tasks::HostTaskManager,
 };
-use crate::{manifest::Manifest, runtime::ReadOnlyMount};
+use crate::{cache::ModuleCache, manifest::Manifest, runtime::ReadOnlyMount};
 
 /// Coroutine stack for Wasm calls. Host imports run on it too, so it is
 /// sized for the deepest syscall path rather than for Wasm alone.
@@ -49,6 +49,8 @@ const TICK: Duration = Duration::from_millis(100);
 pub struct HostArgs {
     pub manifest: PathBuf,
     pub control_fd: RawFd,
+    /// Where compiled modules are cached.
+    pub cache_dir: PathBuf,
 }
 
 /// Runs a host process to completion.
@@ -63,7 +65,7 @@ pub fn run(args: &HostArgs) -> Result<()> {
     let manifest = Manifest::load(&args.manifest)?;
     // The descriptor was inherited from the manager and is ours to close.
     let channel = Channel::from_fd(unsafe { OwnedFd::from_raw_fd(args.control_fd) });
-    let host = Host::new(manifest)?;
+    let host = Host::new(manifest, ModuleCache::new(args.cache_dir.clone()))?;
     host.serve(channel)
 }
 
@@ -161,7 +163,7 @@ struct Host {
 }
 
 impl Host {
-    fn new(manifest: Manifest) -> Result<Self> {
+    fn new(manifest: Manifest, cache: ModuleCache) -> Result<Self> {
         let tokio = freeze::build_tokio()?;
         let tasks = HostTaskManager::new(tokio.handle().clone());
         tasks.install_as_sleep_source();
@@ -185,7 +187,7 @@ impl Host {
                     .collect()
             })
             .unwrap_or_default();
-        let guests = GuestRuntime::new(tasks.clone(), &mounts, networking.clone())?;
+        let guests = GuestRuntime::new(tasks.clone(), &mounts, networking.clone(), cache)?;
 
         Ok(Self {
             manifest,
