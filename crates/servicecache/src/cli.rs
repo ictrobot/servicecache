@@ -314,20 +314,22 @@ fn run_service(
     std::io::stdout()
         .flush()
         .context("failed to write the endpoint")?;
-    eprintln!(
-        "\n==> {} is listening on host port {} ({endpoint}; guest port {}). Ctrl-C to stop.",
+    let mut banner = Lines::new();
+    banner.line("").line(format_args!(
+        "==> {} is listening on host port {} ({endpoint}; guest port {}). Ctrl-C to stop.",
         manifest.service.name,
         endpoint.port(),
         manifest.guest.listen_port
-    );
+    ));
     if let Some(count) = clones {
-        eprintln!(
+        banner.line(format_args!(
             "==> Enter here, or `kill -USR1 {}`, freezes it and forks {count} clone{}.",
             std::process::id(),
             if count == 1 { "" } else { "s" }
-        );
+        ));
     }
-    eprintln!();
+    banner.line("");
+    drop(banner);
 
     let status = match (clones, signals.as_mut()) {
         (Some(count), Some(signals)) => run_with_clones(&mut host, count, signals)?,
@@ -337,6 +339,31 @@ fn run_service(
         bail!("{} exited with status {status}", manifest.service.name);
     }
     Ok(())
+}
+
+/// Lines for stderr, collected and written in one call when dropped, so
+/// that a group of them never interleaves with what a host writes there at
+/// the same time.
+struct Lines(String);
+
+impl Lines {
+    fn new() -> Self {
+        Self(String::new())
+    }
+
+    fn line(&mut self, line: impl std::fmt::Display) -> &mut Self {
+        use std::fmt::Write as _;
+        let _ = writeln!(self.0, "{line}");
+        self
+    }
+}
+
+impl Drop for Lines {
+    fn drop(&mut self) {
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(self.0.as_bytes());
+        let _ = stderr.flush();
+    }
 }
 
 /// A descriptor SIGUSR1 can be read from, the signal blocked so that it
@@ -398,9 +425,10 @@ fn run_with_clones(
                 } => {
                     clones.retain(|clone| clone.pid() != pid);
                     clone_failed |= status != 0;
-                    eprintln!("==> clone {pid} exited with status {status}");
+                    let mut lines = Lines::new();
+                    lines.line(format_args!("==> clone {pid} exited with status {status}"));
                     if clones.is_empty() {
-                        eprintln!("==> every clone has exited");
+                        lines.line("==> every clone has exited");
                         return Ok(i32::from(clone_failed));
                     }
                 }
@@ -431,15 +459,16 @@ fn run_with_clones(
             continue;
         }
 
+        let mut lines = Lines::new();
         if !frozen {
             let started = Instant::now();
             let threads = template.freeze()?;
             frozen = true;
-            eprintln!(
+            lines.line(format_args!(
                 "==> frozen: {threads} guest thread{} in {:.1?}",
                 if threads == 1 { "" } else { "s" },
                 started.elapsed()
-            );
+            ));
         }
         for _ in 0..count {
             let started = Instant::now();
@@ -449,11 +478,11 @@ fn run_with_clones(
             std::io::stdout()
                 .flush()
                 .context("failed to write the endpoint")?;
-            eprintln!(
+            lines.line(format_args!(
                 "==> clone {} is listening on host port {} ({endpoint}), forked in {elapsed:.1?}",
                 clone.pid(),
                 endpoint.port()
-            );
+            ));
             clones.push(clone);
         }
     }
