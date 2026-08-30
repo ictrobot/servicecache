@@ -1,0 +1,41 @@
+Subject: wasix: allow the journal-only code in builds without the feature
+
+Without the journal feature rustc warns about the journal fields of
+CommonWasiOptions, the journal imports in runners/wasi.rs, and a mut in
+run_wasm that only the journal block needs. Allow them, as run_command
+already does for its builder, so a build without the feature is clean.
+
+diff --git a/lib/wasix/src/runners/wasi.rs b/lib/wasix/src/runners/wasi.rs
+index c416457..ae4e1ad 100644
+--- a/lib/wasix/src/runners/wasi.rs
++++ b/lib/wasix/src/runners/wasi.rs
+@@ -9,6 +9,8 @@ use wasmer::{Engine, Module};
+ use wasmer_types::ModuleHash;
+ use webc::metadata::{Command, annotations::Wasi};
+ 
++// The journal imports are only used with the journal feature.
++#[cfg_attr(not(feature = "journal"), allow(unused_imports))]
+ use crate::{
+     Runtime, WasiEnvBuilder, WasiError, WasiRuntimeError,
+     bin_factory::BinaryPackage,
+@@ -364,6 +366,7 @@ impl WasiRunner {
+ 
+         let wasi = webc::metadata::annotations::Wasi::new(program_name);
+ 
++        #[allow(unused_mut)]
+         let mut builder = runner.prepare_webc_env(
+             program_name,
+             &wasi,
+diff --git a/lib/wasix/src/runners/wasi_common.rs b/lib/wasix/src/runners/wasi_common.rs
+index fdc5eff..7192b6e 100644
+--- a/lib/wasix/src/runners/wasi_common.rs
++++ b/lib/wasix/src/runners/wasi_common.rs
+@@ -38,6 +38,8 @@ pub struct MappedCommand {
+     pub target: String,
+ }
+ 
++// The journal fields are only read with the journal feature.
++#[cfg_attr(not(feature = "journal"), allow(dead_code))]
+ #[derive(Debug, Default, Clone)]
+ pub(crate) struct CommonWasiOptions {
+     pub(crate) entry_function: Option<String>,
