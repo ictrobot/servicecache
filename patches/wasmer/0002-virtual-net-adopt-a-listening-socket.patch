@@ -6,7 +6,7 @@ that is already listening, and `LocalNetworking::selector` exposes the
 selector it registers with.
 
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index d39b5d7..c750260 100644
+index d39b5d7..db83250 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
 @@ -61,6 +61,11 @@ impl LocalNetworking {
@@ -21,7 +21,7 @@ index d39b5d7..c750260 100644
  }
  
  impl Drop for LocalNetworking {
-@@ -304,6 +309,24 @@ pub struct LocalTcpListener {
+@@ -304,6 +309,25 @@ pub struct LocalTcpListener {
  }
  
  impl LocalTcpListener {
@@ -32,6 +32,7 @@ index d39b5d7..c750260 100644
 +        selector: Arc<Selector>,
 +    ) -> io::Result<Self> {
 +        listener.set_nonblocking(true)?;
++        tracing::debug!(addr = ?listener.local_addr().ok(), "adopted a listening socket");
 +        Ok(Self {
 +            stream: mio::net::TcpListener::from_std(listener),
 +            selector,

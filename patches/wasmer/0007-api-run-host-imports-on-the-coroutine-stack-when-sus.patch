@@ -235,7 +235,7 @@ index c0e9418..5a50aaf 100644
  #[cfg(feature = "baremetal")]
  pub use traphandlers::install_unwinder;
 diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
-index 1bb7d27..b7a186a 100644
+index b49e0ba..2557b67 100644
 --- a/lib/vm/src/trap/suspend.rs
 +++ b/lib/vm/src/trap/suspend.rs
 @@ -100,6 +100,22 @@ pub fn enabled() -> bool {

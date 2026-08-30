@@ -68,7 +68,7 @@ index 60d5596..ac50e02 100644
      if !matches!(state, HandlerGuardState::WakerMap(_, _)) {
          let waker_map = InterestWakerMap::default();
 diff --git a/lib/virtual-io/src/selector.rs b/lib/virtual-io/src/selector.rs
-index 858f80e..eb5d4ee 100644
+index 858f80e..fd3467c 100644
 --- a/lib/virtual-io/src/selector.rs
 +++ b/lib/virtual-io/src/selector.rs
 @@ -1,4 +1,4 @@
@@ -97,7 +97,7 @@ index 858f80e..eb5d4ee 100644
  pub enum SelectorModification {
      Add {
          handler: Box<dyn InterestHandler + Send + Sync>,
-@@ -89,60 +102,122 @@ impl std::fmt::Debug for SelectorModification {
+@@ -89,60 +102,124 @@ impl std::fmt::Debug for SelectorModification {
      }
  }
  
@@ -205,6 +205,7 @@ index 858f80e..eb5d4ee 100644
 +        if let Some(handle) = handle {
 +            handle.join().ok();
 +        }
++        tracing::debug!("selector halted");
 +    }
 +
 +    /// In a forked child (or after `halt`): creates a new poll instance,
@@ -221,6 +222,7 @@ index 858f80e..eb5d4ee 100644
 +                poll.registry()
 +                    .register(&mut mio::unix::SourceFd(fd), *token, *interests)?;
 +            }
++            tracing::debug!(sources = sources.len(), "selector rebuilt after fork");
 +        }
 +        // Drop the old thread's handle (the thread does not exist here)
 +        // before anything can join it.
@@ -240,7 +242,7 @@ index 858f80e..eb5d4ee 100644
          interests: mio::Interest,
      ) -> io::Result<Token> {
          let token = self.new_token();
-@@ -150,29 +225,32 @@ impl Selector {
+@@ -150,29 +227,34 @@ impl Selector {
          self.queue_modification(SelectorModification::Add { handler, token });
  
          // CONCURRENCY: This should never result in a deadlock, as long as source.deregister does not call remove or add again.
@@ -262,6 +264,7 @@ index 858f80e..eb5d4ee 100644
 +            .lock()
 +            .unwrap()
 +            .insert(token, (std::os::fd::AsRawFd::as_raw_fd(source), interests));
++        tracing::trace!(?token, "source added");
  
          Ok(token)
      }
@@ -272,6 +275,7 @@ index 858f80e..eb5d4ee 100644
 -        source: Option<&mut dyn mio::event::Source>,
 -    ) -> io::Result<()> {
 +    pub fn remove(&self, token: Token, source: Option<&mut dyn SelectorSource>) -> io::Result<()> {
++        tracing::trace!(?token, "source removed");
          self.queue_modification(SelectorModification::Remove { token });
 +        #[cfg(unix)]
 +        self.sources.lock().unwrap().remove(&token);
@@ -284,7 +288,7 @@ index 858f80e..eb5d4ee 100644
          }
          Ok(())
      }
-@@ -203,7 +281,7 @@ impl Selector {
+@@ -203,7 +285,7 @@ impl Selector {
          self.queued_modifications.lock().unwrap().push(modification);
  
          if needs_wakeup {
@@ -293,7 +297,7 @@ index 858f80e..eb5d4ee 100644
          }
      }
  
-@@ -221,8 +299,6 @@ impl Selector {
+@@ -221,8 +303,6 @@ impl Selector {
          // The outer loop is used to release the scope of the
          // read lock whenever it needs to do so
          let mut events = mio::Events::with_capacity(128);
@@ -302,7 +306,7 @@ index 858f80e..eb5d4ee 100644
          loop {
              // Wait for an event to trigger
              if let Err(e) = poll.poll(&mut events, None) {
-@@ -237,6 +313,7 @@ impl Selector {
+@@ -237,6 +317,7 @@ impl Selector {
              // Handler changes that may be queued up between the poll completing and taking the queued modifications can be a problem but we can not eliminate that fully.
  
              let queued_modifications = engine.take_queued_modifications();
@@ -310,7 +314,7 @@ index 858f80e..eb5d4ee 100644
              for modification in queued_modifications {
                  modification.apply(&mut handler_map);
              }
-@@ -429,4 +506,46 @@ mod tests {
+@@ -429,4 +510,46 @@ mod tests {
              "Did not receive success signal from handler, deadlocked?"
          );
      }

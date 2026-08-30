@@ -49,10 +49,10 @@ index 94cfbc5..c0e9418 100644
  pub use traphandlers::install_unwinder;
 diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
 new file mode 100644
-index 0000000..1bb7d27
+index 0000000..b49e0ba
 --- /dev/null
 +++ b/lib/vm/src/trap/suspend.rs
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,358 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
 +// Copyright (c) 2026 Ethan Jones
 +
@@ -160,6 +160,15 @@ index 0000000..1bb7d27
 +    SLEEP_HOOK.get().map(|hook| hook(duration))
 +}
 +
++/// Logs through `tracing` when the crate's `tracing` feature is on, and
++/// expands to nothing otherwise.
++macro_rules! log {
++    ($level:ident, $($arg:tt)*) => {
++        #[cfg(feature = "tracing")]
++        tracing::$level!($($arg)*);
++    };
++}
++
 +/// Number of host loops currently resuming a coroutine or polling its wait.
 +static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 +
@@ -239,10 +248,12 @@ index 0000000..1bb7d27
 +    // SAFETY: the yielder pointer was stored in this thread's TLS by the
 +    // coroutine we are running on and stays valid while that coroutine is
 +    // live; suspending from within it is the operation it exists for.
++    log!(trace, "suspending on a wait");
 +    unsafe { yielder.as_ref().suspend(WasmYield::Blocked(blocked)) };
 +    // Resumed, possibly on another thread: this thread's view of the
 +    // coroutine is re-established through the non-inlined accessor.
 +    yielder_set(Some(yielder));
++    log!(trace, "resumed");
 +    true
 +}
 +

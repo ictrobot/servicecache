@@ -22,10 +22,10 @@ index ac50e02..42dc47a 100644
          if let Some(selector) = self.selector.upgrade() {
              selector.remove(self.token, Some(source))?;
 diff --git a/lib/virtual-io/src/selector.rs b/lib/virtual-io/src/selector.rs
-index eb5d4ee..df1993c 100644
+index fd3467c..6cbb626 100644
 --- a/lib/virtual-io/src/selector.rs
 +++ b/lib/virtual-io/src/selector.rs
-@@ -255,6 +255,31 @@ impl Selector {
+@@ -259,6 +259,32 @@ impl Selector {
          Ok(())
      }
  
@@ -51,6 +51,7 @@ index eb5d4ee..df1993c 100644
 +        }
 +        source.register(&instance.registry, token, interests)?;
 +        sources.insert(token, (std::os::fd::AsRawFd::as_raw_fd(source), interests));
++        tracing::debug!(?token, "registration moved to a new descriptor");
 +        Ok(())
 +    }
 +
@@ -58,10 +59,10 @@ index eb5d4ee..df1993c 100644
          self.queue_modification(SelectorModification::PushInterest { token, interest });
      }
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index 172d3ca..44576cc 100644
+index 8c4f88e..b7980f0 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
-@@ -323,6 +323,33 @@ impl LocalTcpListener {
+@@ -324,6 +324,38 @@ impl LocalTcpListener {
          })
      }
  
@@ -73,6 +74,11 @@ index 172d3ca..44576cc 100644
 +    #[cfg(unix)]
 +    pub fn replace_std_listener(&mut self, listener: std::net::TcpListener) -> io::Result<()> {
 +        listener.set_nonblocking(true)?;
++        tracing::debug!(
++            old = ?self.stream.local_addr().ok(),
++            new = ?listener.local_addr().ok(),
++            "replacing the listening socket"
++        );
 +        let mut stream = mio::net::TcpListener::from_std(listener);
 +        let token = match &self.handler_guard {
 +            HandlerGuardState::ExternalHandler(guard) | HandlerGuardState::WakerMap(guard, _) => {
