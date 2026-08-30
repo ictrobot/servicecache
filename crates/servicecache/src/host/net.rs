@@ -3,9 +3,14 @@
 //! Stock wasmer-wasix binds sockets itself. Here the manager creates the
 //! guest's listening socket and passes it over the control channel; when
 //! the guest binds its `listen_port` it gets that socket, and a forked child
-//! replaces it with the socket passed for the child. Any other bind is
-//! refused: a clone must never bind a real host port. Outbound connections
-//! (the initializer's) go to the host network unchanged.
+//! replaces it with the socket passed for the child.
+//!
+//! A bind on any other port gets a socket that reports the address it was
+//! given but can neither listen nor connect: a clone must never bind a real
+//! host port, and wasix-libc decides the byte order of every port it reads
+//! back by binding a throwaway socket and reading its address, so refusing the
+//! bind outright would leave the guest with swapped ports. Outbound
+//! connections (the initializer's) go to the host network unchanged.
 
 use std::{
     net::{SocketAddr, TcpListener},
@@ -148,7 +153,7 @@ impl VirtualNetworking for HostNetworking {
         _reuse_addr: bool,
     ) -> virtual_net::Result<Box<dyn VirtualTcpBoundSocket + Sync>> {
         if addr.port() != self.listen_port {
-            return Err(NetworkError::PermissionDenied);
+            return Ok(Box::new(UnservedBoundSocket { addr }));
         }
         let listener = self
             .passed
@@ -250,6 +255,38 @@ impl VirtualTcpBoundSocket for PassedBoundSocket {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .ttl()
             .map(u32::from)
+    }
+}
+
+/// A bind the host does not serve: it answers for its address, which is what
+/// wasix-libc's port byte-order probe needs, and refuses everything else.
+#[derive(Debug)]
+struct UnservedBoundSocket {
+    addr: SocketAddr,
+}
+
+impl VirtualTcpBoundSocket for UnservedBoundSocket {
+    fn addr_local(&self) -> virtual_net::Result<SocketAddr> {
+        Ok(self.addr)
+    }
+
+    fn listen(&mut self) -> virtual_net::Result<Box<dyn VirtualTcpListener + Sync>> {
+        Err(NetworkError::PermissionDenied)
+    }
+
+    fn connect(
+        &mut self,
+        _peer: SocketAddr,
+    ) -> virtual_net::Result<Box<dyn VirtualTcpSocket + Sync>> {
+        Err(NetworkError::PermissionDenied)
+    }
+
+    fn set_ttl(&mut self, _ttl: u32) -> virtual_net::Result<()> {
+        Ok(())
+    }
+
+    fn ttl(&self) -> virtual_net::Result<u32> {
+        Ok(64)
     }
 }
 

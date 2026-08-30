@@ -232,6 +232,8 @@ run_smoke() {
   # without any service.
   "$WASIXCC_DIR/bin/wasixcc" -O2 \
     "$SC_ROOT/toolchain/smoke/stdio-net.c" -o "$build_dir/stdio-net.wasm"
+  "$WASIXCC_DIR/bin/wasixcc" -O2 \
+    "$SC_ROOT/toolchain/smoke/netprobe.c" -o "$build_dir/netprobe.wasm"
 
   # The libc patch (patches/wasix-libc): two threads making relative-path
   # syscalls at once must not corrupt each other's paths. Fails on the

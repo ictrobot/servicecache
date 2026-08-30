@@ -125,3 +125,51 @@ fn every_built_service_runs_through_the_cli() {
         run_through_cli(&manifest);
     }
 }
+
+/// A guest reads ports back the way it bound and the client connected
+/// (wasix-libc probes the port byte order with a throwaway bind, which the
+/// host must answer). Uses the toolchain smoke fixture `netprobe.wasm`.
+#[test]
+fn guest_sees_correct_ports() {
+    use std::io::Read as _;
+
+    let fixture = repo_root().join("work/build/toolchain-smoke/netprobe.wasm");
+    if !fixture.is_file() {
+        eprintln!(
+            "skipped: {} is not built (run `make smoke-toolchain`)",
+            fixture.display()
+        );
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("servicecache-netprobe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::os::unix::fs::symlink(&fixture, dir.join("netprobe.wasm")).expect("symlink the fixture");
+    std::fs::write(
+        dir.join("service.toml"),
+        "[service]\nname = \"netprobe\"\nversion = \"0\"\n\n[guest]\nmodule = \"netprobe.wasm\"\nargs = [\"4000\"]\nlisten_port = 4000\n",
+    )
+    .expect("write the manifest");
+
+    let binary = Path::new(env!("CARGO_BIN_EXE_servicecache"));
+    let cache_dir =
+        servicecache::cache::directory(None, std::env::var_os("SERVICECACHE_CACHE_DIR").as_deref())
+            .expect("a cache directory");
+    let mut host = HostProcess::spawn_with_binary(binary, &dir.join("service.toml"), &cache_dir)
+        .expect("spawn the host");
+    let endpoint = host.start().expect("start");
+
+    let mut stream = std::net::TcpStream::connect(endpoint).expect("connect");
+    let client_port = stream.local_addr().expect("local addr").port();
+    let mut line = String::new();
+    stream
+        .read_to_string(&mut line)
+        .expect("read the guest's report");
+    assert_eq!(
+        line.trim(),
+        format!("local={} peer={client_port}", endpoint.port()),
+        "the guest's view of the ports"
+    );
+    assert_eq!(host.wait_exit().expect("the guest exits"), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
