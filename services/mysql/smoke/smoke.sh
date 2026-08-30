@@ -133,4 +133,27 @@ if ! grep -Fqx $'1\twasix-client\tInnoDB' <<<"$probe_output"; then
   exit 1
 fi
 
+# A clean shutdown over the wire: the server must exit on its own.
+"${probe[@]}" "SHUTDOWN" >/dev/null
+stopped=false
+for ((attempt = 0; attempt < 300; attempt++)); do
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    stopped=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$stopped" != true ]]; then
+  echo "MySQL did not exit within 30s of SHUTDOWN" >&2
+  tail -n 40 "$server_log" >&2
+  exit 1
+fi
+wait "$server_pid" || true
+server_pid=""
+if ! grep -q "Shutdown complete" "$server_log"; then
+  echo "MySQL exited without logging 'Shutdown complete'" >&2
+  tail -n 40 "$server_log" >&2
+  exit 1
+fi
+
 echo "MySQL WASIX smoke test passed."

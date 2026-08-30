@@ -2,9 +2,12 @@ Subject: [PATCH 4/7] server: adapt lifecycle and networking for WASIX
 
 WASIX lacks the Unix process-control and signal-delivery behavior used by
 mysqld. Keep the server in the foreground, reject chroot/identity switching,
-use an internal atomic shutdown notification, and wake Wasmer's blocked TCP
-poll with a loopback connection. Also avoid dynamic component autoloading and
-the unavailable ppoll signal-wakeup path.
+use an internal atomic shutdown notification, and wake the listener out of
+its blocked poll through a pipe in its poll set: a signal handler runs under
+WASIX but does not interrupt poll(), and a loopback connection to the
+configured port is not a reliable wake, since the listener need not be
+reachable at that address and WASIX connect() reports no failure. Also avoid
+dynamic component autoloading and the unavailable ppoll signal-wakeup path.
 
 diff --git a/sql/conn_handler/connection_acceptor.h b/sql/conn_handler/connection_acceptor.h
 index a0043dbb..d65b8fb9 100644
@@ -22,41 +25,94 @@ index a0043dbb..d65b8fb9 100644
  };
  #endif  // CONNECTION_ACCEPTOR_INCLUDED
 diff --git a/sql/conn_handler/socket_connection.cc b/sql/conn_handler/socket_connection.cc
-index 1e0decf6..5cb3e6be 100644
+index 1e0decf6..9a02bf61 100644
 --- a/sql/conn_handler/socket_connection.cc
 +++ b/sql/conn_handler/socket_connection.cc
-@@ -1439,6 +1439,21 @@ Channel_info *Mysqld_socket_listener::listen_for_connection_event() {
+@@ -896,6 +896,15 @@ void Mysqld_socket_listener::setup_connection_events(
+ 
+   for (const auto &socket_element : socket_vector)
+     add_socket_to_listener(socket_element.m_socket);
++
++#if defined(__wasm__)
++  /*
++    The wake pipe's read end goes last in the poll set, after the sockets, so
++    that the socket entries keep their indexes.
++  */
++  if (pipe(m_wake_pipe) == 0)
++    m_poll_info.m_fds.emplace_back(pollfd{m_wake_pipe[0], POLLIN, 0});
++#endif
+ }
+ 
+ /**
+@@ -1346,7 +1355,16 @@ const Listen_socket *Mysqld_socket_listener::get_listen_socket() const {
+ }
+ 
+ Channel_info *Mysqld_socket_listener::listen_for_connection_event() {
+-#ifdef HAVE_POLL
++#if defined(__wasm__)
++  // The sockets and, after them, the wake pipe.
++  int retval = poll(&m_poll_info.m_fds[0], m_poll_info.m_fds.size(), -1);
++  if (retval > 0 && m_wake_pipe[0] >= 0 && m_poll_info.m_fds.back().revents) {
++    // Woken during shutdown: consume one wake and let the caller notice.
++    char byte;
++    (void)read(m_wake_pipe[0], &byte, 1);
++    return nullptr;
++  }
++#elif defined(HAVE_POLL)
+   int retval = poll(&m_poll_info.m_fds[0], m_socket_vector.size(), -1);
+ #else
+   m_select_info.m_read_fds = m_select_info.m_client_fds;
+@@ -1439,12 +1457,25 @@ Channel_info *Mysqld_socket_listener::listen_for_connection_event() {
    return channel_info;
  }
  
 +#if defined(__wasm__)
 +void Mysqld_socket_listener::wake_listener() {
-+  int wake_socket = socket(AF_INET, SOCK_STREAM, 0);
-+  if (wake_socket < 0) return;
-+
-+  sockaddr_in loopback{};
-+  loopback.sin_family = AF_INET;
-+  loopback.sin_port = htons(m_tcp_port);
-+  loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-+  (void)connect(wake_socket, reinterpret_cast<sockaddr *>(&loopback),
-+                sizeof(loopback));
-+  (void)close(wake_socket);
++  if (m_wake_pipe[1] >= 0) (void)write(m_wake_pipe[1], "", 1);
 +}
 +#endif
 +
  void Mysqld_socket_listener::close_listener() {
    for (const auto &socket_element : m_socket_vector) {
      (void)mysql_socket_shutdown(socket_element.m_socket, SHUT_RDWR);
+     (void)mysql_socket_close(socket_element.m_socket);
+   }
+ 
++#if defined(__wasm__)
++  for (int &fd : m_wake_pipe) {
++    if (fd >= 0) (void)close(fd);
++    fd = -1;
++  }
++#endif
++
+   /*
+     In case a separate thread was spawned to handle incoming connection
+     requests on admin interface, a socket corresponding to an admin interface
 diff --git a/sql/conn_handler/socket_connection.h b/sql/conn_handler/socket_connection.h
-index 9a509e9b..aa83ceac 100644
+index 9a509e9b..0552a934 100644
 --- a/sql/conn_handler/socket_connection.h
 +++ b/sql/conn_handler/socket_connection.h
-@@ -196,6 +196,11 @@ class Mysqld_socket_listener {
+@@ -125,6 +125,14 @@ class Mysqld_socket_listener {
+   // Container storing listen socket and their attributes.
+   socket_vector_t m_socket_vector;
+   MYSQL_SOCKET m_admin_interface_listen_socket;
++#if defined(__wasm__)
++  /*
++    A pipe whose read end is polled with the listening sockets, so that the
++    listener can be woken from poll() without a signal: WASIX runs signal
++    handlers but does not interrupt poll() for them.
++  */
++  int m_wake_pipe[2] = {-1, -1};
++#endif
+ 
+ #ifdef HAVE_POLL
+   struct poll_info_t {
+@@ -196,6 +204,11 @@ class Mysqld_socket_listener {
    */
    void close_listener();
  
 +#if defined(__wasm__)
-+  /** Make a loopback connection to wake poll() during server shutdown. */
++  /** Wake the listener out of poll() during server shutdown. */
 +  void wake_listener();
 +#endif
 +
