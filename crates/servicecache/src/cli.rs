@@ -1,15 +1,18 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    path::PathBuf,
+    io::{Read as _, Write as _},
+    path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::{
     cache::{self, ModuleCache},
     discovery::ServiceIndex,
+    manager::HostProcess,
+    manifest::Manifest,
     runtime::Runtime,
 };
 
@@ -37,6 +40,16 @@ struct Cli {
 enum Command {
     /// Start the service manager.
     Serve,
+    /// Run one service and print its endpoint; runs until the service
+    /// exits.
+    Run {
+        /// The service, as `name` or `name@version`.
+        service: String,
+        /// The initializer's stdin, a file or `-` for standard input.
+        /// Without it the initializer does not run.
+        #[arg(long, value_name = "FILE")]
+        recipe: Option<PathBuf>,
+    },
     /// Inspect installed service packages.
     Services {
         #[command(subcommand)]
@@ -97,6 +110,13 @@ fn run_with(
         Command::Serve => {
             println!("serve is not implemented yet");
             Ok(())
+        }
+        Command::Run { service, recipe } => {
+            let search_dirs = service_dirs(cli.services_dir, environment_dirs);
+            let services = ServiceIndex::discover(&search_dirs)?;
+            let manifest = find_service(&services, &service)?;
+            let recipe = recipe.map(|path| read_recipe(&path)).transpose()?;
+            run_service(manifest, recipe.as_deref(), &cache_dir()?)
         }
         Command::Services { command } => {
             let search_dirs = service_dirs(cli.services_dir, environment_dirs);
@@ -176,6 +196,92 @@ fn print_services(services: &ServiceIndex) {
             }
         }
     }
+}
+
+/// The manifest for `name` or `name@version`; the name alone selects the
+/// only installed version.
+fn find_service<'a>(services: &'a ServiceIndex, service: &str) -> Result<&'a Manifest> {
+    let (name, version) = match service.split_once('@') {
+        Some((name, version)) => (name, Some(version)),
+        None => (service, None),
+    };
+    let mut candidates: Vec<&Manifest> = services
+        .iter()
+        .map(|package| &package.manifest)
+        .filter(|manifest| manifest.service.name == name)
+        .filter(|manifest| version.is_none_or(|version| manifest.service.version == version))
+        .collect();
+    match candidates.len() {
+        0 => bail!("no installed service matches {service}"),
+        1 => Ok(candidates.remove(0)),
+        _ => {
+            let versions: Vec<&str> = candidates
+                .iter()
+                .map(|manifest| manifest.service.version.as_str())
+                .collect();
+            bail!(
+                "{name} is installed in several versions ({}); name one as {name}@<version>",
+                versions.join(", ")
+            )
+        }
+    }
+}
+
+fn read_recipe(path: &Path) -> Result<Vec<u8>> {
+    if path.as_os_str() == "-" {
+        let mut recipe = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut recipe)
+            .context("failed to read the recipe from standard input")?;
+        return Ok(recipe);
+    }
+    std::fs::read(path).with_context(|| format!("failed to read the recipe {}", path.display()))
+}
+
+/// Brings a service up in a host — prepare, start, the initializer when a
+/// recipe was given — prints its endpoint, and waits for the guest to exit.
+fn run_service(manifest: &Manifest, recipe: Option<&[u8]>, cache_dir: &Path) -> Result<()> {
+    let manifest_path = manifest.directory().join("service.toml");
+    let mut host = HostProcess::spawn(&manifest_path, cache_dir)?;
+    if manifest.prepare.is_some() {
+        let status = host.prepare()?;
+        if status != 0 {
+            bail!("the prepare step exited with status {status}");
+        }
+    }
+    let endpoint = host.start()?;
+    match (recipe, manifest.initializer.is_some()) {
+        (Some(recipe), true) => {
+            let status = host.initialize(recipe)?;
+            if status != 0 {
+                bail!("the initializer exited with status {status}");
+            }
+        }
+        (Some(_), false) => bail!(
+            "{} has no initializer to give the recipe to",
+            manifest.service.name
+        ),
+        (None, true) => eprintln!("no --recipe: the initializer was not run"),
+        (None, false) => {}
+    }
+    // The bare endpoint on stdout for scripts, and a labelled line on
+    // stderr, where the guest's own output goes, so it stands out there.
+    println!("{endpoint}");
+    std::io::stdout()
+        .flush()
+        .context("failed to write the endpoint")?;
+    eprintln!(
+        "\n==> {} is listening on host port {} ({endpoint}; guest port {}). Ctrl-C to stop.\n",
+        manifest.service.name,
+        endpoint.port(),
+        manifest.guest.listen_port
+    );
+
+    let status = host.wait_exit()?;
+    if status != 0 {
+        bail!("{} exited with status {status}", manifest.service.name);
+    }
+    Ok(())
 }
 
 fn check_services(services: &ServiceIndex, runtime: &Runtime) -> Result<()> {

@@ -246,6 +246,32 @@ impl HostProcess {
         }
     }
 
+    /// Waits for the guest to exit; its exit status.
+    ///
+    /// # Errors
+    ///
+    /// Fails on `error`, on a closed channel, or on a reply that is not an
+    /// event.
+    pub fn wait_exit(&mut self) -> Result<i32> {
+        loop {
+            let Some(Frame { message, .. }) = self.channel.recv::<Reply>()? else {
+                bail!("host {} closed its control channel", self.pid);
+            };
+            match message {
+                Reply::Error { text } => bail!("host {} refused: {text}", self.pid),
+                Reply::Exited {
+                    run: Run::Guest,
+                    status,
+                    ..
+                } => return Ok(status),
+                Reply::Exited {
+                    run: Run::Child, ..
+                } => self.events.push(message),
+                other => bail!("unexpected reply from host {}: {other:?}", self.pid),
+            }
+        }
+    }
+
     /// Events received so far (clones reaped by a template).
     #[must_use]
     pub fn events(&self) -> &[Reply] {
