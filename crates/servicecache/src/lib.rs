@@ -6,5 +6,6 @@ pub mod logging;
 pub mod manager;
 pub mod manifest;
 pub mod runtime;
+pub mod serve;
 
 pub use cli::run as run_cli;

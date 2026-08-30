@@ -21,16 +21,49 @@ pub struct ContentDigest {
 #[derive(Debug, Clone)]
 pub struct ShadowedPackage {
     pub directory: PathBuf,
-    pub files: Vec<ContentDigest>,
     pub manifest: Manifest,
 }
 
-/// The selected package for a name and version.
+impl ShadowedPackage {
+    /// The package's files with their content digests, hashed on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a file cannot be read, or the package
+    /// contains a symbolic link.
+    pub fn files(&self) -> Result<Vec<ContentDigest>> {
+        digest_tree(&self.directory)
+    }
+}
+
+/// The selected package for a name and version. Discovery reads only the
+/// manifests; a package's content is hashed on demand, since the trees are
+/// large and most commands never look at them.
 #[derive(Debug, Clone)]
 pub struct DiscoveredPackage {
     pub manifest: Manifest,
-    pub files: Vec<ContentDigest>,
     pub shadowed: Vec<ShadowedPackage>,
+}
+
+impl DiscoveredPackage {
+    /// The package's files with their content digests, hashed on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a file cannot be read, or the package
+    /// contains a symbolic link.
+    pub fn files(&self) -> Result<Vec<ContentDigest>> {
+        digest_tree(self.manifest.directory())
+    }
+}
+
+/// Why a name (and optional version) selected no single service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectError {
+    /// Nothing installed matches.
+    NotFound,
+    /// The bare name matches several installed versions.
+    Ambiguous(Vec<String>),
 }
 
 /// Services indexed by their exact name and version.
@@ -67,6 +100,34 @@ impl ServiceIndex {
         self.packages.values()
     }
 
+    /// The manifest for `name` at `version`; a bare name selects the only
+    /// installed version.
+    ///
+    /// # Errors
+    ///
+    /// [`SelectError::NotFound`] when nothing matches;
+    /// [`SelectError::Ambiguous`] when a bare name matches several versions.
+    pub fn select(&self, name: &str, version: Option<&str>) -> Result<&Manifest, SelectError> {
+        let mut candidates = self
+            .packages
+            .values()
+            .map(|package| &package.manifest)
+            .filter(|manifest| manifest.service.name == name)
+            .filter(|manifest| version.is_none_or(|version| manifest.service.version == version));
+        match (candidates.next(), candidates.next()) {
+            (None, _) => Err(SelectError::NotFound),
+            (Some(manifest), None) => Ok(manifest),
+            (Some(first), Some(second)) => {
+                let mut versions = vec![
+                    first.service.version.clone(),
+                    second.service.version.clone(),
+                ];
+                versions.extend(candidates.map(|manifest| manifest.service.version.clone()));
+                Err(SelectError::Ambiguous(versions))
+            }
+        }
+    }
+
     /// Iterate over every selected and shadowed package.
     pub fn all_packages(&self) -> impl Iterator<Item = (&Manifest, &Path)> {
         self.packages.values().flat_map(|package| {
@@ -81,7 +142,6 @@ impl ServiceIndex {
 
     fn insert(&mut self, manifest_path: &Path) -> Result<()> {
         let manifest = Manifest::load(manifest_path)?;
-        let files = digest_tree(manifest.directory())?;
         let key = (
             manifest.service.name.clone(),
             manifest.service.version.clone(),
@@ -91,14 +151,12 @@ impl ServiceIndex {
             Entry::Vacant(entry) => {
                 entry.insert(DiscoveredPackage {
                     manifest,
-                    files,
                     shadowed: Vec::new(),
                 });
             }
             Entry::Occupied(mut entry) => {
                 entry.get_mut().shadowed.push(ShadowedPackage {
                     directory: manifest.directory().to_path_buf(),
-                    files,
                     manifest,
                 });
             }
@@ -254,6 +312,10 @@ mod tests {
         assert_eq!(package.manifest.directory(), first.0.join("first"));
         assert_eq!(package.shadowed.len(), 1);
         assert_eq!(package.shadowed[0].directory, second.0.join("second"));
-        assert_eq!(package.files.len(), 2);
+        assert_eq!(package.files().expect("hash the package").len(), 2);
+        assert_eq!(
+            package.shadowed[0].files().expect("hash the shadow").len(),
+            2
+        );
     }
 }

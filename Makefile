@@ -13,7 +13,7 @@ RUN_SERVICE_TARGETS := $(addprefix run-,$(SERVICE_TARGETS))
 SERVICE_NAMES := $(sort $(foreach file,$(SERVICE_VERSION_FILES),$(word 2,$(subst /, ,$(file)))))
 SERVICE_NAME_TARGETS := $(foreach verb,service smoke-service clean-service purge-service,$(addprefix $(verb)-,$(SERVICE_NAMES)))
 
-.PHONY: help bootstrap setup-wasmer build test lint check services services-list smoke smoke-toolchain smoke-services lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
+.PHONY: help bootstrap setup-wasmer build test lint check serve services services-list smoke smoke-toolchain smoke-services lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_SERVICE_TARGETS)
 .PHONY: $(SERVICE_NAME_TARGETS)
@@ -34,6 +34,7 @@ help:
 	@echo "lifecycle-tests-long            the same plus the long cases (thousands of forks)"
 	@echo "lifecycle-tests-release         the quick matrix on a release build, for latency figures"
 	@echo "lifecycle-tests-long-release    the long matrix on a release build"
+	@echo "serve                           serve the manager's HTTP API for services under work/services (--socket/SERVICECACHE_SOCKET overrides the socket)"
 	@echo "services-list                   list services assembled under work/services"
 	@echo "run-service-<name>-<version>    run one service through a host and print its endpoint; RECIPE=<file> feeds the initializer, CLONES=<n> forks clones on Enter"
 	@echo "check                           lint, test and smoke-toolchain"
@@ -79,6 +80,9 @@ lifecycle-tests-release: setup-wasmer
 
 lifecycle-tests-long-release: setup-wasmer
 	SERVICECACHE_LIFECYCLE=1 cargo test --release --test lifecycle -- --include-ignored
+
+serve: setup-wasmer
+	SERVICECACHE_SERVICES_DIR=work/services cargo run -- serve
 
 services-list:
 	SERVICECACHE_SERVICES_DIR=work/services cargo run -- services list
