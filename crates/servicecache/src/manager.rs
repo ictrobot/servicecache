@@ -324,6 +324,11 @@ impl HostProcess {
         &self.events
     }
 
+    /// Takes the events received so far, leaving none behind.
+    pub fn take_events(&mut self) -> Vec<Reply> {
+        std::mem::take(&mut self.events)
+    }
+
     /// Asks the host to stop and waits for it to go.
     ///
     /// # Errors

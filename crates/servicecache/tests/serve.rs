@@ -70,6 +70,10 @@ impl Serve {
     }
 
     fn start_with(services_dir: &Path, capture_logs: bool) -> Self {
+        Self::start_configured(services_dir, capture_logs, &[])
+    }
+
+    fn start_configured(services_dir: &Path, capture_logs: bool, extra_args: &[&str]) -> Self {
         let socket = std::env::temp_dir().join(format!(
             "sc-serve-{}-{}.sock",
             std::process::id(),
@@ -82,6 +86,7 @@ impl Serve {
             .arg("--socket")
             .arg(&socket)
             .arg("serve")
+            .args(extra_args)
             // The log level under test is serve's own default.
             .env_remove("SERVICECACHE_LOG")
             .stdin(std::process::Stdio::null())
@@ -167,8 +172,10 @@ fn wait_refusing(endpoint: std::net::SocketAddr, what: &str) {
     }
 }
 
-/// An instance created over the API answers as initialized, is listed,
-/// and deleting it frees the endpoint and forgets the id.
+/// An instance created over the API answers as initialized and is
+/// listed; a second instance for the same recipe forks off the same
+/// template, isolated from the first; deleting frees the endpoints and
+/// forgets the ids.
 fn serves_and_destroys(manifest_path: &Path) {
     let manifest = Manifest::load(manifest_path).expect("load the manifest");
     let name = manifest.service.name.clone();
@@ -205,6 +212,27 @@ fn serves_and_destroys(manifest_path: &Path) {
         "{name}: not in the instance listing"
     );
 
+    // A second instance for the same recipe: forked off the same
+    // template, on its own endpoint, its state its own.
+    let second = client
+        .create(&create_request(&manifest, &adapter))
+        .expect("second create");
+    let second_endpoint = second.endpoint.socket_addr().expect("endpoint");
+    assert_ne!(
+        second_endpoint, endpoint,
+        "{name}: the second instance shares the first's endpoint"
+    );
+    adapter.check_initialized(second_endpoint);
+    adapter.diverge(endpoint, 1);
+    adapter.diverge(second_endpoint, 2);
+    adapter.check_diverged(endpoint, 1);
+    adapter.check_diverged(second_endpoint, 2);
+
+    client.delete(&second.id).expect("delete the second");
+    wait_refusing(
+        second_endpoint,
+        &format!("{name}: the destroyed second instance"),
+    );
     client.delete(&instance.id).expect("delete");
     wait_refusing(endpoint, &format!("{name}: the destroyed instance"));
     let error = client.instance(&instance.id).expect_err("the id is gone");
@@ -287,6 +315,95 @@ fn refuses_unknown_services() {
         .expect_err("an unknown service is refused");
     assert_refused(&error, 404, "unknown-service");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The second request for a service is served by a fork: the template
+/// fills and freezes once, and every instance is forked off it. Uses the
+/// first service without a prepare step, the cheapest to bring up.
+fn second_request_is_a_fork() {
+    let Some((manifest_path, manifest)) = manifests().into_iter().find_map(|path| {
+        let manifest = Manifest::load(&path).expect("load the manifest");
+        manifest.prepare.is_none().then_some((path, manifest))
+    }) else {
+        eprintln!("skipped: every built service has a prepare step");
+        return;
+    };
+    let name = manifest.service.name.clone();
+    let mut serve =
+        Serve::start_capturing_logs(manifest_path.parent().and_then(Path::parent).expect("dir"));
+    let client = serve.client();
+
+    // No recipe: the instances fork straight off the base template.
+    let request = api::CreateInstance {
+        service: name.clone(),
+        version: Some(manifest.service.version.clone()),
+        ..api::CreateInstance::default()
+    };
+    let first = client.create(&request).expect("first create");
+    let second = client.create(&request).expect("second create");
+    let first_endpoint = first.endpoint.socket_addr().expect("endpoint");
+    let second_endpoint = second.endpoint.socket_addr().expect("endpoint");
+    assert_ne!(first_endpoint, second_endpoint);
+    TcpStream::connect(first_endpoint).expect("connect to the first");
+    TcpStream::connect(second_endpoint).expect("connect to the second");
+
+    let logs = serve.end_and_logs();
+    assert_eq!(
+        logs.matches("template frozen").count(),
+        1,
+        "{name}: expected exactly one template fill in the log:\n{logs}"
+    );
+    assert_eq!(
+        logs.matches("instance forked").count(),
+        2,
+        "{name}: expected both instances forked in the log:\n{logs}"
+    );
+}
+
+/// A template with no live descendant expires after its TTL — its frozen
+/// host exits — and the next request fills a fresh one. Uses the first
+/// service without a prepare step, the cheapest to bring up.
+fn idle_templates_expire() {
+    let Some((manifest_path, manifest)) = manifests().into_iter().find_map(|path| {
+        let manifest = Manifest::load(&path).expect("load the manifest");
+        manifest.prepare.is_none().then_some((path, manifest))
+    }) else {
+        eprintln!("skipped: every built service has a prepare step");
+        return;
+    };
+    let name = manifest.service.name.clone();
+    let mut serve = Serve::start_configured(
+        manifest_path.parent().and_then(Path::parent).expect("dir"),
+        true,
+        &["--template-ttl", "2"],
+    );
+    let client = serve.client();
+
+    let request = api::CreateInstance {
+        service: name.clone(),
+        version: Some(manifest.service.version.clone()),
+        ..api::CreateInstance::default()
+    };
+    let first = client.create(&request).expect("first create");
+    client.delete(&first.id).expect("delete");
+
+    // With its only instance gone the template idles out: TTL 2 s, the
+    // owner checks each second.
+    std::thread::sleep(Duration::from_secs(6));
+    let second = client.create(&request).expect("create after the expiry");
+    let endpoint = second.endpoint.socket_addr().expect("endpoint");
+    TcpStream::connect(endpoint).expect("connect to the refilled template's instance");
+
+    let logs = serve.end_and_logs();
+    assert!(
+        logs.contains("template expired"),
+        "{name}: no expiry in the server's log:\n{logs}"
+    );
+    assert_eq!(
+        logs.matches("template frozen").count(),
+        2,
+        "{name}: expected a second fill after the expiry:\n{logs}"
+    );
 }
 
 /// The server logs every request by default: method, path, status and
@@ -411,8 +528,19 @@ fn main() {
         logs_every_request();
         Ok(())
     }));
+    trials.push(libtest_mimic::Trial::test(
+        "second_request_is_a_fork",
+        || {
+            second_request_is_a_fork();
+            Ok(())
+        },
+    ));
     trials.push(libtest_mimic::Trial::test("expires_after_its_ttl", || {
         expires_after_its_ttl();
+        Ok(())
+    }));
+    trials.push(libtest_mimic::Trial::test("idle_templates_expire", || {
+        idle_templates_expire();
         Ok(())
     }));
     libtest_mimic::run(&args, trials).exit();

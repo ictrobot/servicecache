@@ -1,21 +1,19 @@
-//! The instances a serving manager holds. Each is one host process owned
-//! by a dedicated thread that brings it up, watches it and stops it: a
-//! host dies with the thread that spawned it, so the owner thread must
-//! live exactly as long as the instance. Dropping a registry entry closes
-//! the stop pipe and the owner shuts its host down.
+//! The instances a serving manager holds. Each is a clone forked off a
+//! template — a running host process, child of its template's — watched
+//! by a thread of its own until the guest exits or the stop pipe closes.
+//! Dropping a registry entry closes the stop pipe and the watcher shuts
+//! its host down.
 
 use std::{
     collections::HashMap,
     net::SocketAddr,
     os::fd::{AsFd as _, OwnedFd},
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use tokio::sync::oneshot;
 
 use super::api;
 use crate::{
@@ -163,135 +161,42 @@ impl Registry {
     }
 }
 
-/// What the owner thread runs for an instance.
-pub struct BringUp {
-    pub manifest_path: PathBuf,
-    pub has_prepare: bool,
-    /// The initializer's stdin; the initializer runs only when this is
-    /// set.
-    pub recipe: Option<Vec<u8>>,
-    pub cache_dir: PathBuf,
-}
-
-/// An instance being brought up on its owner thread.
-pub struct Pending {
-    /// Resolves to the endpoint once the instance serves, or to the
-    /// problem that stopped it. Dropping it abandons the bring-up: the
-    /// owner stops the host when it finds no receiver.
-    pub ready: oneshot::Receiver<Result<SocketAddr, api::Problem>>,
-    shared: Arc<Shared>,
-    stop: OwnedFd,
-}
-
-impl Pending {
-    /// The registry entry for the now-serving instance.
-    #[must_use]
-    pub fn into_entry(
-        self,
-        id: String,
-        service: String,
-        version: String,
-        endpoint: SocketAddr,
-        ttl: Duration,
-    ) -> Entry {
-        Entry {
-            id,
-            service,
-            version,
-            endpoint,
-            lease: Mutex::new(Lease {
-                ttl,
-                expires_at: Instant::now() + ttl,
-            }),
-            shared: self.shared,
-            _stop: self.stop,
-        }
-    }
-}
-
-/// Starts an owner thread bringing an instance up.
+/// Adopts a running host — a clone just forked off a template — as an
+/// instance: a watcher thread observes it until the guest exits or the
+/// entry is dropped. The clone is its template's child, not this
+/// thread's, so the watcher only observes and stops it.
 ///
 /// # Errors
 ///
 /// Fails when the stop pipe or the thread cannot be created.
-pub fn spawn(id: &str, bring_up: BringUp) -> Result<Pending> {
+pub fn adopt(
+    id: String,
+    service: String,
+    version: String,
+    host: HostProcess,
+    endpoint: SocketAddr,
+    ttl: Duration,
+) -> Result<Entry> {
     let (stop_read, stop_write) =
         nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("failed to create a stop pipe")?;
-    let (ready_send, ready) = oneshot::channel();
     let shared = Arc::new(Shared::default());
-    let owner_shared = Arc::clone(&shared);
+    let watcher_shared = Arc::clone(&shared);
     std::thread::Builder::new()
         .name(format!("instance-{id}"))
-        .spawn(move || owner(&bring_up, &owner_shared, &stop_read, ready_send))
-        .context("failed to start the instance's owner thread")?;
-    Ok(Pending {
-        ready,
+        .spawn(move || watch(host, &watcher_shared, &stop_read))
+        .context("failed to start the instance's watcher thread")?;
+    Ok(Entry {
+        id,
+        service,
+        version,
+        endpoint,
+        lease: Mutex::new(Lease {
+            ttl,
+            expires_at: Instant::now() + ttl,
+        }),
         shared,
-        stop: stop_write,
+        _stop: stop_write,
     })
-}
-
-/// The owner thread: brings the host up, reports the endpoint, then
-/// watches until the guest exits or the stop pipe closes.
-fn owner(
-    bring: &BringUp,
-    shared: &Shared,
-    stop: &OwnedFd,
-    ready: oneshot::Sender<Result<SocketAddr, api::Problem>>,
-) {
-    let (host, endpoint) = match bring_up(bring) {
-        Ok(brought_up) => brought_up,
-        Err(problem) => {
-            ready.send(Err(problem)).ok();
-            return;
-        }
-    };
-    if ready.send(Ok(endpoint)).is_err() {
-        // The creator went away; nothing will register the instance.
-        tracing::debug!(host = host.pid(), "the instance's creator gave up");
-        host.stop().ok();
-        return;
-    }
-    watch(host, shared, stop);
-}
-
-fn bring_up(bring: &BringUp) -> Result<(HostProcess, SocketAddr), api::Problem> {
-    let mut host = HostProcess::spawn(&bring.manifest_path, &bring.cache_dir)
-        .map_err(|error| api::Problem::bring_up_failed(&error))?;
-    if bring.has_prepare {
-        match host.prepare() {
-            Ok(0) => {}
-            Ok(status) => {
-                host.kill().ok();
-                return Err(api::Problem::prepare_failed(status));
-            }
-            Err(error) => {
-                host.kill().ok();
-                return Err(api::Problem::bring_up_failed(&error));
-            }
-        }
-    }
-    let endpoint = match host.start() {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
-            host.kill().ok();
-            return Err(api::Problem::bring_up_failed(&error));
-        }
-    };
-    if let Some(recipe) = &bring.recipe {
-        match host.initialize(recipe) {
-            Ok(0) => {}
-            Ok(status) => {
-                host.kill().ok();
-                return Err(api::Problem::initializer_failed(status));
-            }
-            Err(error) => {
-                host.kill().ok();
-                return Err(api::Problem::bring_up_failed(&error));
-            }
-        }
-    }
-    Ok((host, endpoint))
 }
 
 fn watch(mut host: HostProcess, shared: &Shared, stop: &OwnedFd) {

@@ -242,6 +242,11 @@ impl Problem {
     }
 
     #[must_use]
+    pub fn template_failed(detail: impl std::fmt::Display) -> Self {
+        Self::new(500, "template-failed", "The service's template failed").with_detail(detail)
+    }
+
+    #[must_use]
     pub fn unknown_route() -> Self {
         Self::new(404, "unknown-route", "No such route")
     }
@@ -253,6 +258,16 @@ impl Problem {
             "method-not-allowed",
             "The route does not answer this method",
         )
+    }
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.title, self.kind)?;
+        if let Some(detail) = &self.detail {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
     }
 }
 

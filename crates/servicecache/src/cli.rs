@@ -69,7 +69,12 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Serve the manager's HTTP API on a Unix socket.
-    Serve,
+    Serve {
+        /// Seconds an idle template lives (a testing hook; the default is
+        /// the policy).
+        #[arg(long, value_name = "SECONDS", hide = true)]
+        template_ttl: Option<u64>,
+    },
     /// Ask a serving manager for an instance and hold it: prints the
     /// endpoint, renews the instance until stdin closes or SIGINT/SIGTERM,
     /// then destroys it.
@@ -156,7 +161,7 @@ fn run_with(
 ) -> Result<()> {
     // A server prints its request log by default: `serve` starts at `-v`
     // unless a filter was chosen (`--log`, `-v`, `SERVICECACHE_LOG`).
-    let verbose = if matches!(cli.command, Command::Serve)
+    let verbose = if matches!(cli.command, Command::Serve { .. })
         && cli.verbose == 0
         && cli.log.is_none()
         && env::var_os("SERVICECACHE_LOG").is_none()
@@ -169,13 +174,15 @@ fn run_with(
     let cache_dir = || cache::directory(cli.cache_dir.as_deref(), environment_cache);
     let socket = move || socket_path(cli.socket, environment_socket);
     match cli.command {
-        Command::Serve => {
+        Command::Serve { template_ttl } => {
             let search_dirs = service_dirs(cli.services_dir, environment_dirs);
             let services = ServiceIndex::discover(&search_dirs)?;
             crate::serve::run(crate::serve::Options {
                 socket: socket(),
                 services,
                 cache_dir: cache_dir()?,
+                template_ttl: template_ttl
+                    .map_or(crate::serve::DEFAULT_TEMPLATE_TTL, Duration::from_secs),
             })
         }
         Command::Request { service, recipe } => {

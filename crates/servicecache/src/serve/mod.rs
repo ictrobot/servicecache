@@ -1,12 +1,13 @@
 //! `servicecache serve`: the manager's HTTP API on a Unix socket. A
-//! request for an instance brings a service up in its own host process
-//! and answers with the endpoint; instances live until deleted or until
-//! their TTL runs out unrenewed. Every request runs the full bring-up for
-//! now — templates and forks arrive with the cached manager.
+//! request for an instance forks it off the frozen template for its
+//! service and recipe — filled through the fork chain on the first
+//! request — and answers with the endpoint; instances live until deleted
+//! or until their TTL runs out unrenewed.
 
 pub mod api;
 pub mod client;
 mod instances;
+mod templates;
 
 use std::{
     io::{Read as _, Write as _},
@@ -28,10 +29,15 @@ use utoipa::OpenApi as _;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::discovery::{SelectError, ServiceIndex};
-use instances::{BringUp, Registry};
+use instances::Registry;
+use templates::Templates;
 
 /// How long an instance lives without a renewal, unless the request says.
 const DEFAULT_TTL: Duration = Duration::from_secs(300);
+/// How long a template lives with no live descendant — no running
+/// instance and no child template — before its frozen host is destroyed;
+/// counted from its freeze when it is never forked.
+pub const DEFAULT_TEMPLATE_TTL: Duration = Duration::from_secs(300);
 /// The longest TTL a request may ask for, in seconds.
 const MAX_TTL_SECONDS: u64 = 86400;
 /// The largest request body: room for the largest recipe the control
@@ -46,12 +52,16 @@ pub struct Options {
     pub services: ServiceIndex,
     /// Where compiled modules are cached.
     pub cache_dir: PathBuf,
+    /// How long an idle template lives ([`DEFAULT_TEMPLATE_TTL`] outside
+    /// tests).
+    pub template_ttl: Duration,
 }
 
 struct App {
     services: ServiceIndex,
     cache_dir: PathBuf,
     registry: Registry,
+    templates: Templates,
 }
 
 /// Serves the API until SIGINT or SIGTERM.
@@ -65,6 +75,7 @@ pub fn run(options: Options) -> Result<()> {
         services: options.services,
         cache_dir: options.cache_dir,
         registry: Registry::default(),
+        templates: Templates::new(options.template_ttl),
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -124,10 +135,11 @@ async fn serve_on(socket: &Path, app: Arc<App>) -> Result<()> {
         .await
         .context("the server failed")?;
     sweeper.abort();
-    // Dropping the entries closes their stop pipes; owner threads still
-    // shutting down when the process exits take their hosts with them
-    // (hosts die with the thread that spawned them).
+    // Dropping the entries and templates tells their threads to stop
+    // their hosts; whatever is still shutting down when the process exits
+    // dies with it (hosts die with the thread that spawned them).
     app.registry.clear();
+    app.templates.clear();
     Ok(())
 }
 
@@ -148,7 +160,9 @@ fn shutdown_signal() -> Result<impl std::future::Future<Output = ()>> {
     })
 }
 
-/// Destroys expired instances, once a second.
+/// Destroys expired instances and forgets expired templates' slots, once
+/// a second. Templates expire themselves, on their owner threads; this
+/// only keeps the map from accumulating their keys.
 async fn sweep(app: Arc<App>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -156,6 +170,7 @@ async fn sweep(app: Arc<App>) {
         for entry in app.registry.remove_expired() {
             tracing::info!(id = entry.id, service = entry.service, "instance expired");
         }
+        app.templates.prune();
     }
 }
 
@@ -279,26 +294,29 @@ async fn create_instance(
     let version = manifest.service.version.clone();
     let id = new_id().map_err(api::Problem::internal)?;
     tracing::info!(id, service, version, "creating an instance");
-    let mut pending = instances::spawn(
-        &id,
-        BringUp {
-            manifest_path: manifest.directory().join("service.toml"),
-            has_prepare: manifest.prepare.is_some(),
-            recipe,
-            cache_dir: app.cache_dir.clone(),
-        },
-    )
-    .map_err(|error| api::Problem::internal(format!("{error:#}")))?;
-    let endpoint = match (&mut pending.ready).await {
-        Ok(Ok(endpoint)) => endpoint,
-        Ok(Err(problem)) => return Err(problem),
-        Err(_) => return Err(api::Problem::internal("the instance's owner thread died")),
+    let template = app
+        .templates
+        .obtain(manifest, recipe.as_deref(), &app.cache_dir)
+        .await?;
+    let (host, endpoint) = match template.fork().await {
+        Ok(forked) => forked,
+        Err(problem) => {
+            // The template died since it was filled; rebuild it once.
+            tracing::warn!(id, service, %problem, "the template failed; rebuilding");
+            app.templates.forget(manifest, recipe.as_deref());
+            app.templates
+                .obtain(manifest, recipe.as_deref(), &app.cache_dir)
+                .await?
+                .fork()
+                .await?
+        }
     };
 
-    let entry = Arc::new(pending.into_entry(id.clone(), service, version, endpoint, ttl));
+    let entry = instances::adopt(id.clone(), service, version, host, endpoint, ttl)
+        .map_err(|error| api::Problem::internal(format!("{error:#}")))?;
     let described = entry.describe();
-    app.registry.insert(entry);
-    tracing::info!(id, %endpoint, "instance running");
+    app.registry.insert(Arc::new(entry));
+    tracing::info!(id, %endpoint, "instance forked");
     Ok((
         StatusCode::CREATED,
         [(header::LOCATION, format!("/v1/instances/{id}"))],
@@ -426,6 +444,7 @@ mod tests {
             services: ServiceIndex::default(),
             cache_dir: PathBuf::new(),
             registry: Registry::default(),
+            templates: Templates::new(DEFAULT_TEMPLATE_TTL),
         });
         drop(router(app));
         let document = ApiDoc::openapi();
