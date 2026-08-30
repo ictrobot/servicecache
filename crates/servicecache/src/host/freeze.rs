@@ -181,6 +181,7 @@ pub(super) fn fork(host: &mut Host, child_control: OwnedFd, listener: OwnedFd) -
     let endpoint = listener
         .local_addr()
         .context("the child's listening socket has no address")?;
+    let forked_at = Instant::now();
     // SAFETY: the process is single-threaded (verified by `freeze`), so the
     // child inherits no lock held or state half-changed by another thread.
     let pid = unsafe { libc::fork() };
@@ -188,12 +189,15 @@ pub(super) fn fork(host: &mut Host, child_control: OwnedFd, listener: OwnedFd) -
         return Err(std::io::Error::last_os_error()).context("fork failed");
     }
     if pid == 0 {
-        let rebuilt = rebuild(host, listener);
+        let rebuilt = rebuild(host, listener, forked_at);
         return Ok(Forked::Child {
             control: child_control,
             rebuilt,
         });
     }
+    // The syscall's own cost in the template: mostly copying the page tables
+    // of the guest's memory.
+    tracing::debug!(clone = pid, elapsed = ?forked_at.elapsed(), "fork() returned");
     drop(child_control);
     drop(listener);
     Ok(Forked::Parent {
@@ -203,8 +207,9 @@ pub(super) fn fork(host: &mut Host, child_control: OwnedFd, listener: OwnedFd) -
 }
 
 /// In the child: rebuild the host machinery the parent dismantled and
-/// resume every coroutine.
-fn rebuild(host: &mut Host, listener: TcpListener) -> Result<()> {
+/// resume every coroutine. `forked_at` was taken in the template just
+/// before `fork()`, so its elapsed time here spans the syscall too.
+fn rebuild(host: &mut Host, listener: TcpListener, forked_at: Instant) -> Result<()> {
     let started = Instant::now();
     // The parent-death signal does not survive a fork; the template is
     // this clone's parent.
@@ -212,6 +217,7 @@ fn rebuild(host: &mut Host, listener: TcpListener) -> Result<()> {
     tracing::debug!(
         pid = std::process::id(),
         template = nix::unistd::getppid().as_raw(),
+        since_fork = ?forked_at.elapsed(),
         "rebuilding in the clone"
     );
 
@@ -221,12 +227,15 @@ fn rebuild(host: &mut Host, listener: TcpListener) -> Result<()> {
     // The parent's runtime: its threads do not exist here and its state is
     // never touched again (`ManuallyDrop`).
     host.tokio = std::mem::ManuallyDrop::new(runtime);
+    let tokio_built = started.elapsed();
 
     host.networking
         .selector()
         .rebuild_after_fork()
         .context("failed to rebuild the selector")?;
+    let selector_rebuilt = started.elapsed();
     host.networking.replace_listener(listener)?;
+    let listener_replaced = started.elapsed();
 
     let resurrected = wasmer_vm::resurrect_all(&mut |body| {
         std::thread::Builder::new()
@@ -237,10 +246,19 @@ fn rebuild(host: &mut Host, listener: TcpListener) -> Result<()> {
     })
     .map_err(|err| anyhow::anyhow!("{err}"))
     .context("resurrecting the guest threads")?;
+    let elapsed = started.elapsed();
+    tracing::debug!(
+        tokio = ?tokio_built,
+        selector = ?selector_rebuilt.saturating_sub(tokio_built),
+        listener = ?listener_replaced.saturating_sub(selector_rebuilt),
+        threads = ?elapsed.saturating_sub(listener_replaced),
+        "clone rebuilt"
+    );
     tracing::info!(
         pid = std::process::id(),
         threads = resurrected.threads,
-        elapsed = ?started.elapsed(),
+        elapsed = ?elapsed,
+        since_fork = ?forked_at.elapsed(),
         "clone running"
     );
     Ok(())

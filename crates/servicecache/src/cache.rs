@@ -103,8 +103,7 @@ impl ModuleCache {
         let entry_dir = self.dir.join("modules").join(engine_key(engine));
         let entry = entry_dir.join(format!("{:x}.bin", Sha256::digest(&bytes)));
 
-        if let Some(module) = load_entry(engine, path, &entry) {
-            tracing::debug!(module = %path.display(), entry = %entry.display(), "module cache hit");
+        if let Some(module) = load_entry(engine, path, &entry, false) {
             return Ok(module);
         }
 
@@ -129,8 +128,7 @@ impl ModuleCache {
         lock_file
             .lock()
             .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-        if let Some(module) = load_entry(engine, path, &entry) {
-            tracing::debug!(module = %path.display(), "module cache hit after waiting for the lock");
+        if let Some(module) = load_entry(engine, path, &entry, true) {
             return Ok(module);
         }
 
@@ -162,16 +160,31 @@ impl ModuleCache {
 }
 
 /// The artifact at `entry`, if there is one and it loads. One that does not
-/// load is reported and treated as absent, so it gets recompiled.
-fn load_entry(engine: &Engine, path: &Path, entry: &Path) -> Option<Module> {
-    if !entry.is_file() {
+/// load is reported and treated as absent, so it gets recompiled. `waited`
+/// says whether the caller held the entry's lock first, for the log.
+fn load_entry(engine: &Engine, path: &Path, entry: &Path, waited: bool) -> Option<Module> {
+    let Ok(metadata) = entry.metadata() else {
+        return None;
+    };
+    if !metadata.is_file() {
         return None;
     }
+    let started = std::time::Instant::now();
     // SAFETY: the artifact was written by `Module::serialize` from this
     // program into a directory private to the user; Wasmer checks its header
     // and rejects one it did not produce.
     match unsafe { Module::deserialize_from_file(engine, entry) } {
-        Ok(module) => Some(module),
+        Ok(module) => {
+            tracing::debug!(
+                module = %path.display(),
+                entry = %entry.display(),
+                bytes = metadata.len(),
+                elapsed = ?started.elapsed(),
+                waited,
+                "module cache hit"
+            );
+            Some(module)
+        }
         Err(error) => {
             tracing::warn!(
                 module = %path.display(),

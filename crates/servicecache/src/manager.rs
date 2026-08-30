@@ -9,6 +9,7 @@ use std::{
     },
     path::Path,
     process::{Child, Command, Stdio},
+    time::Instant,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -171,13 +172,16 @@ impl HostProcess {
     ///
     /// Fails if the host is not frozen or the clone does not come up.
     pub fn fork(&mut self) -> Result<(Self, SocketAddr)> {
+        let started = Instant::now();
         let (ours, theirs) = Channel::pair()?;
         let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind a listener")?;
+        let sockets_made = started.elapsed();
         let reply = self.request(
             Request::Fork,
             &[],
             &[theirs.as_raw_fd(), listener.as_raw_fd()],
         )?;
+        let replied = started.elapsed();
         drop(theirs);
         drop(listener);
         let Reply::Forked { pid, endpoint } = reply else {
@@ -194,7 +198,18 @@ impl HostProcess {
             endpoint: Some(endpoint),
         };
         match child.reply()? {
-            Reply::Forked { .. } => Ok((child, endpoint)),
+            Reply::Forked { .. } => {
+                tracing::debug!(
+                    host = self.pid,
+                    clone = pid,
+                    %endpoint,
+                    sockets = ?sockets_made,
+                    replied = ?replied,
+                    announced = ?started.elapsed(),
+                    "clone forked"
+                );
+                Ok((child, endpoint))
+            }
             other => bail!("unexpected announcement from clone {pid}: {other:?}"),
         }
     }
