@@ -1,0 +1,40 @@
+diff --git a/src/cluster_legacy.c b/src/cluster_legacy.c
+index dabe1ac..3c0c974 100644
+--- a/src/cluster_legacy.c
++++ b/src/cluster_legacy.c
+@@ -954,7 +954,7 @@ int clusterLockConfig(char *filename) {
+  * and a fcntl-based solution won't help, as we constantly re-open that file,
+  * which will release _all_ locks anyway
+  */
+-#if !defined(__sun)
++#if !defined(__sun) && !defined(__wasm__)
+     /* To lock it, we need to open the file in a way it is created if
+      * it does not exist, otherwise there is a race condition with other
+      * processes. */
+@@ -990,7 +990,7 @@ int clusterLockConfig(char *filename) {
+     server.cluster_config_file_lock_fd = fd;
+ #else
+     UNUSED(filename);
+-#endif /* __sun */
++#endif /* __sun || __wasm__ */
+ 
+     return C_OK;
+ }
+@@ -1295,7 +1295,7 @@ void clusterHandleServerShutdown(void) {
+     serverLog(LL_NOTICE, "Saving the cluster configuration file before exiting.");
+     clusterSaveConfig(1);
+ 
+-#if !defined(__sun)
++#if !defined(__sun) && !defined(__wasm__)
+     /* Unlock the cluster config file before shutdown, see clusterLockConfig.
+      *
+      * This is needed if you shutdown a very large server process, it will take
+@@ -1308,7 +1308,7 @@ void clusterHandleServerShutdown(void) {
+     if (server.cluster_config_file_lock_fd != -1) {
+         flock(server.cluster_config_file_lock_fd, LOCK_UN | LOCK_NB);
+     }
+-#endif /* __sun */
++#endif /* __sun || __wasm__ */
+ }
+ 
+ /* Reset a node performing a soft or hard reset:

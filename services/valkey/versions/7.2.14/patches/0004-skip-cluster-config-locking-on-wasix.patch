@@ -1,0 +1,41 @@
+diff --git a/src/cluster.c b/src/cluster.c
+index 6ce3827..7aa96ff 100644
+--- a/src/cluster.c
++++ b/src/cluster.c
+@@ -845,7 +845,7 @@ int clusterLockConfig(char *filename) {
+  * and a fcntl-based solution won't help, as we constantly re-open that file,
+  * which will release _all_ locks anyway
+  */
+-#if !defined(__sun)
++#if !defined(__sun) && !defined(__wasm__)
+     /* To lock it, we need to open the file in a way it is created if
+      * it does not exist, otherwise there is a race condition with other
+      * processes. */
+@@ -883,7 +883,7 @@ int clusterLockConfig(char *filename) {
+     server.cluster_config_file_lock_fd = fd;
+ #else
+     UNUSED(filename);
+-#endif /* __sun */
++#endif /* __sun || __wasm__ */
+ 
+     return C_OK;
+ }
+diff --git a/src/server.c b/src/server.c
+index cc85f36..8763189 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -4440,12 +4440,12 @@ int finishShutdown(void) {
+     /* Close the listening sockets. Apparently this allows faster restarts. */
+     closeListeningSockets(1);
+ 
+-#if !defined(__sun)
++#if !defined(__sun) && !defined(__wasm__)
+     /* Unlock the cluster config file before shutdown */
+     if (server.cluster_enabled && server.cluster_config_file_lock_fd != -1) {
+         flock(server.cluster_config_file_lock_fd, LOCK_UN|LOCK_NB);
+     }
+-#endif /* __sun */
++#endif /* __sun || __wasm__ */
+ 
+ 
+     serverLog(LL_WARNING,"%s is now ready to exit, bye bye...",

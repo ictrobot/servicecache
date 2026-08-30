@@ -1,0 +1,14 @@
+diff --git a/src/tls.c b/src/tls.c
+index 9a53848..00b8103 100644
+--- a/src/tls.c
++++ b/src/tls.c
+@@ -27,7 +27,9 @@
+  * POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#ifndef __wasm__
+ #define VALKEYMODULE_CORE_MODULE /* A module that's part of the redis core, uses server.h too. */
++#endif
+ 
+ #include "server.h"
+ #include "connhelpers.h"

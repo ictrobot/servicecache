@@ -1,0 +1,17 @@
+diff --git a/src/server.h b/src/server.h
+index 735434a..1185f55 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -96,6 +96,12 @@ static_assert(sizeof(off_t) >= 8, "off_t must be 64-bit; ensure _FILE_OFFSET_BIT
+ 
+ #ifdef USE_LTTNG
+ #define valkey_fork() do_fork()
++#elif defined(__wasm__)
++static inline pid_t valkeyWasmFork(void) {
++    errno = ENOTSUP;
++    return -1;
++}
++#define valkey_fork() valkeyWasmFork()
+ #else
+ #define valkey_fork() fork()
+ #endif

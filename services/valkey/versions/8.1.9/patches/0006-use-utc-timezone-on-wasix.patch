@@ -1,0 +1,17 @@
+diff --git a/src/util.c b/src/util.c
+index ba7df61..cf442eb 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -1071,7 +1071,11 @@ sds getAbsolutePath(char *filename) {
+  * i.e timezone variables are linux specific.
+  */
+ long getTimeZone(void) {
+-#if defined(__linux__) || defined(__sun)
++#if defined(__wasm__)
++    /* WASI clocks use UTC and do not populate gettimeofday's obsolete
++     * timezone output argument. */
++    return 0;
++#elif defined(__linux__) || defined(__sun)
+     return timezone;
+ #else
+     struct timezone tz;

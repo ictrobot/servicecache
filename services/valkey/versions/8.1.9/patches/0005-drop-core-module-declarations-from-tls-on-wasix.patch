@@ -1,0 +1,14 @@
+diff --git a/src/tls.c b/src/tls.c
+index 35685e8..b47f336 100644
+--- a/src/tls.c
++++ b/src/tls.c
+@@ -27,7 +27,9 @@
+  * POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#ifndef __wasm__
+ #define VALKEYMODULE_CORE_MODULE /* A module that's part of the server core, uses server.h too. */
++#endif
+ 
+ #include "server.h"
+ #include "connhelpers.h"

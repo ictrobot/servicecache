@@ -11,6 +11,13 @@ address="${VALKEY_WASIX_BIND_ADDRESS:-127.0.0.1}"
 port="${VALKEY_WASIX_PORT:-6380}"
 maxmemory="${VALKEY_WASIX_MAXMEMORY:-256mb}"
 
+# Lua scripts reach the server API through the "server" global since 8.0;
+# 7.2 only has the "redis" name.
+lua_api=server
+case "$SC_VERSION" in
+  7.2.*) lua_api=redis ;;
+esac
+
 for module in "$server_module" "$cli_module"; do
   if [[ ! -f "$module" ]]; then
     echo "Valkey module not found: $module" >&2
@@ -89,13 +96,13 @@ assert_response 2 HSET wasm-hash runtime wasmer target wasix
 assert_response wasmer HGET wasm-hash runtime
 assert_response wasix HGET wasm-hash target
 assert_response 42 EVAL "return 6 * 7" 0
-assert_response OK EVAL "return server.call('SET', KEYS[1], ARGV[1])" 1 wasm-lua-key lua-wasix
-assert_response lua-wasix EVAL "return server.call('GET', KEYS[1])" 1 wasm-lua-key
+assert_response OK EVAL "return ${lua_api}.call('SET', KEYS[1], ARGV[1])" 1 wasm-lua-key lua-wasix
+assert_response lua-wasix EVAL "return ${lua_api}.call('GET', KEYS[1])" 1 wasm-lua-key
 
 lua_sha="$("${probe[@]}" SCRIPT LOAD "return ARGV[1]")"
 assert_response evalsha-wasix EVALSHA "$lua_sha" 0 evalsha-wasix
 
-lua_library=$'#!lua name=wasixlib\nserver.register_function("answer", function(keys, args) return 42 end)'
+lua_library="#!lua name=wasixlib"$'\n'"${lua_api}.register_function('answer', function(keys, args) return 42 end)"
 assert_response wasixlib FUNCTION LOAD REPLACE "$lua_library"
 assert_response 42 FCALL answer 0
 assert_response OK FUNCTION DELETE wasixlib

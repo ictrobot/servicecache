@@ -4,6 +4,4 @@
 0004-skip-cluster-config-locking-on-wasix.patch
 0005-drop-core-module-declarations-from-tls-on-wasix.patch
 0006-use-utc-timezone-on-wasix.patch
-0007-stub-rdma-on-wasix.patch
-0008-enable-static-lua-on-wasix.patch
 0009-support-wasix-connect-completion.patch

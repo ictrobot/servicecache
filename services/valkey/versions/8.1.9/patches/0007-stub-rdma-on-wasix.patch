@@ -1,0 +1,31 @@
+diff --git a/src/rdma.c b/src/rdma.c
+index b7ea1d6..fb586cb 100644
+--- a/src/rdma.c
++++ b/src/rdma.c
+@@ -13,10 +13,20 @@
+  * SPDX-License-Identifier: BSD-3-Clause
+  */
+ 
++#ifndef __wasm__
+ #define VALKEYMODULE_CORE_MODULE
++#endif
+ #include "server.h"
+ #include "connection.h"
+ 
++#ifdef __wasm__
++
++int RegisterConnectionTypeRdma(void) {
++    return C_ERR;
++}
++
++#else
++
+ #if defined __linux__ /* currently RDMA is only supported on Linux */
+ #if (USE_RDMA == 1 /* BUILD_YES */) || ((USE_RDMA == 2 /* BUILD_MODULE */) && (BUILD_RDMA_MODULE == 2))
+ #include "connhelpers.h"
+@@ -1931,3 +1941,5 @@ int RegisterConnectionTypeRdma(void) {
+ }
+ 
+ #endif /* __linux__ */
++
++#endif /* __wasm__ */

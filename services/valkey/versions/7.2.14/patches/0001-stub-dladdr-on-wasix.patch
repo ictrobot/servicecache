@@ -1,0 +1,26 @@
+diff --git a/src/debug.c b/src/debug.c
+index dcfebc3..be7c1af 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -39,7 +39,21 @@
+ 
+ #include <arpa/inet.h>
+ #include <signal.h>
++#ifndef __wasm__
+ #include <dlfcn.h>
++#else
++typedef struct {
++    const char *dli_fname;
++    void *dli_fbase;
++    const char *dli_sname;
++    void *dli_saddr;
++} Dl_info;
++static int dladdr(const void *addr, Dl_info *info) {
++    UNUSED(addr);
++    UNUSED(info);
++    return 0;
++}
++#endif
+ #include <fcntl.h>
+ #include <sys/mman.h>
+ #include <unistd.h>

@@ -1,0 +1,59 @@
+diff --git a/src/sentinel.c b/src/sentinel.c
+index c0a65e9..92e0fb2 100644
+--- a/src/sentinel.c
++++ b/src/sentinel.c
+@@ -820,7 +820,7 @@ void sentinelRunPendingScripts(void) {
+         sj->flags |= SENTINEL_SCRIPT_RUNNING;
+         sj->start_time = mstime();
+         sj->retry_num++;
+-        pid = fork();
++        pid = valkey_fork();
+ 
+         if (pid == -1) {
+             /* Parent (fork error).
+diff --git a/src/server.c b/src/server.c
+index e48be49..cfb9366 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -6365,7 +6365,7 @@ void createPidFile(void) {
+ void daemonize(void) {
+     int fd;
+ 
+-    if (fork() != 0) exit(0); /* parent exits */
++    if (valkey_fork() != 0) exit(0); /* parent exits */
+     setsid();                 /* create a new session */
+ 
+     /* Every output goes to /dev/null. If the server is daemonized but
+@@ -6559,7 +6559,7 @@ int serverFork(int purpose) {
+ 
+     int childpid;
+     long long start = ustime();
+-    if ((childpid = fork()) == 0) {
++    if ((childpid = valkey_fork()) == 0) {
+         /* Child.
+          *
+          * The order of setting things up follows some reasoning:
+diff --git a/src/server.h b/src/server.h
+index e0d3137..db1836f 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -84,6 +84,19 @@ typedef long long ustime_t; /* microsecond time type. */
+ 
+ #define dismissMemory zmadvise_dontneed
+ 
++/* WASIX declares no fork() alongside WebAssembly exception handling, and a
++ * multi-threaded guest could not use one anyway: background children are
++ * refused with ENOTSUP for the caller to report. */
++#ifdef __wasm__
++static inline pid_t valkeyWasmFork(void) {
++    errno = ENOTSUP;
++    return -1;
++}
++#define valkey_fork() valkeyWasmFork()
++#else
++#define valkey_fork() fork()
++#endif
++
+ #define VALKEYMODULE_CORE 1
+ typedef struct serverObject robj;
+ #include "valkeymodule.h" /* Modules API defines. */

@@ -1,0 +1,38 @@
+diff --git a/src/module.c b/src/module.c
+index 1ea966e..ee1bdb7 100644
+--- a/src/module.c
++++ b/src/module.c
+@@ -69,7 +69,33 @@
+ #include "io_threads.h"
+ #include "scripting_engine.h"
+ #include "cluster_migrateslots.h"
++#ifndef __wasm__
+ #include <dlfcn.h>
++#else
++/* WebAssembly modules are linked statically and have no dynamic loader. */
++#define RTLD_NOW 0
++#define RTLD_LOCAL 0
++static void *dlopen(const char *path, int flags) {
++    UNUSED(path);
++    UNUSED(flags);
++    errno = ENOTSUP;
++    return NULL;
++}
++static void *dlsym(void *handle, const char *symbol) {
++    UNUSED(handle);
++    UNUSED(symbol);
++    errno = ENOTSUP;
++    return NULL;
++}
++static int dlclose(void *handle) {
++    UNUSED(handle);
++    errno = ENOTSUP;
++    return -1;
++}
++static char *dlerror(void) {
++    return "dynamic module loading is unavailable on WebAssembly";
++}
++#endif
+ #include <sys/stat.h>
+ #include <sys/wait.h>
+ #include <fcntl.h>

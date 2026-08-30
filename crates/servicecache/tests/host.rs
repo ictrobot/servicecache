@@ -102,8 +102,11 @@ fn run_through_cli(manifest_path: &Path) {
         .arg(&spec)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped());
-    let recipe_path =
-        std::env::temp_dir().join(format!("servicecache-recipe-{}-{name}", std::process::id()));
+    let recipe_path = std::env::temp_dir().join(format!(
+        "servicecache-recipe-{}-{name}-{}",
+        std::process::id(),
+        manifest.service.version
+    ));
     if manifest.initializer.is_some() {
         std::fs::File::create(&recipe_path)
             .and_then(|mut file| file.write_all(&adapter.recipe()))
@@ -159,8 +162,9 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let recipe_path = std::env::temp_dir().join(format!(
-        "servicecache-clone-recipe-{}-{name}",
-        std::process::id()
+        "servicecache-clone-recipe-{}-{name}-{}",
+        std::process::id(),
+        manifest.service.version
     ));
     if manifest.initializer.is_some() {
         std::fs::File::create(&recipe_path)
