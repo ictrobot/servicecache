@@ -12,25 +12,24 @@ license = "MIT"
 [workspace.lints.clippy]
 pedantic = "warn"
 
-# The host process embeds Wasmer with the series in patches/wasmer/ applied;
-# scripts/setup-wasmer checks the pinned tag out into work/wasmer and applies
-# it. Every crate the lockfile pulls from the Wasmer workspace is overridden
-# from that tree: a partial override fails with duplicate types.
+# The host process embeds the servicecache wasmer variant (see wasmer/README).
+# Every crate the lockfile pulls from the Wasmer workspace is overridden from
+# that tree: a partial override fails with duplicate types.
 [patch.crates-io]
-virtual-fs = { path = "work/wasmer/lib/virtual-fs" }
-virtual-mio = { path = "work/wasmer/lib/virtual-io" }
-virtual-net = { path = "work/wasmer/lib/virtual-net" }
-wasmer = { path = "work/wasmer/lib/api" }
-wasmer-compiler = { path = "work/wasmer/lib/compiler" }
-wasmer-compiler-cranelift = { path = "work/wasmer/lib/compiler-cranelift" }
-wasmer-config = { path = "work/wasmer/lib/config" }
-wasmer-derive = { path = "work/wasmer/lib/derive" }
-wasmer-journal = { path = "work/wasmer/lib/journal" }
-wasmer-package = { path = "work/wasmer/lib/package" }
-wasmer-types = { path = "work/wasmer/lib/types" }
-wasmer-vm = { path = "work/wasmer/lib/vm" }
-wasmer-wasix = { path = "work/wasmer/lib/wasix" }
-wasmer-wasix-types = { path = "work/wasmer/lib/wasi-types" }
+virtual-fs = { path = "work/src/wasmer/servicecache/lib/virtual-fs" }
+virtual-mio = { path = "work/src/wasmer/servicecache/lib/virtual-io" }
+virtual-net = { path = "work/src/wasmer/servicecache/lib/virtual-net" }
+wasmer = { path = "work/src/wasmer/servicecache/lib/api" }
+wasmer-compiler = { path = "work/src/wasmer/servicecache/lib/compiler" }
+wasmer-compiler-cranelift = { path = "work/src/wasmer/servicecache/lib/compiler-cranelift" }
+wasmer-config = { path = "work/src/wasmer/servicecache/lib/config" }
+wasmer-derive = { path = "work/src/wasmer/servicecache/lib/derive" }
+wasmer-journal = { path = "work/src/wasmer/servicecache/lib/journal" }
+wasmer-package = { path = "work/src/wasmer/servicecache/lib/package" }
+wasmer-types = { path = "work/src/wasmer/servicecache/lib/types" }
+wasmer-vm = { path = "work/src/wasmer/servicecache/lib/vm" }
+wasmer-wasix = { path = "work/src/wasmer/servicecache/lib/wasix" }
+wasmer-wasix-types = { path = "work/src/wasmer/servicecache/lib/wasi-types" }
 
 # Line tables in the bench profile (`cargo build --profile bench`: the same
 # code as release, in the same directory), so that perf attributes samples to

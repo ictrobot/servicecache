@@ -1,0 +1,31 @@
+Wasmer 7.3.0, built from the pinned tag in named variants. A variant is an
+ordered list of patch sets applied to the tag, declared in
+<variant>/variant.env; its checkout lives at work/src/wasmer/<variant>, its
+cargo output at work/build/wasmer/<variant>, and its CLI is installed at
+work/wasmer/<variant>/bin/wasmer, mirroring how services are laid out.
+Every variant builds only the Cranelift compiler backend; ServiceCache does
+not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
+
+- stock: no patches. Every guest must run under it unchanged, and it is
+  the unpatched baseline for test.sh.
+
+- servicecache: the runtime the host embeds ([patch.crates-io] in Cargo.toml
+  points at its checkout). Its patch set makes a guest coroutine suspend on
+  a blocking host wait instead of parking its OS thread, lets guest threads
+  be resurrected on fresh threads in a forked child, rebuilds the selector
+  after a fork, replaces a clone's listening socket, and keeps host I/O
+  from going through a runtime handle captured at construction. Suspension
+  is off unless the host enables it; the I/O changes apply always.
+
+build.sh <variant> builds and installs a variant's CLI; setup.sh <variant>
+only prepares its checkout; test.sh <variant> runs the unit tests of the
+crates that go into the built CLIs — a superset of everything the patch
+sets modify — so patches carry their tests and the tests actually run;
+upstream's integration suites and the backends we do not build are left to
+upstream's CI. The matching make targets are wasmer-<variant>,
+test-wasmer-<variant> and clean-wasmer-<variant>.
+
+The patch sets are developed as stacked branches of a checkout under
+work/wasmer-dev — a set's branch contains the branches below it — and
+written back with export-patches.sh. They are maintained for the sys
+backend on Linux.

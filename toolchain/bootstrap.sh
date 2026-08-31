@@ -192,75 +192,9 @@ install_binaryen() {
   binaryen_ready || fail "binaryen verification failed after installation"
 }
 
-wasmer_ready() {
-  [[ -x "$WASMER_DIR/bin/wasmer" ]] || return 1
-  [[ "$("$WASMER_DIR/bin/wasmer" --version 2>&1)" == "wasmer $WASMER_VERSION" ]]
-}
-
-# The release binary needs a newer libstdc++ than some distributions carry:
-# it unpacks but cannot start. Only bin/wasmer is used, so building that one
-# binary from the pinned tag is a complete substitute.
-build_wasmer() {
-  # A tree of its own, not work/wasmer: that checkout carries the
-  # patches/wasmer series, and this build must stay the stock CLI.
-  local tree="$SC_ROOT/work/src/wasmer-cli-$WASMER_VERSION"
-  local build_dir="$SC_ROOT/work/build/wasmer-cli/$WASMER_VERSION"
-
-  require_command cargo
-
-  echo "building the Wasmer $WASMER_VERSION CLI from source"
-  sc_checkout https://github.com/wasmerio/wasmer.git "v$WASMER_VERSION" "$tree"
-
-  # lib/cli needs the wasmer-napi submodule before cargo can load the
-  # workspace manifest; nothing the host embeds does.
-  git -C "$tree" submodule update --init --depth 1 lib/napi >/dev/null 2>&1 ||
-    git -C "$tree" submodule update --init lib/napi ||
-    fail "could not check out the wasmer-napi submodule that lib/cli needs"
-
-  # Upstream's own release feature set on Linux x86_64, minus V8; the
-  # default features carry no compiler backend at all.
-  CARGO_TARGET_DIR="$build_dir" cargo build --release --locked \
-    --manifest-path "$tree/lib/cli/Cargo.toml" --bin wasmer \
-    --features cranelift,singlepass,wasmer-artifact-create,static-artifact-create,wasmer-artifact-load,static-artifact-load ||
-    fail "could not build the Wasmer CLI from source"
-
-  install -D -m 755 "$build_dir/release/wasmer" "$WASMER_DIR/bin/wasmer"
-}
-
 install_wasmer() {
-  if wasmer_ready; then
-    echo "Wasmer $WASMER_VERSION is already installed"
-    return
-  fi
-
-  # A binary that does not answer with the pinned version is replaced from
-  # source rather than asking for it to be cleared by hand.
-  if [[ -x "$WASMER_DIR/bin/wasmer" ]]; then
-    wasmer_replace_from_source
-    return
-  fi
-
-  [[ ! -e "$WASMER_DIR" ]] ||
-    fail "incomplete Wasmer installation at $WASMER_DIR; move it aside and retry"
-
-  local archive="$SC_ROOT/work/downloads/toolchain/wasmer-${WASMER_VERSION}-linux-amd64.tar.gz"
-  local url="https://github.com/wasmerio/wasmer/releases/download/v${WASMER_VERSION}/wasmer-linux-amd64.tar.gz"
-  download "$url" "$archive" "$WASMER_SHA256"
-  mkdir -p "$WASMER_DIR"
-  tar -xzf "$archive" -C "$WASMER_DIR"
-  if wasmer_ready; then
-    return
-  fi
-  wasmer_replace_from_source
-}
-
-wasmer_replace_from_source() {
-  echo "the installed Wasmer does not report the pinned version:" >&2
-  # It usually cannot start at all, so this reports rather than checks.
-  { "$WASMER_DIR/bin/wasmer" --version 2>&1 || true; } | sed 's/^/  /' >&2
-  build_wasmer
-  wasmer_ready ||
-    fail "Wasmer verification failed after building the CLI from source"
+  "$SC_ROOT/wasmer/build.sh" stock ||
+    fail "could not build the stock Wasmer CLI (wasmer/build.sh stock)"
 }
 
 run_smoke() {
@@ -321,7 +255,7 @@ load_service_set() {
   local service_versions="${version_file%/versions/*}/versions.sh"
 
   unset WASIXCC_VERSION WASIX_SYSROOT_TAG WASIX_LLVM_TAG BINARYEN_TAG WASMER_VERSION
-  unset WASIXCC_SHA256 WASMER_SHA256
+  unset WASIXCC_SHA256
   source "$version_file"
   if [[ -f "$service_versions" ]]; then
     source "$service_versions"
