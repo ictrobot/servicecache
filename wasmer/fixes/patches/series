@@ -4,3 +4,4 @@
 0004-wasix-honor-mapped-commands-under-sys-minimal.patch
 0005-wasix-signal-the-parent-when-a-virtual-process-exits.patch
 0006-wasix-honor-nonblocking-joins-for-any-child.patch
+0007-wasix-virtual-net-close-sockets-with-their-last-WASI.patch

@@ -1,0 +1,175 @@
+Subject: wasix, virtual-net: close sockets with their last WASI handle
+
+The descriptor table closed pipes when their last handle went away but
+left sockets open: a guest that closed its descriptor could leave the
+host TCP socket in CLOSE_WAIT indefinitely, and poll guards kept the
+socket alive after the fd was gone. Closing on every descriptor
+removal would break dup and fork, so the close is attached to the last
+WASI reference instead. Dropping it calls the socket's close
+operation; a local TCP stream removes its selector handler, shuts the
+stream down in both directions, and reports itself closed. The test
+clones an fd table and checks that the first removal closes nothing
+and the last closes exactly once.
+
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index d39b5d7..e609041 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -690,7 +690,7 @@ impl VirtualTcpSocket for LocalTcpStream {
+     }
+ 
+     fn is_closed(&self) -> bool {
+-        false
++        self.shutdown == Some(Shutdown::Both)
+     }
+ }
+ 
+@@ -724,7 +724,8 @@ impl VirtualConnectedSocket for LocalTcpStream {
+     }
+ 
+     fn close(&mut self) -> Result<()> {
+-        Ok(())
++        self.remove_handler();
++        self.shutdown(Shutdown::Both)
+     }
+ 
+     fn try_recv(&mut self, buf: &mut [MaybeUninit<u8>], peek: bool) -> Result<usize> {
+diff --git a/lib/wasix/src/fs/fd_list.rs b/lib/wasix/src/fs/fd_list.rs
+index ad28724..73019ec 100644
+--- a/lib/wasix/src/fs/fd_list.rs
++++ b/lib/wasix/src/fs/fd_list.rs
+@@ -300,7 +300,7 @@ mod tests {
+         borrow::Cow,
+         sync::{
+             Arc, RwLock,
+-            atomic::{AtomicI32, AtomicU64},
++            atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
+         },
+     };
+ 
+@@ -308,6 +308,7 @@ mod tests {
+     use wasmer_wasix_types::wasi::{Fdflags, Fdflagsext, Rights};
+ 
+     use crate::fs::{Inode, InodeGuard, InodeVal, Kind, fd::FdInner};
++    use crate::net::socket::tests::close_tracking_socket;
+ 
+     use super::{Fd, FdList, WasiFd};
+ 
+@@ -336,6 +337,14 @@ mod tests {
+         }
+     }
+ 
++    fn socket_fd(close_calls: Arc<AtomicUsize>) -> Fd {
++        let fd = useless_fd(0);
++        *fd.inode.kind.write().unwrap() = Kind::Socket {
++            socket: close_tracking_socket(close_calls),
++        };
++        fd
++    }
++
+     fn is_useless_fd(fd: &Fd, n: u16) -> bool {
+         fd.inner.flags.bits() == n
+     }
+@@ -697,6 +706,20 @@ mod tests {
+         assert_panic!(drop(fd0.inode.write()), String, contains "PoisonError");
+     }
+ 
++    #[test]
++    fn socket_closes_when_its_last_handle_is_removed() {
++        let close_calls = Arc::new(AtomicUsize::new(0));
++        let mut first = FdList::new();
++        first.insert_first_free(socket_fd(close_calls.clone()));
++        let mut second = first.clone();
++
++        first.remove(0).unwrap();
++        assert_eq!(close_calls.load(Ordering::Relaxed), 0);
++
++        second.remove(0).unwrap();
++        assert_eq!(close_calls.load(Ordering::Relaxed), 1);
++    }
++
+     #[test]
+     fn messing_with_inode_causes_panic() {
+         // We want to pin this behavior down, as not causing a panic
+diff --git a/lib/wasix/src/fs/mod.rs b/lib/wasix/src/fs/mod.rs
+index 412224d..cc67f8e 100644
+--- a/lib/wasix/src/fs/mod.rs
++++ b/lib/wasix/src/fs/mod.rs
+@@ -248,6 +248,12 @@ impl InodeGuard {
+                 trace!(%ino, "closing pipe tx");
+                 tx.close();
+             }
++            Kind::Socket { socket } => {
++                trace!(%ino, "closing socket");
++                if let Err(err) = socket.close() {
++                    trace!(%ino, %err, "failed to close socket");
++                }
++            }
+             _ => (),
+         }
+     }
+diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
+index f75b206..204434e 100644
+--- a/lib/wasix/src/net/socket.rs
++++ b/lib/wasix/src/net/socket.rs
+@@ -1855,7 +1855,7 @@ pub(crate) fn all_socket_rights() -> Rights {
+ }
+ 
+ #[cfg(test)]
+-mod tests {
++pub(crate) mod tests {
+     use super::{InodeSocket, InodeSocketKind, SocketProperties, WasiSocketStatus};
+     use std::{
+         future::pending,
+@@ -1880,6 +1880,7 @@ mod tests {
+     struct MockTcpSocket {
+         read_calls: Arc<AtomicUsize>,
+         write_calls: Arc<AtomicUsize>,
++        close_calls: Arc<AtomicUsize>,
+         status: Arc<AtomicUsize>,
+     }
+ 
+@@ -1951,6 +1952,7 @@ mod tests {
+         }
+ 
+         fn close(&mut self) -> NetResult<()> {
++            self.close_calls.fetch_add(1, Ordering::Relaxed);
+             Ok(())
+         }
+ 
+@@ -2047,6 +2049,19 @@ mod tests {
+     #[derive(Debug)]
+     struct PendingBindNetworking;
+ 
++    pub(crate) fn close_tracking_socket(close_calls: Arc<AtomicUsize>) -> InodeSocket {
++        InodeSocket::new(InodeSocketKind::TcpStream {
++            socket: Box::new(MockTcpSocket {
++                read_calls: Arc::new(AtomicUsize::new(0)),
++                write_calls: Arc::new(AtomicUsize::new(0)),
++                close_calls,
++                status: Arc::new(AtomicUsize::new(MOCK_STATUS_OPENED)),
++            }),
++            write_timeout: None,
++            read_timeout: None,
++        })
++    }
++
+     #[async_trait::async_trait]
+     impl VirtualNetworking for PendingBindNetworking {
+         async fn bind_tcp(
+@@ -2070,6 +2085,7 @@ mod tests {
+             socket: Box::new(MockTcpSocket {
+                 read_calls: read_calls.clone(),
+                 write_calls: write_calls.clone(),
++                close_calls: Arc::new(AtomicUsize::new(0)),
+                 status,
+             }),
+             write_timeout: None,
+@@ -2092,6 +2108,7 @@ mod tests {
+             socket: Box::new(MockTcpSocket {
+                 read_calls: Arc::new(AtomicUsize::new(0)),
+                 write_calls: Arc::new(AtomicUsize::new(0)),
++                close_calls: Arc::new(AtomicUsize::new(0)),
+                 status: status.clone(),
+             }),
+             write_timeout: None,
