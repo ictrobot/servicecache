@@ -59,7 +59,7 @@ index fd3467c..6cbb626 100644
          self.queue_modification(SelectorModification::PushInterest { token, interest });
      }
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index 220a6bc..ad043ec 100644
+index 8120c50..8787cc9 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
 @@ -324,6 +324,38 @@ impl LocalTcpListener {
@@ -98,6 +98,6 @@ index 220a6bc..ad043ec 100644
 +        Ok(())
 +    }
 +
-     fn try_accept_internal(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
-         match self.stream.accept().map_err(io_err_into_net_error) {
-             Ok((stream, addr)) => {
+     /// mio delivers readiness transitions, while WASIX epoll is level
+     /// triggered. If another connection remains after one accept, synthesize
+     /// the level event that the guest's next epoll_wait expects.

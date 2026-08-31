@@ -6,7 +6,7 @@ that is already listening, and `LocalNetworking::selector` exposes the
 selector it registers with.
 
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index e609041..c5b6095 100644
+index 86f5499..85f847e 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
 @@ -61,6 +61,11 @@ impl LocalNetworking {
@@ -44,6 +44,6 @@ index e609041..c5b6095 100644
 +        })
 +    }
 +
-     fn try_accept_internal(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
-         match self.stream.accept().map_err(io_err_into_net_error) {
-             Ok((stream, addr)) => {
+     /// mio delivers readiness transitions, while WASIX epoll is level
+     /// triggered. If another connection remains after one accept, synthesize
+     /// the level event that the guest's next epoll_wait expects.

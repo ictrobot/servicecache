@@ -1,0 +1,137 @@
+Subject: virtual-net: reassert level-triggered listener readiness
+
+mio delivers edge-triggered readiness, but WASIX exposes epoll with
+level-triggered semantics. When connections arrived together, one
+accept consumed the host's edge and the guest returned to epoll_wait
+with the backlog still holding a queued connection; no further event
+ever arrived and that client hung. After an accept, probe the listener
+nonblockingly and, if another connection is already queued, push a
+synthetic readable event through the existing handler. The guest still
+performs every accept; the listener only preserves the level-triggered
+contract. The test queues three connections and requires readiness
+after each of the first two accepts.
+
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index e609041..86f5499 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -304,6 +304,27 @@ pub struct LocalTcpListener {
+ }
+ 
+ impl LocalTcpListener {
++    /// mio delivers readiness transitions, while WASIX epoll is level
++    /// triggered. If another connection remains after one accept, synthesize
++    /// the level event that the guest's next epoll_wait expects.
++    #[cfg(not(target_os = "windows"))]
++    fn reassert_readable_if_ready(&mut self) {
++        let remains_readable = libc_poll(self.stream.as_raw_fd(), libc::POLLIN)
++            .is_some_and(|events| events & libc::POLLIN != 0);
++        if !remains_readable {
++            return;
++        }
++        match &mut self.handler_guard {
++            HandlerGuardState::ExternalHandler(guard) | HandlerGuardState::WakerMap(guard, _) => {
++                guard.interest(InterestType::Readable)
++            }
++            HandlerGuardState::None => {}
++        }
++    }
++
++    #[cfg(target_os = "windows")]
++    fn reassert_readable_if_ready(&mut self) {}
++
+     fn try_accept_internal(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
+         match self.stream.accept().map_err(io_err_into_net_error) {
+             Ok((stream, addr)) => {
+@@ -337,10 +358,12 @@ impl LocalTcpListener {
+ 
+ impl VirtualTcpListener for LocalTcpListener {
+     fn try_accept(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
+-        if let Some(child) = self.backlog.pop_front() {
+-            return Ok(child);
+-        }
+-        self.try_accept_internal()
++        let child = match self.backlog.pop_front() {
++            Some(child) => child,
++            None => self.try_accept_internal()?,
++        };
++        self.reassert_readable_if_ready();
++        Ok(child)
+     }
+ 
+     fn set_handler(&mut self, mut handler: Box<dyn InterestHandler + Send + Sync>) -> Result<()> {
+@@ -1244,3 +1267,74 @@ impl VirtualIoSource for LocalUdpSocket {
+         Poll::Pending
+     }
+ }
++
++#[cfg(all(test, not(target_os = "windows")))]
++mod tests {
++    use super::*;
++    use std::{
++        net::{TcpListener, TcpStream},
++        sync::mpsc::{self, Receiver},
++    };
++
++    #[derive(Debug)]
++    struct ChannelHandler(mpsc::Sender<InterestType>);
++
++    impl InterestHandler for ChannelHandler {
++        fn push_interest(&mut self, interest: InterestType) {
++            self.0.send(interest).unwrap();
++        }
++
++        fn pop_interest(&mut self, _interest: InterestType) -> bool {
++            false
++        }
++
++        fn has_interest(&self, _interest: InterestType) -> bool {
++            false
++        }
++    }
++
++    fn expect_readable(receiver: &Receiver<InterestType>) {
++        loop {
++            let interest = receiver
++                .recv_timeout(Duration::from_secs(1))
++                .expect("listener was not reported readable");
++            if interest == InterestType::Readable {
++                return;
++            }
++        }
++    }
++
++    #[test]
++    fn accepting_one_of_several_connections_reasserts_readability() {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let addr = listener.local_addr().unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let mut listener = LocalTcpListener {
++            stream: mio::net::TcpListener::from_std(listener),
++            selector: Selector::new(),
++            handler_guard: HandlerGuardState::None,
++            no_delay: None,
++            keep_alive: None,
++            backlog: Default::default(),
++            ruleset: None,
++        };
++        let (sender, receiver) = mpsc::channel();
++        listener
++            .set_handler(Box::new(ChannelHandler(sender)))
++            .unwrap();
++
++        let _clients = (0..3)
++            .map(|_| TcpStream::connect(addr).unwrap())
++            .collect::<Vec<_>>();
++        expect_readable(&receiver);
++        while receiver.try_recv().is_ok() {}
++
++        listener.try_accept().unwrap();
++        expect_readable(&receiver);
++        while receiver.try_recv().is_ok() {}
++
++        listener.try_accept().unwrap();
++        expect_readable(&receiver);
++        listener.try_accept().unwrap();
++    }
++}
