@@ -1,0 +1,115 @@
+Subject: wasix: let an embedder choose the registered extensions
+
+Extension namespaces were registered unconditionally: any guest under a
+runtime built with an extension could import it, whatever the embedder
+knew about the guest. Capabilities gains an extensions field - None
+registers every extension the runtime carries, the default and what the
+CLI does; a set registers only the listed namespaces, so a module that
+imports anything else fails to instantiate exactly as it would on a
+runtime without the extension. An embedder that runs declared packages
+passes the declaration, and the linker becomes the enforcement: there
+is no separate scan to drift from what actually links. The setting
+rides the capabilities, so forked and exec'd children inherit it.
+
+diff --git a/lib/wasix/src/capabilities.rs b/lib/wasix/src/capabilities.rs
+index b95f5e5..ff5cacc 100644
+--- a/lib/wasix/src/capabilities.rs
++++ b/lib/wasix/src/capabilities.rs
+@@ -1,4 +1,4 @@
+-use std::time::Duration;
++use std::{collections::BTreeSet, time::Duration};
+ 
+ use crate::http::HttpClientCapabilityV1;
+ 
+@@ -10,6 +10,12 @@ pub struct Capabilities {
+     pub polling: CapabilityPollingV1,
+     pub max_sock_recv_size: Option<u64>,
+     pub threading: CapabilityThreadingV1,
++    /// Extension import namespaces registered for this environment. `None`
++    /// registers every extension the runtime carries; a list registers only
++    /// those, so a module importing anything else fails to instantiate
++    /// exactly as it would on a runtime without the extension. Inherited by
++    /// forked and exec'd children with the rest of the capabilities.
++    pub extensions: Option<BTreeSet<String>>,
+ }
+ 
+ impl Capabilities {
+@@ -20,6 +26,7 @@ impl Capabilities {
+             polling: Default::default(),
+             max_sock_recv_size: Some(16 * 1024 * 1024),
+             threading: Default::default(),
++            extensions: None,
+         }
+     }
+ 
+@@ -32,12 +39,14 @@ impl Capabilities {
+             polling,
+             max_sock_recv_size,
+             threading,
++            extensions,
+         } = other;
+         self.insecure_allow_all |= insecure_allow_all;
+         self.http_client.update(http_client);
+         self.polling.update(polling);
+         self.max_sock_recv_size = max_sock_recv_size.or(self.max_sock_recv_size);
+         self.threading.update(threading);
++        self.extensions = extensions.or(self.extensions.take());
+     }
+ }
+ 
+diff --git a/lib/wasix/src/lib.rs b/lib/wasix/src/lib.rs
+index 2f5546e..a221498 100644
+--- a/lib/wasix/src/lib.rs
++++ b/lib/wasix/src/lib.rs
+@@ -390,13 +390,30 @@ pub fn generate_import_object_from_env(
+     // The shared-memory extension has only a 32-bit ABI: there is no wasm64
+     // sysroot to build a guest with, so a 64-bit namespace would be an
+     // untestable declaration.
+-    if !matches!(version, WasiVersion::Wasix64v1) {
++    if !matches!(version, WasiVersion::Wasix64v1) && extension_enabled(store, ctx, "ictrobot_shm_v1")
++    {
+         imports.register_namespace("ictrobot_shm_v1", ictrobot_shm_exports(store, ctx));
+     }
+ 
+     imports
+ }
+ 
++/// Whether the environment registers an extension namespace: every one the
++/// runtime carries when the embedder set no list, otherwise only the listed
++/// ones, so that anything else fails to instantiate exactly as it would on
++/// a runtime without the extension.
++fn extension_enabled(
++    store: &impl AsStoreMut,
++    ctx: &FunctionEnv<WasiEnv>,
++    namespace: &str,
++) -> bool {
++    ctx.as_ref(store)
++        .capabilities
++        .extensions
++        .as_ref()
++        .is_none_or(|enabled| enabled.contains(namespace))
++}
++
+ fn ictrobot_shm_exports(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
+     use syscalls::*;
+     namespace! {
+@@ -833,7 +850,6 @@ fn import_object_for_all_wasi_versions(
+     let exports_wasi_snapshot_preview1 = wasi_snapshot_preview1_exports(store, env);
+     let exports_wasix_32v1 = wasix_exports_32(store, env);
+     let exports_wasix_64v1 = wasix_exports_64(store, env);
+-    let exports_ictrobot_shm_v1 = ictrobot_shm_exports(store, env);
+ 
+     // Allowed due to JS feature flag complications.
+     #[allow(unused_mut)]
+@@ -843,8 +859,10 @@ fn import_object_for_all_wasi_versions(
+         "wasi_snapshot_preview1" => exports_wasi_snapshot_preview1,
+         "wasix_32v1" => exports_wasix_32v1,
+         "wasix_64v1" => exports_wasix_64v1,
+-        "ictrobot_shm_v1" => exports_ictrobot_shm_v1,
+     };
++    if extension_enabled(store, env, "ictrobot_shm_v1") {
++        imports.register_namespace("ictrobot_shm_v1", ictrobot_shm_exports(store, env));
++    }
+ 
+     imports
+ }

@@ -23,6 +23,13 @@ pub struct Manifest {
 pub struct Service {
     pub name: String,
     pub version: String,
+    /// Import namespaces the service's modules may use beyond the WASIX
+    /// baseline, each specified in extensions/<name>/. Assembly checks the
+    /// built modules against it, and the host registers only these
+    /// namespaces for every run, so an undeclared import fails to
+    /// instantiate.
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 /// Optional filesystem preparation performed before the serving run.
@@ -431,6 +438,28 @@ mod tests {
         let manifest = Manifest::load(&directory.0.join("service.toml")).expect("load manifest");
         let prepare = manifest.prepare.expect("a prepare step");
         assert_eq!(prepare.fs[&PathBuf::from("/service")], directory.0);
+        assert!(manifest.service.extensions.is_empty());
+    }
+
+    #[test]
+    fn service_extensions_are_parsed() {
+        let directory = TestDirectory::new();
+        directory.write("server.wasm", "module");
+        directory.write(
+            "service.toml",
+            r#"
+                [service]
+                name = "example"
+                version = "1"
+                extensions = ["ictrobot_shm_v1"]
+
+                [guest]
+                module = "server.wasm"
+                listen_port = 1234
+            "#,
+        );
+        let manifest = Manifest::load(&directory.0.join("service.toml")).expect("load manifest");
+        assert_eq!(manifest.service.extensions, ["ictrobot_shm_v1"]);
     }
 
     #[test]

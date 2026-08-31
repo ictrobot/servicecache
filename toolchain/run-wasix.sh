@@ -5,7 +5,7 @@ SC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$SC_ROOT/toolchain/versions.sh"
 source "$SC_ROOT/toolchain/env.sh"
 
-variant=stock
+variant=""
 if [[ "${1:-}" == "--variant" ]]; then
   variant="${2:?--variant needs a name}"
   shift 2
@@ -19,9 +19,16 @@ fi
 module="$1"
 shift
 
-wasmer="$SC_ROOT/work/wasmer/$variant/bin/wasmer"
+# An explicit --variant wins; otherwise the CLI sc_init exports for the
+# package being built or smoke-tested; otherwise stock.
+if [[ -n "$variant" ]]; then
+  wasmer="$SC_ROOT/work/wasmer/$variant/bin/wasmer"
+else
+  wasmer="${SC_WASMER:-$SC_ROOT/work/wasmer/stock/bin/wasmer}"
+fi
 if [[ ! -x "$wasmer" ]]; then
-  echo "Wasmer variant not built: run make wasmer-$variant first" >&2
+  variant="$(basename "$(dirname "$(dirname "$wasmer")")")"
+  echo "Wasmer CLI not built: $wasmer (run make wasmer-$variant first)" >&2
   exit 1
 fi
 

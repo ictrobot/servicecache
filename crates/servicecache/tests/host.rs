@@ -298,6 +298,72 @@ const CASES: &[(&str, Case)] = &[
     ("forks_a_clone_through_the_cli", fork_a_clone_through_cli),
 ];
 
+/// The linker gates extensions: a module importing `ictrobot_shm_v1` only
+/// instantiates when the manifest declares the namespace. The demo runs in
+/// child mode with no object created for it, so with the declaration it
+/// instantiates and exits 1 from `shm_open`; without it, it never links.
+/// The full exchange runs under the extension smoke's CLI.
+fn extension_declarations_gate_instantiation(declare: bool) {
+    let demo =
+        repo_root().join("work/build/extension-smoke/ictrobot_shm_v1/ictrobot-shm-demo.wasm");
+    if !demo.is_file() {
+        eprintln!(
+            "skipped: the extension demo is not built (run `make smoke-extension-ictrobot_shm_v1`)"
+        );
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "servicecache-extension-gate-{}-{declare}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("test package dir");
+    std::fs::copy(&demo, dir.join("ictrobot-shm-demo.wasm")).expect("copy the demo");
+    let extensions = if declare {
+        "\nextensions = [\"ictrobot_shm_v1\"]"
+    } else {
+        ""
+    };
+    std::fs::write(
+        dir.join("service.toml"),
+        format!(
+            r#"[service]
+name = "extension-gate"
+version = "1"{extensions}
+
+[prepare]
+module = "ictrobot-shm-demo.wasm"
+args = ["--child"]
+
+[guest]
+module = "ictrobot-shm-demo.wasm"
+listen_port = 1234
+"#
+        ),
+    )
+    .expect("write the manifest");
+
+    let binary = Path::new(env!("CARGO_BIN_EXE_servicecache"));
+    let cache_dir =
+        servicecache::cache::directory(None, std::env::var_os("SERVICECACHE_CACHE_DIR").as_deref())
+            .expect("a cache directory");
+    let mut host = HostProcess::spawn_with_binary(binary, &dir.join("service.toml"), &cache_dir)
+        .expect("spawn the host");
+    let outcome = host.prepare();
+    let _ = host.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+    if declare {
+        // Exit 1 from the demo's own shm_open failure: it instantiated and
+        // ran, which is what the declaration grants.
+        assert_eq!(outcome.expect("prepare with the declaration"), 1);
+    } else {
+        match outcome {
+            Err(error) => assert!(error.to_string().contains("ictrobot_shm_v1"), "{error}"),
+            Ok(code) => assert_ne!(code, 0, "an undeclared extension import must fail"),
+        }
+    }
+}
+
 fn main() {
     let args = libtest_mimic::Arguments::from_args();
     let mut trials = Vec::new();
@@ -325,6 +391,20 @@ fn main() {
         "guest_sees_correct_ports",
         || {
             guest_sees_correct_ports();
+            Ok(())
+        },
+    ));
+    trials.push(libtest_mimic::Trial::test(
+        "extension_gate::undeclared_import_fails",
+        || {
+            extension_declarations_gate_instantiation(false);
+            Ok(())
+        },
+    ));
+    trials.push(libtest_mimic::Trial::test(
+        "extension_gate::declared_import_instantiates",
+        || {
+            extension_declarations_gate_instantiation(true);
             Ok(())
         },
     ));

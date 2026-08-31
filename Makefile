@@ -20,11 +20,13 @@ WASMER_VARIANTS := $(patsubst wasmer/%/variant.env,%,$(wildcard wasmer/*/variant
 WASMER_TARGETS := $(addprefix wasmer-,$(WASMER_VARIANTS))
 TEST_WASMER_TARGETS := $(addprefix test-wasmer-,$(WASMER_VARIANTS))
 CLEAN_WASMER_TARGETS := $(addprefix clean-wasmer-,$(WASMER_VARIANTS))
+EXTENSION_NAMES := $(patsubst extensions/%/smoke.sh,%,$(wildcard extensions/*/smoke.sh))
+SMOKE_EXTENSION_TARGETS := $(addprefix smoke-extension-,$(EXTENSION_NAMES))
 
-.PHONY: help bootstrap setup-wasmer build test lint check serve services services-list smoke smoke-toolchain smoke-services lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
+.PHONY: help bootstrap setup-wasmer build test lint check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
-.PHONY: $(SERVICE_NAME_TARGETS) $(WASMER_TARGETS) $(TEST_WASMER_TARGETS) $(CLEAN_WASMER_TARGETS)
+.PHONY: $(SERVICE_NAME_TARGETS) $(WASMER_TARGETS) $(TEST_WASMER_TARGETS) $(CLEAN_WASMER_TARGETS) $(SMOKE_EXTENSION_TARGETS)
 
 help:
 	@echo "bootstrap                       install the pinned WASIX toolchain into work/toolchains"
@@ -34,6 +36,8 @@ help:
 	@echo "smoke-toolchain                 build and run the toolchain smoke test"
 	@echo "smoke-services                  smoke-test every built service version"
 	@echo "smoke-service-<name>-<version>  build if needed, then smoke-test one service version"
+	@echo "smoke-extensions                run every Wasmer extension's demo ($(EXTENSION_NAMES))"
+	@echo "smoke-extension-<name>          run one extension's demo under the extensions CLI; stock must refuse it"
 	@echo "setup-wasmer                    prepare the servicecache Wasmer variant the host builds against"
 	@echo "wasmer-<variant>                build a Wasmer variant's CLI into work/wasmer/<variant> ($(WASMER_VARIANTS))"
 	@echo "test-wasmer-<variant>           run the unit tests of the CLI's crates in that variant's checkout"
@@ -115,9 +119,18 @@ purge:
 
 services: $(SERVICE_TARGETS)
 
-smoke: smoke-toolchain smoke-services
+smoke: smoke-toolchain smoke-services smoke-extensions
 
 smoke-services: $(SMOKE_SERVICE_TARGETS)
+
+smoke-extensions: $(SMOKE_EXTENSION_TARGETS)
+
+define extension_rules
+smoke-extension-$(1): bootstrap wasmer-extensions
+	extensions/$(1)/smoke.sh
+endef
+
+$(foreach name,$(EXTENSION_NAMES),$(eval $(call extension_rules,$(name))))
 
 define wasmer_variant_rules
 wasmer-$(1):

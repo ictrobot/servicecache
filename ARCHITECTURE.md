@@ -18,7 +18,7 @@ ServiceCache is a generic manager for disposable test services. It runs server s
 - **A control thread drives the host.** It runs a synchronous loop over a socketpair inherited from the manager: `prepare`, `start`, `initialize`, `freeze`, `fork` and `stop` in; `ready`, `exited`, `frozen`, `forked` and `error` out; descriptors such as the listening socket travel with their message as `SCM_RIGHTS`. Hosts die with the manager.
 - **Freeze is terminal.** The host waits until every guest thread is suspended in a wait, ends every thread but the control thread, and verifies the process has one thread. A frozen host is a template: it answers only `fork` and `stop`. Its clients are disconnected at the freeze and its port refuses connections from then on, so a clone inherits no connection. Afterwards the template gives the all-zero pages of the guest's memory back to the kernel, in slices between requests, so that it keeps less resident and a fork copies fewer page-table entries; the guest cannot tell.
 - **A clone is a `fork()` of a template.** The child rebuilds what the parent dismantled — the tokio runtime, the selector, one thread per guest coroutine, the listening socket the manager passed for it — resumes every coroutine where it stopped, and serves on its own control channel. Clones die with their template.
-- **The runtime is Wasmer with a patch series.** Wasmer is built in named variants (`wasmer/<variant>/variant.env`), each an ordered list of patch sets applied to the pinned tag: the workspace builds the host against the `servicecache` variant's checkout (`work/src/wasmer/servicecache`), and every variant's CLI is built from source into `work/wasmer/<variant>`. Suspension is off unless the host enables it. The CLI that builds and smoke-tests guests is the `stock` variant, which every guest must run under unchanged.
+- **The runtime is Wasmer with a patch series.** Wasmer is built in named variants, each an ordered list of patch sets applied to the pinned tag (`wasmer/<variant>/variant.env`, described in `wasmer/README`): `stock` applies none, `fixes` carries fixes to upstream that are not specific to ServiceCache, `extensions` carries the fixes set and the extension sets, and `servicecache` adds its own set on top of fixes and extensions and is what the workspace builds the host against (`work/src/wasmer/servicecache`). Every variant's CLI is built from source into `work/wasmer/<variant>`. Suspension is off unless the host enables it. The CLI that builds and smoke-tests a package's guests is `stock`, which a guest with no extension declaration must run under unchanged; a package that declares extensions uses the `extensions` variant instead.
 
 ## Freezing and resurrection
 
@@ -33,12 +33,25 @@ A fork resurrects the guest in the child. The runtime is rebuilt (tokio, the sel
 The manager and its guests are designed to be independent programs. Their only interfaces are the WASIX ABI and the service's own network protocol.
 
 1. **The manager is generic.** It has no service-specific knowledge; guest memory is opaque bytes to it.
-2. **Guests import only the standard WASIX ABI.** Every guest runs unchanged under stock Wasmer.
+2. **Guests import only the standard WASIX ABI.** Every guest runs unchanged under stock Wasmer, enforced at assembly against a pinned baseline of import namespaces — unless the package declares an extension under rule 8.
 3. **Initialization is the service's own client.** Upstream's client, built for WASIX, speaking the service's own protocol.
 4. **Guest patches make sense without ServiceCache.** Anyone running the server under plain Wasmer should want them.
 5. **Freeze and clone happen in the runtime.** The guest never knows.
 6. **No state is shipped.** Guests start on a clean filesystem.
 7. **Manifests are plain files.** No inheritance, no merging.
+8. **Extensions are narrow, generic and opt in.** A guest-visible extension is program-agnostic and POSIX-shaped, declared by the package, and enforced by the linker; see Extensions below.
+
+## Extensions
+
+An extension adds a program-agnostic, POSIX-shaped, guest-visible primitive to the runtime's WASIX surface.
+
+Each extension lives whole in `extensions/<name>/`: its specification, the guest header, a demo, its smoke test and its own Wasmer patch set. The namespace is versioned and author-prefixed (`ictrobot_<name>_v<n>`). The implementation belongs to the runtime, not the manager, and stays free of anything project-specific, so it can be proposed upstream.
+
+A package opts in by setting `SC_GUEST_EXTENSIONS` in its `version.env` and listing the same namespaces under `extensions` in `service.toml`'s `[service]` table. Assembly checks every built module's imports against the declaration.
+
+At run time the host registers only the declared namespaces, so an undeclared import fails to instantiate exactly as it would under stock Wasmer. The declaration may be a superset of what the manifest's own modules import: a service can load other modules from its package, and the declaration is the allowance for all of them.
+
+Only permissively licensed modules (the service and all its dependencies) import extensions.
 
 ## Services
 

@@ -1,0 +1,1250 @@
+Subject: ictrobot_shm_v1: add the shared-memory imports
+
+WASIX has no cross-process shared memory: wasix-libc implements mmap
+inside the guest, fork deep-copies linear memory, and a MAP_SHARED
+mapping becomes an independent copy in every virtual process. A
+multi-process guest built around a shared segment cannot run
+correctly, and no guest-side change can fix that.
+
+Add an explicit, opt-in ictrobot_shm_v1 import namespace with fd_map
+and fd_unmap: native shared file overlays over page-aligned regions of
+the calling instance's linear memory, backed by a memfd-based
+/dev/shm. Forked children re-overlay their inherited mappings; as on
+Linux, exec keeps none: a recycled execution unregisters its ranges
+and a new image re-attaches explicitly. Futexes on mapped addresses
+take their identity from the shared object and offset, so waits and
+wakes pair across instances. A module that imports the namespace
+fails loudly to instantiate anywhere the imports are absent.
+
+The mapping list lives beside the process, outside its inner lock,
+and the futex path checks an atomic count before taking any lock, so
+a process that never maps pays one relaxed load per wait or wake and
+never queues behind thread or signal bookkeeping.
+
+The namespace is registered for the 32-bit WASI versions only: there
+is no wasm64 sysroot to build a guest with, so 64-bit entry points
+would be untestable declarations. A future 64-bit ABI can arrive as
+its own namespace once a guest can exist to import it.
+
+diff --git a/lib/wasix/src/bin_factory/exec.rs b/lib/wasix/src/bin_factory/exec.rs
+index 76b938a..a010315 100644
+--- a/lib/wasix/src/bin_factory/exec.rs
++++ b/lib/wasix/src/bin_factory/exec.rs
+@@ -167,6 +167,14 @@ unsafe fn run_recycle(
+     ctx: WasiFunctionEnv,
+     mut store: Store,
+ ) {
++    // As on Linux, no mapping survives exec. The process and its mapping
++    // list outlive the recycled Store, and a stale range would hand the
++    // old object's shared futex identity to whatever the next image keeps
++    // at those guest addresses, besides blocking it from mapping them.
++    ctx.data(&store)
++        .process
++        .shared_memory_mappings
++        .write(|mappings| mappings.clear());
+     if let Some(callback) = callback {
+         let env = ctx.data_mut(&mut store);
+         let memory = unsafe { env.memory() }.clone();
+diff --git a/lib/wasix/src/fs/mod.rs b/lib/wasix/src/fs/mod.rs
+index cc67f8e..3b051e3 100644
+--- a/lib/wasix/src/fs/mod.rs
++++ b/lib/wasix/src/fs/mod.rs
+@@ -19,6 +19,7 @@ mod fd_list;
+ mod inode_guard;
+ mod notification;
+ mod path_posix;
++pub(crate) mod shared_memory;
+ 
+ use std::{
+     borrow::Cow,
+@@ -441,6 +442,7 @@ pub struct WasiFsRoot {
+ 
+ impl WasiFsRoot {
+     pub fn from_mount_fs(root: MountFileSystem) -> Self {
++        shared_memory::install(&root);
+         Self {
+             root: Arc::new(root),
+             memory_limiter: None,
+@@ -451,6 +453,7 @@ impl WasiFsRoot {
+         let root = MountFileSystem::new();
+         root.mount(Path::new("/"), fs)
+             .expect("mounting the root fs on an empty mount fs should succeed");
++        shared_memory::install(&root);
+ 
+         Self {
+             root: Arc::new(root),
+diff --git a/lib/wasix/src/fs/shared_memory.rs b/lib/wasix/src/fs/shared_memory.rs
+new file mode 100644
+index 0000000..7dfaf8f
+--- /dev/null
++++ b/lib/wasix/src/fs/shared_memory.rs
+@@ -0,0 +1,597 @@
++use std::{
++    collections::HashMap,
++    ffi::CString,
++    io,
++    ops::Range,
++    os::fd::FromRawFd,
++    path::{Component, Path, PathBuf},
++    pin::Pin,
++    sync::{
++        Arc, Mutex, RwLock,
++        atomic::{AtomicU64, Ordering},
++    },
++    task::{Context, Poll},
++    time::{SystemTime, UNIX_EPOCH},
++};
++
++use futures::future::BoxFuture;
++use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
++use virtual_fs::{
++    DirEntry, FileOpener, FileSystem, FileType, FsError, Metadata, OpenOptions, OpenOptionsConfig,
++    ReadDir, VirtualFile,
++};
++use wasmer_wasix_types::wasi::{Errno, Rights};
++
++use super::{Kind, WasiFs};
++use crate::state::WasiFutexState;
++
++#[derive(Debug)]
++pub(crate) struct SharedMemoryObject {
++    file: std::fs::File,
++    created: u64,
++    accessed: AtomicU64,
++    modified: AtomicU64,
++    next_mapping: AtomicU64,
++    mappings: Mutex<HashMap<u64, Range<u64>>>,
++    pub(crate) futexs: Mutex<WasiFutexState>,
++    io_lock: Mutex<()>,
++}
++
++impl SharedMemoryObject {
++    fn new() -> Result<Self, FsError> {
++        #[cfg(target_os = "linux")]
++        let file = {
++            let name = CString::new("ictrobot-shm-v1").unwrap();
++            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
++            if fd < 0 {
++                return Err(io::Error::last_os_error().into());
++            }
++            unsafe { std::fs::File::from_raw_fd(fd) }
++        };
++
++        #[cfg(not(target_os = "linux"))]
++        return Err(FsError::Unsupported);
++
++        #[cfg(target_os = "linux")]
++        {
++            let now = now_nanos();
++            Ok(Self {
++                file,
++                created: now,
++                accessed: AtomicU64::new(now),
++                modified: AtomicU64::new(now),
++                next_mapping: AtomicU64::new(1),
++                mappings: Mutex::new(HashMap::new()),
++                futexs: Mutex::new(WasiFutexState::default()),
++                io_lock: Mutex::new(()),
++            })
++        }
++    }
++
++    pub(crate) fn try_clone_file(&self) -> Result<std::fs::File, Errno> {
++        self.file.try_clone().map_err(|_| Errno::Io)
++    }
++
++    pub(crate) fn register_mapping(
++        self: &Arc<Self>,
++        file_offset: u64,
++        len: u64,
++    ) -> Result<SharedMemoryMapping, Errno> {
++        let end = file_offset.checked_add(len).ok_or(Errno::Overflow)?;
++        if len == 0 || end > self.size() {
++            return Err(Errno::Inval);
++        }
++        let id = self.next_mapping.fetch_add(1, Ordering::Relaxed);
++        self.mappings.lock().unwrap().insert(id, file_offset..end);
++        Ok(SharedMemoryMapping {
++            object: self.clone(),
++            id,
++            address: 0,
++            len,
++            file_offset,
++        })
++    }
++
++    fn unregister_mapping(&self, id: u64) {
++        self.mappings.lock().unwrap().remove(&id);
++    }
++
++    fn size(&self) -> u64 {
++        self.file.metadata().map(|m| m.len()).unwrap_or(0)
++    }
++
++    fn set_len(&self, new_size: u64) -> Result<(), FsError> {
++        if self
++            .mappings
++            .lock()
++            .unwrap()
++            .values()
++            .any(|range| range.end > new_size)
++        {
++            return Err(FsError::PermissionDenied);
++        }
++        self.file.set_len(new_size)?;
++        self.modified.store(now_nanos(), Ordering::Relaxed);
++        Ok(())
++    }
++
++    fn metadata(&self) -> Metadata {
++        Metadata {
++            ft: FileType::new_file(),
++            accessed: self.accessed.load(Ordering::Relaxed),
++            created: self.created,
++            modified: self.modified.load(Ordering::Relaxed),
++            len: self.size(),
++        }
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct SharedMemoryMapping {
++    pub(crate) object: Arc<SharedMemoryObject>,
++    id: u64,
++    pub(crate) address: u64,
++    pub(crate) len: u64,
++    pub(crate) file_offset: u64,
++}
++
++impl SharedMemoryMapping {
++    pub(crate) fn range(&self) -> Range<u64> {
++        self.address..self.address + self.len
++    }
++
++    pub(crate) fn fork_clone(&self) -> Self {
++        let mut mapping = self
++            .object
++            .register_mapping(self.file_offset, self.len)
++            .expect("a live shared mapping must remain within its backing object");
++        mapping.address = self.address;
++        mapping
++    }
++
++    pub(crate) fn descriptor(&self) -> (Arc<SharedMemoryObject>, u64, u64, u64) {
++        (
++            self.object.clone(),
++            self.address,
++            self.len,
++            self.file_offset,
++        )
++    }
++}
++
++impl Drop for SharedMemoryMapping {
++    fn drop(&mut self) {
++        self.object.unregister_mapping(self.id);
++    }
++}
++
++#[derive(Debug, Default, Clone)]
++pub(crate) struct SharedMemoryFileSystem {
++    files: Arc<RwLock<HashMap<String, Arc<SharedMemoryObject>>>>,
++}
++
++impl SharedMemoryFileSystem {
++    pub(crate) fn new() -> Self {
++        Self::default()
++    }
++
++    fn name(path: &Path) -> Result<Option<String>, FsError> {
++        let mut name = None;
++        for component in path.components() {
++            match component {
++                Component::RootDir | Component::CurDir => {}
++                Component::Normal(part) if name.is_none() => {
++                    name = Some(part.to_string_lossy().into_owned());
++                }
++                _ => return Err(FsError::InvalidInput),
++            }
++        }
++        if name.as_deref() == Some("") {
++            return Err(FsError::InvalidInput);
++        }
++        Ok(name)
++    }
++
++    fn remove_named_object(&self, name: &str, expected: Option<&Arc<SharedMemoryObject>>) -> bool {
++        let mut files = self.files.write().unwrap();
++        match (files.get(name), expected) {
++            (Some(found), Some(expected)) if !Arc::ptr_eq(found, expected) => false,
++            (Some(_), _) => {
++                files.remove(name);
++                true
++            }
++            (None, _) => false,
++        }
++    }
++}
++
++impl FileOpener for SharedMemoryFileSystem {
++    fn open(
++        &self,
++        path: &Path,
++        conf: &OpenOptionsConfig,
++    ) -> virtual_fs::Result<Box<dyn VirtualFile + Send + Sync + 'static>> {
++        let name = Self::name(path)?.ok_or(FsError::NotAFile)?;
++        if !conf.read && !conf.write {
++            return Err(FsError::PermissionDenied);
++        }
++
++        let object = {
++            let mut files = self.files.write().unwrap();
++            if let Some(object) = files.get(&name) {
++                if conf.create_new {
++                    return Err(FsError::AlreadyExists);
++                }
++                object.clone()
++            } else {
++                if !conf.create && !conf.create_new {
++                    return Err(FsError::EntryNotFound);
++                }
++                let object = Arc::new(SharedMemoryObject::new()?);
++                files.insert(name.clone(), object.clone());
++                object
++            }
++        };
++
++        if conf.truncate {
++            if !conf.write {
++                return Err(FsError::PermissionDenied);
++            }
++            object.set_len(0)?;
++        }
++
++        let cursor = if conf.append { object.size() } else { 0 };
++        Ok(Box::new(SharedMemoryFileHandle {
++            object,
++            files: self.files.clone(),
++            name,
++            readable: conf.read,
++            writable: conf.write,
++            append: conf.append,
++            cursor,
++            pending_seek: None,
++        }))
++    }
++}
++
++impl FileSystem for SharedMemoryFileSystem {
++    fn readlink(&self, _path: &Path) -> virtual_fs::Result<PathBuf> {
++        Err(FsError::InvalidInput)
++    }
++
++    fn read_dir(&self, path: &Path) -> virtual_fs::Result<ReadDir> {
++        if Self::name(path)?.is_some() {
++            return Err(FsError::NotAFile);
++        }
++        let mut entries = self
++            .files
++            .read()
++            .unwrap()
++            .iter()
++            .map(|(name, object)| DirEntry {
++                path: Path::new("/").join(name),
++                metadata: Ok(object.metadata()),
++            })
++            .collect::<Vec<_>>();
++        entries.sort_by(|a, b| a.path.cmp(&b.path));
++        Ok(ReadDir::new(entries))
++    }
++
++    fn create_dir(&self, _path: &Path) -> virtual_fs::Result<()> {
++        Err(FsError::PermissionDenied)
++    }
++
++    fn remove_dir(&self, _path: &Path) -> virtual_fs::Result<()> {
++        Err(FsError::PermissionDenied)
++    }
++
++    fn rename<'a>(
++        &'a self,
++        _from: &'a Path,
++        _to: &'a Path,
++    ) -> BoxFuture<'a, virtual_fs::Result<()>> {
++        Box::pin(async { Err(FsError::Unsupported) })
++    }
++
++    fn metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
++        match Self::name(path)? {
++            None => Ok(Metadata {
++                ft: FileType::new_dir(),
++                accessed: 0,
++                created: 0,
++                modified: 0,
++                len: 0,
++            }),
++            Some(name) => self
++                .files
++                .read()
++                .unwrap()
++                .get(&name)
++                .map(|object| object.metadata())
++                .ok_or(FsError::EntryNotFound),
++        }
++    }
++
++    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<Metadata> {
++        self.metadata(path)
++    }
++
++    fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
++        let name = Self::name(path)?.ok_or(FsError::NotAFile)?;
++        if self.remove_named_object(&name, None) {
++            Ok(())
++        } else {
++            Err(FsError::EntryNotFound)
++        }
++    }
++
++    fn new_open_options(&self) -> OpenOptions<'_> {
++        OpenOptions::new(self)
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct SharedMemoryFileHandle {
++    object: Arc<SharedMemoryObject>,
++    files: Arc<RwLock<HashMap<String, Arc<SharedMemoryObject>>>>,
++    name: String,
++    readable: bool,
++    writable: bool,
++    append: bool,
++    cursor: u64,
++    pending_seek: Option<io::Result<u64>>,
++}
++
++impl SharedMemoryFileHandle {
++    pub(crate) fn object(&self) -> Arc<SharedMemoryObject> {
++        self.object.clone()
++    }
++
++    fn remove_name(&self) -> bool {
++        let mut files = self.files.write().unwrap();
++        if files
++            .get(&self.name)
++            .is_some_and(|object| Arc::ptr_eq(object, &self.object))
++        {
++            files.remove(&self.name);
++            true
++        } else {
++            false
++        }
++    }
++}
++
++impl VirtualFile for SharedMemoryFileHandle {
++    fn last_accessed(&self) -> u64 {
++        self.object.accessed.load(Ordering::Relaxed)
++    }
++
++    fn last_modified(&self) -> u64 {
++        self.object.modified.load(Ordering::Relaxed)
++    }
++
++    fn created_time(&self) -> u64 {
++        self.object.created
++    }
++
++    fn set_times(&mut self, atime: Option<u64>, mtime: Option<u64>) -> virtual_fs::Result<()> {
++        if let Some(atime) = atime {
++            self.object.accessed.store(atime, Ordering::Relaxed);
++        }
++        if let Some(mtime) = mtime {
++            self.object.modified.store(mtime, Ordering::Relaxed);
++        }
++        Ok(())
++    }
++
++    fn size(&self) -> u64 {
++        self.object.size()
++    }
++
++    fn set_len(&mut self, new_size: u64) -> virtual_fs::Result<()> {
++        if !self.writable {
++            return Err(FsError::PermissionDenied);
++        }
++        self.object.set_len(new_size)?;
++        self.cursor = self.cursor.min(new_size);
++        Ok(())
++    }
++
++    fn unlink(&mut self) -> virtual_fs::Result<()> {
++        if self.remove_name() {
++            Ok(())
++        } else {
++            Err(FsError::EntryNotFound)
++        }
++    }
++
++    fn poll_read_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
++        Poll::Ready(Ok(self.object.size().saturating_sub(self.cursor) as usize))
++    }
++
++    fn poll_write_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
++        Poll::Ready(Ok(8192))
++    }
++}
++
++impl AsyncRead for SharedMemoryFileHandle {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        use std::os::unix::fs::FileExt;
++
++        if !self.readable {
++            return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
++        }
++        let destination = buf.initialize_unfilled();
++        match self.object.file.read_at(destination, self.cursor) {
++            Ok(read) => {
++                self.cursor += read as u64;
++                self.object.accessed.store(now_nanos(), Ordering::Relaxed);
++                buf.advance(read);
++                Poll::Ready(Ok(()))
++            }
++            Err(error) => Poll::Ready(Err(error)),
++        }
++    }
++}
++
++impl AsyncWrite for SharedMemoryFileHandle {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        use std::os::unix::fs::FileExt;
++
++        if !self.writable {
++            return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
++        }
++        let object = self.object.clone();
++        let _guard = object.io_lock.lock().unwrap();
++        let offset = if self.append {
++            object.size()
++        } else {
++            self.cursor
++        };
++        match object.file.write_at(buf, offset) {
++            Ok(written) => {
++                drop(_guard);
++                self.cursor = offset + written as u64;
++                object.modified.store(now_nanos(), Ordering::Relaxed);
++                Poll::Ready(Ok(written))
++            }
++            Err(error) => Poll::Ready(Err(error)),
++        }
++    }
++
++    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++
++    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++}
++
++impl AsyncSeek for SharedMemoryFileHandle {
++    fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
++        let new_position = match position {
++            io::SeekFrom::Start(offset) => i128::from(offset),
++            io::SeekFrom::End(delta) => i128::from(self.object.size()) + i128::from(delta),
++            io::SeekFrom::Current(delta) => i128::from(self.cursor) + i128::from(delta),
++        };
++        self.pending_seek = Some(match u64::try_from(new_position) {
++            Ok(position) => {
++                self.cursor = position;
++                Ok(position)
++            }
++            Err(_) => Err(io::ErrorKind::InvalidInput.into()),
++        });
++        Ok(())
++    }
++
++    fn poll_complete(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
++        Poll::Ready(self.pending_seek.take().unwrap_or(Ok(self.cursor)))
++    }
++}
++
++impl WasiFs {
++    pub(crate) fn shared_memory_object(&self, fd: u32) -> Result<Arc<SharedMemoryObject>, Errno> {
++        let fd = self.get_fd(fd)?;
++        if !fd.inner.rights.contains(Rights::FD_READ | Rights::FD_WRITE) {
++            return Err(Errno::Access);
++        }
++        let inode = fd.inode.read();
++        let Kind::File {
++            handle: Some(handle),
++            ..
++        } = &*inode
++        else {
++            return Err(Errno::Badf);
++        };
++        let handle = handle.read().unwrap();
++        handle
++            .upcast_any_ref()
++            .downcast_ref::<SharedMemoryFileHandle>()
++            .map(SharedMemoryFileHandle::object)
++            .ok_or(Errno::Nodev)
++    }
++}
++
++pub(crate) fn install(root: &virtual_fs::MountFileSystem) {
++    root.set_mount(
++        Path::new("/dev/shm"),
++        Arc::new(SharedMemoryFileSystem::new()),
++    )
++    .expect("installing the /dev/shm filesystem should succeed");
++}
++
++fn now_nanos() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|duration| duration.as_nanos() as u64)
++        .unwrap_or(0)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn unlink_and_mapping_lifetimes_are_independent_of_the_name() {
++        let fs = SharedMemoryFileSystem::new();
++        let mut handle = fs
++            .new_open_options()
++            .read(true)
++            .write(true)
++            .create_new(true)
++            .open("/object")
++            .unwrap();
++        handle.set_len(WASM_PAGE_SIZE).unwrap();
++
++        let object = handle
++            .upcast_any_ref()
++            .downcast_ref::<SharedMemoryFileHandle>()
++            .unwrap()
++            .object();
++        let mapping = object
++            .register_mapping(0, WASM_PAGE_SIZE)
++            .expect("the complete object should be mappable");
++        assert_eq!(handle.set_len(0), Err(FsError::PermissionDenied));
++
++        handle.unlink().unwrap();
++        assert_eq!(
++            fs.metadata(Path::new("/object")),
++            Err(FsError::EntryNotFound)
++        );
++        assert_eq!(handle.size(), WASM_PAGE_SIZE);
++
++        drop(mapping);
++        handle.set_len(0).unwrap();
++    }
++
++    #[test]
++    fn wasi_root_reserves_dev_shm_for_memfd_objects() {
++        let root =
++            super::super::WasiFsRoot::from_filesystem(Arc::new(virtual_fs::TmpFileSystem::new()));
++        let mut handle = root
++            .new_open_options()
++            .read(true)
++            .write(true)
++            .create_new(true)
++            .open("/dev/shm/object")
++            .unwrap();
++        handle.set_len(WASM_PAGE_SIZE).unwrap();
++        assert!(
++            handle
++                .upcast_any_ref()
++                .downcast_ref::<SharedMemoryFileHandle>()
++                .is_some()
++        );
++    }
++
++    const WASM_PAGE_SIZE: u64 = 65_536;
++}
+diff --git a/lib/wasix/src/lib.rs b/lib/wasix/src/lib.rs
+index 29befce..2f5546e 100644
+--- a/lib/wasix/src/lib.rs
++++ b/lib/wasix/src/lib.rs
+@@ -387,9 +387,24 @@ pub fn generate_import_object_from_env(
+ 
+     imports.extend(&imports_wasi_generic);
+ 
++    // The shared-memory extension has only a 32-bit ABI: there is no wasm64
++    // sysroot to build a guest with, so a 64-bit namespace would be an
++    // untestable declaration.
++    if !matches!(version, WasiVersion::Wasix64v1) {
++        imports.register_namespace("ictrobot_shm_v1", ictrobot_shm_exports(store, ctx));
++    }
++
+     imports
+ }
+ 
++fn ictrobot_shm_exports(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
++    use syscalls::*;
++    namespace! {
++        "fd_map" => Function::new_typed_with_env(&mut store, env, fd_map32),
++        "fd_unmap" => Function::new_typed_with_env(&mut store, env, fd_unmap32),
++    }
++}
++
+ fn wasi_exports_generic(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
+     use syscalls::*;
+     let namespace = namespace! {
+@@ -818,6 +833,7 @@ fn import_object_for_all_wasi_versions(
+     let exports_wasi_snapshot_preview1 = wasi_snapshot_preview1_exports(store, env);
+     let exports_wasix_32v1 = wasix_exports_32(store, env);
+     let exports_wasix_64v1 = wasix_exports_64(store, env);
++    let exports_ictrobot_shm_v1 = ictrobot_shm_exports(store, env);
+ 
+     // Allowed due to JS feature flag complications.
+     #[allow(unused_mut)]
+@@ -827,6 +843,7 @@ fn import_object_for_all_wasi_versions(
+         "wasi_snapshot_preview1" => exports_wasi_snapshot_preview1,
+         "wasix_32v1" => exports_wasix_32v1,
+         "wasix_64v1" => exports_wasix_64v1,
++        "ictrobot_shm_v1" => exports_ictrobot_shm_v1,
+     };
+ 
+     imports
+diff --git a/lib/wasix/src/os/task/process.rs b/lib/wasix/src/os/task/process.rs
+index 4deeb12..eb62e37 100644
+--- a/lib/wasix/src/os/task/process.rs
++++ b/lib/wasix/src/os/task/process.rs
+@@ -1,4 +1,6 @@
+-use crate::{WasiEnv, WasiRuntimeError, journal::SnapshotTrigger};
++use crate::{
++    WasiEnv, WasiRuntimeError, fs::shared_memory::SharedMemoryMapping, journal::SnapshotTrigger,
++};
+ #[cfg(feature = "journal")]
+ use crate::{WasiResult, journal::JournalEffector, syscalls::do_checkpoint_from_outside, unwind};
+ use serde::{Deserialize, Serialize};
+@@ -86,6 +88,41 @@ impl std::fmt::Debug for WasiProcessId {
+ 
+ pub type LockableWasiProcessInner = Arc<(Mutex<WasiProcessInner>, Condvar)>;
+ 
++/// File-backed ranges overlaid onto a process's WebAssembly memory.
++///
++/// Read on every futex wait and wake, written only when a mapping is
++/// created, removed or inherited. The futex path checks `count` first and
++/// skips the lock while no mapping exists, so a process that never maps
++/// pays one relaxed load, and readers never queue behind the process-inner
++/// lock. Relaxed suffices: mapping identity during a concurrent map or
++/// unmap is undefined for the racing accessor.
++#[derive(Debug, Default)]
++pub(crate) struct SharedMemoryMappings {
++    count: std::sync::atomic::AtomicUsize,
++    mappings: std::sync::RwLock<Vec<SharedMemoryMapping>>,
++}
++
++impl SharedMemoryMappings {
++    pub(crate) fn is_empty(&self) -> bool {
++        self.count.load(Ordering::Relaxed) == 0
++    }
++
++    /// Run `f` with the mapping list. Check `is_empty` first on hot paths.
++    pub(crate) fn read<R>(&self, f: impl FnOnce(&[SharedMemoryMapping]) -> R) -> R {
++        f(&self.mappings.read().unwrap())
++    }
++
++    /// Run `f` with the mutable mapping list, holding the write lock for
++    /// the caller's whole update so concurrent maps and unmaps exclude
++    /// each other.
++    pub(crate) fn write<R>(&self, f: impl FnOnce(&mut Vec<SharedMemoryMapping>) -> R) -> R {
++        let mut mappings = self.mappings.write().unwrap();
++        let result = f(&mut mappings);
++        self.count.store(mappings.len(), Ordering::Relaxed);
++        result
++    }
++}
++
+ /// Represents a process running within the compute state
+ /// TODO: fields should be private and only accessed via methods.
+ #[derive(Debug, Clone)]
+@@ -111,6 +148,10 @@ pub struct WasiProcess {
+     /// the exponential backoff of CPU is halted (as in CPU
+     /// is allowed to run freely)
+     pub(crate) cpu_run_tokens: Arc<AtomicU32>,
++    /// File-backed ranges overlaid onto this process's WebAssembly memory,
++    /// outside the inner lock so the futex path never contends with thread
++    /// and signal bookkeeping.
++    pub(crate) shared_memory_mappings: Arc<SharedMemoryMappings>,
+ }
+ 
+ /// Represents a freeze of all threads to perform some action
+@@ -475,6 +516,7 @@ impl WasiProcess {
+             ),
+             waiting,
+             cpu_run_tokens: Arc::new(AtomicU32::new(0)),
++            shared_memory_mappings: Default::default(),
+         }
+     }
+ 
+diff --git a/lib/wasix/src/syscalls/ictrobot_shm.rs b/lib/wasix/src/syscalls/ictrobot_shm.rs
+new file mode 100644
+index 0000000..2f1181f
+--- /dev/null
++++ b/lib/wasix/src/syscalls/ictrobot_shm.rs
+@@ -0,0 +1,157 @@
++use super::*;
++use crate::fs::shared_memory::SharedMemoryObject;
++
++const WASM_PAGE_SIZE: u64 = 65_536;
++
++#[derive(Clone)]
++pub(crate) enum FutexOwner {
++    Process(Arc<WasiState>),
++    Shared(Arc<SharedMemoryObject>),
++}
++
++impl FutexOwner {
++    pub(crate) fn with_state<R>(&self, f: impl FnOnce(&mut state::WasiFutexState) -> R) -> R {
++        match self {
++            Self::Process(state) => f(&mut state.futexs.lock().unwrap()),
++            Self::Shared(object) => f(&mut object.futexs.lock().unwrap()),
++        }
++    }
++}
++
++pub(crate) fn futex_owner(env: &WasiEnv, address: u64) -> (FutexOwner, u64) {
++    // One relaxed load on the hot path: a process with no mappings, which
++    // is every process that never called fd_map, resolves locally without
++    // taking any lock.
++    let mappings = &env.process.shared_memory_mappings;
++    if !mappings.is_empty() {
++        let shared = mappings.read(|mappings| {
++            mappings
++                .iter()
++                .find(|mapping| {
++                    let Some(end) = address.checked_add(size_of::<u32>() as u64) else {
++                        return false;
++                    };
++                    let range = mapping.range();
++                    range.start <= address && end <= range.end
++                })
++                .map(|mapping| {
++                    (
++                        mapping.object.clone(),
++                        mapping.file_offset + (address - mapping.address),
++                    )
++                })
++        });
++        if let Some((object, offset)) = shared {
++            return (FutexOwner::Shared(object), offset);
++        }
++    }
++    (FutexOwner::Process(env.state.clone()), address)
++}
++
++pub(crate) fn fd_map32(
++    ctx: FunctionEnvMut<'_, WasiEnv>,
++    fd: u32,
++    address: u32,
++    len: u32,
++    file_offset: u64,
++) -> Errno {
++    fd_map(ctx, fd, u64::from(address), u64::from(len), file_offset)
++}
++
++fn fd_map(
++    mut ctx: FunctionEnvMut<'_, WasiEnv>,
++    fd: u32,
++    address: u64,
++    len: u64,
++    file_offset: u64,
++) -> Errno {
++    if len == 0
++        || address % WASM_PAGE_SIZE != 0
++        || len % WASM_PAGE_SIZE != 0
++        || file_offset % WASM_PAGE_SIZE != 0
++    {
++        return Errno::Inval;
++    }
++    let end = match address.checked_add(len) {
++        Some(end) => end,
++        None => return Errno::Overflow,
++    };
++
++    let (memory, object, process_mappings) = {
++        let env = ctx.data();
++        let Some(memory) = env.try_memory_clone() else {
++            return Errno::Fault;
++        };
++        let object = match env.state.fs.shared_memory_object(fd) {
++            Ok(object) => object,
++            Err(error) => return error,
++        };
++        (memory, object, env.process.shared_memory_mappings.clone())
++    };
++
++    // The write lock covers the whole update, so concurrent maps and
++    // unmaps of overlapping ranges exclude each other.
++    process_mappings.write(|mappings| {
++        if mappings.iter().any(|mapping| {
++            let range = mapping.range();
++            address < range.end && range.start < end
++        }) {
++            return Errno::Exist;
++        }
++
++        let mut mapping = match object.register_mapping(file_offset, len) {
++            Ok(mapping) => mapping,
++            Err(error) => return error,
++        };
++        let file = match object.try_clone_file() {
++            Ok(file) => file,
++            Err(error) => return error,
++        };
++        if memory
++            .overlay_shared_file(&mut ctx, address, len, &file, file_offset)
++            .is_err()
++        {
++            return Errno::Inval;
++        }
++
++        mapping.address = address;
++        mappings.push(mapping);
++        Errno::Success
++    })
++}
++
++pub(crate) fn fd_unmap32(ctx: FunctionEnvMut<'_, WasiEnv>, address: u32, len: u32) -> Errno {
++    fd_unmap(ctx, u64::from(address), u64::from(len))
++}
++
++
++fn fd_unmap(mut ctx: FunctionEnvMut<'_, WasiEnv>, address: u64, len: u64) -> Errno {
++    if len == 0 || address % WASM_PAGE_SIZE != 0 || len % WASM_PAGE_SIZE != 0 {
++        return Errno::Inval;
++    }
++
++    let (memory, process_mappings) = {
++        let env = ctx.data();
++        let Some(memory) = env.try_memory_clone() else {
++            return Errno::Fault;
++        };
++        (memory, env.process.shared_memory_mappings.clone())
++    };
++    process_mappings.write(|mappings| {
++        let Some(index) = mappings
++            .iter()
++            .position(|mapping| mapping.address == address && mapping.len == len)
++        else {
++            return Errno::Inval;
++        };
++
++        if memory
++            .restore_private_anonymous(&mut ctx, address, len)
++            .is_err()
++        {
++            return Errno::Inval;
++        }
++        mappings.swap_remove(index);
++        Errno::Success
++    })
++}
+diff --git a/lib/wasix/src/syscalls/mod.rs b/lib/wasix/src/syscalls/mod.rs
+index 90bdb31..1ae91f2 100644
+--- a/lib/wasix/src/syscalls/mod.rs
++++ b/lib/wasix/src/syscalls/mod.rs
+@@ -21,6 +21,7 @@ pub mod wasm;
+ #[cfg(target_os = "windows")]
+ pub mod windows;
+ 
++pub(crate) mod ictrobot_shm;
+ pub mod journal;
+ pub mod wasi;
+ pub mod wasix;
+@@ -65,6 +66,7 @@ use std::{io::IoSlice, marker::PhantomData, mem::MaybeUninit, task::Waker, time:
+ 
+ pub(crate) use bytes::{Bytes, BytesMut};
+ pub(crate) use cooked_waker::IntoWaker;
++pub(crate) use ictrobot_shm::*;
+ pub use journal::*;
+ pub(crate) use sha2::Sha256;
+ pub(crate) use tracing::{debug, error, trace, warn};
+diff --git a/lib/wasix/src/syscalls/wasix/futex_wait.rs b/lib/wasix/src/syscalls/wasix/futex_wait.rs
+index c9e78a9..b60a2e5 100644
+--- a/lib/wasix/src/syscalls/wasix/futex_wait.rs
++++ b/lib/wasix/src/syscalls/wasix/futex_wait.rs
+@@ -5,7 +5,7 @@ use crate::syscalls::*;
+ 
+ /// Poller returns true if its triggered and false if it times out
+ struct FutexPoller {
+-    state: Arc<WasiState>,
++    owner: FutexOwner,
+     poller_idx: u64,
+     futex_idx: u64,
+     expected: u32,
+@@ -14,24 +14,23 @@ struct FutexPoller {
+ impl Future for FutexPoller {
+     type Output = bool;
+     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+-        let mut guard = self.state.futexs.lock().unwrap();
+-
+-        // If the futex itself is no longer registered then it was likely
+-        // woken by a wake call
+-        let futex = match guard.futexes.get_mut(&self.futex_idx) {
+-            Some(f) => f,
+-            None => return Poll::Ready(true),
+-        };
+-        let waker = match futex.wakers.get_mut(&self.poller_idx) {
+-            Some(w) => w,
+-            None => return Poll::Ready(true),
+-        };
+-
+-        // Register the waker
+-        waker.replace(cx.waker().clone());
++        let ready = self.owner.with_state(|guard| {
++            // If the futex itself is no longer registered then it was likely
++            // woken by a wake call.
++            let Some(futex) = guard.futexes.get_mut(&self.futex_idx) else {
++                return true;
++            };
++            let Some(waker) = futex.wakers.get_mut(&self.poller_idx) else {
++                return true;
++            };
++            waker.replace(cx.waker().clone());
++            false
++        });
++        if ready {
++            return Poll::Ready(true);
++        }
+ 
+         // Check for timeout
+-        drop(guard);
+         if let Some(timeout) = self.timeout.as_mut() {
+             let timeout = timeout.as_mut();
+             if timeout.poll(cx).is_ready() {
+@@ -46,18 +45,18 @@ impl Future for FutexPoller {
+ }
+ impl Drop for FutexPoller {
+     fn drop(&mut self) {
+-        let mut guard = self.state.futexs.lock().unwrap();
+-
+-        let mut should_remove = false;
+-        if let Some(futex) = guard.futexes.get_mut(&self.futex_idx) {
+-            if let Some(Some(waker)) = futex.wakers.remove(&self.poller_idx) {
+-                waker.wake();
++        self.owner.with_state(|guard| {
++            let mut should_remove = false;
++            if let Some(futex) = guard.futexes.get_mut(&self.futex_idx) {
++                if let Some(Some(waker)) = futex.wakers.remove(&self.poller_idx) {
++                    waker.wake();
++                }
++                should_remove = futex.wakers.is_empty();
+             }
+-            should_remove = futex.wakers.is_empty();
+-        }
+-        if should_remove {
+-            guard.futexes.remove(&self.futex_idx);
+-        }
++            if should_remove {
++                guard.futexes.remove(&self.futex_idx);
++            }
++        });
+     }
+ }
+ 
+@@ -115,8 +114,8 @@ pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
+     };
+     Span::current().record("timeout", format!("{timeout:?}"));
+ 
+-    let state = env.state.clone();
+-    let futex_idx: u64 = futex_ptr.offset().into();
++    let pointer: u64 = futex_ptr.offset().into();
++    let (owner, futex_idx) = futex_owner(env, pointer);
+     Span::current().record("futex_idx", futex_idx);
+ 
+     // We generate a new poller which also registers in the
+@@ -125,21 +124,20 @@ pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
+     // removed whenever the wake call is invoked (which could
+     // be before the poller is polled).
+     let poller = {
+-        let mut guard = env.state.futexs.lock().unwrap();
+-        guard.poller_seed += 1;
+-        let poller_idx = guard.poller_seed;
++        let poller_idx = owner.with_state(|guard| {
++            guard.poller_seed += 1;
++            let poller_idx = guard.poller_seed;
++            let futex = guard.futexes.entry(futex_idx).or_default();
++            futex.wakers.insert(poller_idx, Default::default());
++            poller_idx
++        });
+ 
+         // Create the timeout if one exists
+         let timeout = timeout.map(|timeout| env.tasks().sleep_now(timeout));
+ 
+-        // We insert the futex before we check the condition variable to avoid
+-        // certain race conditions
+-        let futex = guard.futexes.entry(futex_idx).or_default();
+-        futex.wakers.insert(poller_idx, Default::default());
+-
+         Span::current().record("poller_idx", poller_idx);
+         FutexPoller {
+-            state: env.state.clone(),
++            owner,
+             poller_idx,
+             futex_idx,
+             expected,
+diff --git a/lib/wasix/src/syscalls/wasix/futex_wake.rs b/lib/wasix/src/syscalls/wasix/futex_wake.rs
+index ae2020d..2c150d1 100644
+--- a/lib/wasix/src/syscalls/wasix/futex_wake.rs
++++ b/lib/wasix/src/syscalls/wasix/futex_wake.rs
+@@ -18,15 +18,13 @@ pub fn futex_wake<M: MemorySize>(
+ 
+     let env = ctx.data();
+     let memory = unsafe { env.memory_view(&ctx) };
+-    let state = env.state.deref();
+-
+     let pointer: u64 = futex_ptr.offset().into();
+-    Span::current().record("futex_idx", pointer);
++    let (owner, futex_idx) = futex_owner(env, pointer);
++    Span::current().record("futex_idx", futex_idx);
+ 
+     let mut woken = false;
+-    let woken = {
+-        let mut guard = state.futexs.lock().unwrap();
+-        if let Some(futex) = guard.futexes.get_mut(&pointer) {
++    let woken = owner.with_state(|guard| {
++        if let Some(futex) = guard.futexes.get_mut(&futex_idx) {
+             let first = futex.wakers.keys().copied().next();
+             if let Some(id) = first
+                 && let Some(Some(w)) = futex.wakers.remove(&id)
+@@ -34,15 +32,15 @@ pub fn futex_wake<M: MemorySize>(
+                 w.wake();
+             }
+             if futex.wakers.is_empty() {
+-                guard.futexes.remove(&pointer);
++                guard.futexes.remove(&futex_idx);
+             }
+-            tracing::trace!("wake(hit) on {pointer}");
++            tracing::trace!("wake(hit) on {futex_idx}");
+             true
+         } else {
+-            tracing::trace!("wake(miss) on {pointer}");
++            tracing::trace!("wake(miss) on {futex_idx}");
+             true
+         }
+-    };
++    });
+     Span::current().record("woken", woken);
+ 
+     let woken = match woken {
+diff --git a/lib/wasix/src/syscalls/wasix/futex_wake_all.rs b/lib/wasix/src/syscalls/wasix/futex_wake_all.rs
+index 8a74714..c074546 100644
+--- a/lib/wasix/src/syscalls/wasix/futex_wake_all.rs
++++ b/lib/wasix/src/syscalls/wasix/futex_wake_all.rs
+@@ -16,27 +16,25 @@ pub fn futex_wake_all<M: MemorySize>(
+ 
+     let env = ctx.data();
+     let memory = unsafe { env.memory_view(&ctx) };
+-    let state = env.state.deref();
+-
+     let pointer: u64 = futex_ptr.offset().into();
++    let (owner, futex_idx) = futex_owner(env, pointer);
+     //Span::current().record("futex_idx", pointer);
+ 
+     let mut woken = false;
+-    let woken = {
+-        let mut guard = state.futexs.lock().unwrap();
+-        if let Some(futex) = guard.futexes.remove(&pointer) {
++    let woken = owner.with_state(|guard| {
++        if let Some(futex) = guard.futexes.remove(&futex_idx) {
+             for waker in futex.wakers {
+                 if let Some(waker) = waker.1 {
+                     waker.wake();
+                 }
+             }
+-            tracing::trace!("wake_all (hit) on {pointer}");
++            tracing::trace!("wake_all (hit) on {futex_idx}");
+             true
+         } else {
+-            tracing::trace!("wake_all (miss) on {pointer}");
++            tracing::trace!("wake_all (miss) on {futex_idx}");
+             true
+         }
+-    };
++    });
+     //Span::current().record("woken", woken);
+ 
+     let woken = match woken {
+diff --git a/lib/wasix/src/syscalls/wasix/proc_fork.rs b/lib/wasix/src/syscalls/wasix/proc_fork.rs
+index 1c392c5..ca2f94e 100644
+--- a/lib/wasix/src/syscalls/wasix/proc_fork.rs
++++ b/lib/wasix/src/syscalls/wasix/proc_fork.rs
+@@ -75,6 +75,17 @@ pub fn proc_fork<M: MemorySize>(
+             return Ok(Errno::Perm);
+         }
+     };
++    {
++        let mappings: Vec<_> = ctx
++            .data()
++            .process
++            .shared_memory_mappings
++            .read(|mappings| mappings.iter().map(|mapping| mapping.fork_clone()).collect());
++        child_env
++            .process
++            .shared_memory_mappings
++            .write(|child| *child = mappings);
++    }
+     let child_pid = child_env.process.pid();
+     let child_finished = child_env.process.finished.clone();
+ 
+@@ -197,6 +208,42 @@ pub fn proc_fork<M: MemorySize>(
+                 let ctx = props.ctx;
+                 let mut store = props.store;
+ 
++                // The copied memory is initially anonymous. Restore every live
++                // file overlay before the child executes guest code.
++                {
++                    let mut child_ctx = ctx.env.clone().into_mut(&mut store);
++                    let descriptors = child_ctx
++                        .data()
++                        .process
++                        .shared_memory_mappings
++                        .read(|mappings| {
++                            mappings
++                                .iter()
++                                .map(|mapping| mapping.descriptor())
++                                .collect::<Vec<_>>()
++                        });
++                    let Some(memory) = child_ctx.data().try_memory_clone() else {
++                        warn!("forked child has no memory for shared mappings");
++                        return;
++                    };
++                    for (object, address, len, file_offset) in descriptors {
++                        let Ok(file) = object.try_clone_file() else {
++                            warn!("failed to clone a shared mapping handle for forked child");
++                            return;
++                        };
++                        if let Err(error) = memory.overlay_shared_file(
++                            &mut child_ctx,
++                            address,
++                            len,
++                            &file,
++                            file_offset,
++                        ) {
++                            warn!(%error, "failed to restore a shared mapping in forked child");
++                            return;
++                        }
++                    }
++                }
++
+                 // Rewind the stack and carry on
+                 {
+                     trace!("rewinding child");

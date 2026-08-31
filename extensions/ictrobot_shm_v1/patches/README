@@ -1,0 +1,14 @@
+These patches add the ictrobot_shm_v1 import namespace to Wasmer 7.3.0.
+See wasmer/README for how it is built and applied.
+
+Copyright (c) 2026 Ethan Jones
+
+The patches are offered under either the MIT License (LICENSE-MIT) or the
+Apache License 2.0 with the LLVM exception
+(LICENSE-Apache-2.0-WITH-LLVM-exception), at your option: the licence
+Wasmer declares for its crates that contain code derived from Wasmtime. The
+Wasmtime-derived files the series modifies carry the change notice
+Apache-2.0 requires.
+
+Context lines are from upstream and remain the copyright of their authors
+under upstream's terms.

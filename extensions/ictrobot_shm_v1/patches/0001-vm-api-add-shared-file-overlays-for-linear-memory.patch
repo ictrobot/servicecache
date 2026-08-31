@@ -1,0 +1,573 @@
+Subject: vm, api: add shared file overlays for linear memory
+
+A linear memory is one private anonymous mapping, so no part of it can
+be shared with another instance: MAP_SHARED inside a guest is a
+fiction maintained by copying. Let the sys backend replace
+page-aligned ranges of a WasmMmap with MAP_FIXED|MAP_SHARED file
+mappings and later restore them to fresh private anonymous pages,
+exposed as overlay_shared_file and restore_private_anonymous on
+Memory. The caller keeps the range unaccessed while it is replaced;
+the overlay otherwise behaves as ordinary memory, with the file
+providing the shared identity. A grow that would have to move the
+allocation fails while any overlay exists: moving would silently turn
+the shared pages into private copies.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index a72232c..7a39208 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7916,6 +7916,7 @@ dependencies = [
+  "rustversion",
+  "scopeguard",
+  "serde",
++ "tempfile",
+  "thiserror 2.0.20",
+  "tracing",
+  "wasmer-types",
+diff --git a/lib/api/src/backend/sys/entities/memory/mod.rs b/lib/api/src/backend/sys/entities/memory/mod.rs
+index 1820f8b..b0e1528 100644
+--- a/lib/api/src/backend/sys/entities/memory/mod.rs
++++ b/lib/api/src/backend/sys/entities/memory/mod.rs
+@@ -92,6 +92,30 @@ impl Memory {
+         Ok(())
+     }
+ 
++    pub(crate) fn overlay_shared_file(
++        &self,
++        store: &mut impl AsStoreMut,
++        start: u64,
++        len: u64,
++        file: &std::fs::File,
++        file_offset: u64,
++    ) -> Result<(), MemoryError> {
++        self.handle
++            .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
++            .overlay_shared_file(start, len, file, file_offset)
++    }
++
++    pub(crate) fn restore_private_anonymous(
++        &self,
++        store: &mut impl AsStoreMut,
++        start: u64,
++        len: u64,
++    ) -> Result<(), MemoryError> {
++        self.handle
++            .get_mut(store.as_store_mut().objects_mut().as_sys_mut())
++            .restore_private_anonymous(start, len)
++    }
++
+     pub(crate) fn from_vm_extern(store: &impl AsStoreRef, vm_extern: VMExternMemory) -> Self {
+         Self {
+             handle: unsafe {
+diff --git a/lib/api/src/entities/memory/inner.rs b/lib/api/src/entities/memory/inner.rs
+index 361f00a..c8f1b83 100644
+--- a/lib/api/src/entities/memory/inner.rs
++++ b/lib/api/src/entities/memory/inner.rs
+@@ -170,6 +170,50 @@ impl BackendMemory {
+         })
+     }
+ 
++    /// Replace a range of this memory with a shared file mapping.
++    pub fn overlay_shared_file(
++        &self,
++        store: &mut impl AsStoreMut,
++        start: u64,
++        len: u64,
++        file: &std::fs::File,
++        file_offset: u64,
++    ) -> Result<(), MemoryError> {
++        match self {
++            #[cfg(feature = "sys")]
++            Self::Sys(memory) => memory.overlay_shared_file(store, start, len, file, file_offset),
++            #[cfg(feature = "v8")]
++            Self::V8(_) => Err(MemoryError::UnsupportedOperation {
++                message: "shared file overlays require the sys backend".into(),
++            }),
++            #[cfg(feature = "js")]
++            Self::Js(_) => Err(MemoryError::UnsupportedOperation {
++                message: "shared file overlays require the sys backend".into(),
++            }),
++        }
++    }
++
++    /// Replace a shared file overlay with fresh private anonymous pages.
++    pub fn restore_private_anonymous(
++        &self,
++        store: &mut impl AsStoreMut,
++        start: u64,
++        len: u64,
++    ) -> Result<(), MemoryError> {
++        match self {
++            #[cfg(feature = "sys")]
++            Self::Sys(memory) => memory.restore_private_anonymous(store, start, len),
++            #[cfg(feature = "v8")]
++            Self::V8(_) => Err(MemoryError::UnsupportedOperation {
++                message: "shared file overlays require the sys backend".into(),
++            }),
++            #[cfg(feature = "js")]
++            Self::Js(_) => Err(MemoryError::UnsupportedOperation {
++                message: "shared file overlays require the sys backend".into(),
++            }),
++        }
++    }
++
+     /// Attempts to duplicate this memory in a new store with a byte-for-byte copy
+     #[inline]
+     #[deprecated(
+diff --git a/lib/api/src/entities/memory/mod.rs b/lib/api/src/entities/memory/mod.rs
+index 2b7e37c..b375792 100644
+--- a/lib/api/src/entities/memory/mod.rs
++++ b/lib/api/src/entities/memory/mod.rs
+@@ -161,6 +161,34 @@ impl Memory {
+         self.0.reset(store)
+     }
+ 
++    /// Replace a page-aligned range of this memory with a shared file mapping.
++    ///
++    /// This low-level operation is intended for runtimes that expose explicit
++    /// shared-mapping host imports. It is currently supported by the sys backend.
++    #[doc(hidden)]
++    pub fn overlay_shared_file(
++        &self,
++        store: &mut impl AsStoreMut,
++        start: u64,
++        len: u64,
++        file: &std::fs::File,
++        file_offset: u64,
++    ) -> Result<(), MemoryError> {
++        self.0
++            .overlay_shared_file(store, start, len, file, file_offset)
++    }
++
++    /// Replace a page-aligned shared file overlay with private anonymous pages.
++    #[doc(hidden)]
++    pub fn restore_private_anonymous(
++        &self,
++        store: &mut impl AsStoreMut,
++        start: u64,
++        len: u64,
++    ) -> Result<(), MemoryError> {
++        self.0.restore_private_anonymous(store, start, len)
++    }
++
+     /// Attempts to duplicate this memory in a new store with a byte-for-byte copy
+     ///
+     /// Since Wasmer 8.0, this function can no longer be used for stores
+diff --git a/lib/vm/Cargo.toml b/lib/vm/Cargo.toml
+index 89894b1..abefc9e 100644
+--- a/lib/vm/Cargo.toml
++++ b/lib/vm/Cargo.toml
+@@ -53,6 +53,9 @@ windows-sys = { workspace = true, features = [
+ cc.workspace = true
+ rustversion.workspace = true
+ 
++[dev-dependencies]
++tempfile.workspace = true
++
+ [badges]
+ maintenance = { status = "actively-developed" }
+ 
+diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
+index de28f44..2a9d1b8 100644
+--- a/lib/vm/src/memory.rs
++++ b/lib/vm/src/memory.rs
+@@ -1,5 +1,7 @@
+ // This file contains code from external sources.
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
++//
++// Modified to add the ictrobot_shm_v1 extension for shared memory.
+ 
+ //! Memory management for linear memories.
+ //!
+@@ -96,6 +98,11 @@ impl WasmMmap {
+         if new_bytes > self.alloc.len() - conf.offset_guard_size {
+             // If the new size is within the declared maximum, but needs more memory than we
+             // have on hand, it's a dynamic heap and it can move.
++            if self.alloc.has_overlays() {
++                return Err(MemoryError::Region(
++                    "cannot move a linear memory that holds shared file overlays".into(),
++                ));
++            }
+             let guard_bytes = conf.offset_guard_size;
+             let request_bytes =
+                 new_bytes
+@@ -158,6 +165,48 @@ impl WasmMmap {
+         Ok(())
+     }
+ 
++    fn overlay_shared_file(
++        &mut self,
++        start: u64,
++        len: u64,
++        file: &std::fs::File,
++        file_offset: u64,
++    ) -> Result<(), MemoryError> {
++        let start = usize::try_from(start)
++            .map_err(|_| MemoryError::Region("shared mapping address is too large".into()))?;
++        let len = usize::try_from(len)
++            .map_err(|_| MemoryError::Region("shared mapping length is too large".into()))?;
++        let end = start
++            .checked_add(len)
++            .ok_or_else(|| MemoryError::Region("shared mapping range overflows".into()))?;
++        if end > self.size().bytes().0 {
++            return Err(MemoryError::Region(
++                "shared mapping range is outside the WebAssembly memory".into(),
++            ));
++        }
++        self.alloc
++            .overlay_shared_file(start, len, file, file_offset)
++            .map_err(MemoryError::Region)
++    }
++
++    fn restore_private_anonymous(&mut self, start: u64, len: u64) -> Result<(), MemoryError> {
++        let start = usize::try_from(start)
++            .map_err(|_| MemoryError::Region("shared mapping address is too large".into()))?;
++        let len = usize::try_from(len)
++            .map_err(|_| MemoryError::Region("shared mapping length is too large".into()))?;
++        let end = start
++            .checked_add(len)
++            .ok_or_else(|| MemoryError::Region("shared mapping range overflows".into()))?;
++        if end > self.size().bytes().0 {
++            return Err(MemoryError::Region(
++                "shared mapping range is outside the WebAssembly memory".into(),
++            ));
++        }
++        self.alloc
++            .restore_private_anonymous(start, len)
++            .map_err(MemoryError::Region)
++    }
++
+     /// Copies the memory
+     /// (in this case it performs a copy-on-write to save memory)
+     pub fn copy(&self) -> Result<Self, MemoryError> {
+@@ -457,6 +506,20 @@ impl LinearMemory for VMOwnedMemory {
+     fn as_shared(&self) -> Result<VMSharedMemory, MemoryError> {
+         Err(MemoryError::MemoryNotShared)
+     }
++
++    fn overlay_shared_file(
++        &mut self,
++        start: u64,
++        len: u64,
++        file: &std::fs::File,
++        file_offset: u64,
++    ) -> Result<(), MemoryError> {
++        self.mmap.overlay_shared_file(start, len, file, file_offset)
++    }
++
++    fn restore_private_anonymous(&mut self, start: u64, len: u64) -> Result<(), MemoryError> {
++        self.mmap.restore_private_anonymous(start, len)
++    }
+ }
+ 
+ /// A shared linear memory instance.
+@@ -548,6 +611,28 @@ impl VMSharedMemory {
+             conditions: ThreadConditions::new(),
+         })
+     }
++
++    /// Replace a range of this memory with a shared file mapping.
++    pub fn overlay_shared_file(
++        &self,
++        start: u64,
++        len: u64,
++        file: &std::fs::File,
++        file_offset: u64,
++    ) -> Result<(), MemoryError> {
++        self.mmap
++            .write()
++            .unwrap()
++            .overlay_shared_file(start, len, file, file_offset)
++    }
++
++    /// Replace a shared file overlay with fresh private anonymous pages.
++    pub fn restore_private_anonymous(&self, start: u64, len: u64) -> Result<(), MemoryError> {
++        self.mmap
++            .write()
++            .unwrap()
++            .restore_private_anonymous(start, len)
++    }
+ }
+ 
+ impl LinearMemory for VMSharedMemory {
+@@ -616,6 +701,20 @@ impl LinearMemory for VMSharedMemory {
+         Ok(self.clone())
+     }
+ 
++    fn overlay_shared_file(
++        &mut self,
++        start: u64,
++        len: u64,
++        file: &std::fs::File,
++        file_offset: u64,
++    ) -> Result<(), MemoryError> {
++        VMSharedMemory::overlay_shared_file(self, start, len, file, file_offset)
++    }
++
++    fn restore_private_anonymous(&mut self, start: u64, len: u64) -> Result<(), MemoryError> {
++        VMSharedMemory::restore_private_anonymous(self, start, len)
++    }
++
+     // Add current thread to waiter list
+     unsafe fn do_wait(
+         &mut self,
+@@ -722,6 +821,20 @@ impl LinearMemory for VMMemory {
+         self.0.as_shared()
+     }
+ 
++    fn overlay_shared_file(
++        &mut self,
++        start: u64,
++        len: u64,
++        file: &std::fs::File,
++        file_offset: u64,
++    ) -> Result<(), MemoryError> {
++        self.0.overlay_shared_file(start, len, file, file_offset)
++    }
++
++    fn restore_private_anonymous(&mut self, start: u64, len: u64) -> Result<(), MemoryError> {
++        self.0.restore_private_anonymous(start, len)
++    }
++
+     // Add current thread to waiter list
+     unsafe fn do_wait(
+         &mut self,
+@@ -890,6 +1003,26 @@ where
+         Err(MemoryError::MemoryNotShared)
+     }
+ 
++    /// Replace a range of this memory with a shared file mapping.
++    fn overlay_shared_file(
++        &mut self,
++        _start: u64,
++        _len: u64,
++        _file: &std::fs::File,
++        _file_offset: u64,
++    ) -> Result<(), MemoryError> {
++        Err(MemoryError::UnsupportedOperation {
++            message: "shared file overlays are not supported".into(),
++        })
++    }
++
++    /// Replace a shared file overlay with fresh private anonymous pages.
++    fn restore_private_anonymous(&mut self, _start: u64, _len: u64) -> Result<(), MemoryError> {
++        Err(MemoryError::UnsupportedOperation {
++            message: "shared file overlays are not supported".into(),
++        })
++    }
++
+     /// Add current thread to the waiter hash, and wait until notified or timeout.
+     /// Return 0 if the waiter has been notified, 1 if there was a value mismatch,
+     /// or 2 if the timeout occurred.
+diff --git a/lib/vm/src/mmap.rs b/lib/vm/src/mmap.rs
+index b875e60..cb7e205 100644
+--- a/lib/vm/src/mmap.rs
++++ b/lib/vm/src/mmap.rs
+@@ -1,5 +1,7 @@
+ // This file contains code from external sources.
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
++//
++// Modified to add the ictrobot_shm_v1 extension for shared memory.
+ 
+ //! Low-level abstraction for allocating and managing zero-filled pages
+ //! of memory.
+@@ -22,6 +24,11 @@ pub struct Mmap {
+     accessible_size: usize,
+     #[cfg_attr(target_os = "windows", allow(dead_code))]
+     sync_on_drop: bool,
++    /// Number of live shared file overlays inside this allocation. A grow
++    /// that would move the allocation must fail while any exist: moving
++    /// would silently turn the shared pages into private copies.
++    #[cfg_attr(target_os = "windows", allow(dead_code))]
++    overlay_count: usize,
+ }
+ 
+ /// The type of mmap to create
+@@ -46,6 +53,7 @@ impl Mmap {
+             total_size: 0,
+             accessible_size: 0,
+             sync_on_drop: false,
++            overlay_count: 0,
+         }
+     }
+ 
+@@ -145,6 +153,7 @@ impl Mmap {
+                 total_size: mapping_size,
+                 accessible_size,
+                 sync_on_drop: memory_fd != -1 && memory_type == MmapType::Shared,
++                overlay_count: 0,
+             }
+         } else {
+             // Reserve the mapping size.
+@@ -167,6 +176,7 @@ impl Mmap {
+                 total_size: mapping_size,
+                 accessible_size,
+                 sync_on_drop: memory_fd != -1 && memory_type == MmapType::Shared,
++                overlay_count: 0,
+             };
+ 
+             if accessible_size != 0 {
+@@ -222,6 +232,7 @@ impl Mmap {
+                 total_size: mapping_size,
+                 accessible_size,
+                 sync_on_drop: false,
++                overlay_count: 0,
+             }
+         } else {
+             // Reserve the mapping size.
+@@ -236,6 +247,7 @@ impl Mmap {
+                 total_size: mapping_size,
+                 accessible_size,
+                 sync_on_drop: false,
++                overlay_count: 0,
+             };
+ 
+             if accessible_size != 0 {
+@@ -295,6 +307,115 @@ impl Mmap {
+         Ok(())
+     }
+ 
++    /// Replace a range of this allocation with a shared file mapping.
++    ///
++    /// The caller must ensure that the range is not concurrently accessed while
++    /// the mapping is being replaced.
++    #[cfg(not(target_os = "windows"))]
++    pub fn overlay_shared_file(
++        &mut self,
++        start: usize,
++        len: usize,
++        file: &std::fs::File,
++        file_offset: u64,
++    ) -> Result<(), String> {
++        use std::os::fd::AsRawFd;
++
++        self.validate_overlay_range(start, len, file_offset)?;
++        let file_offset = libc::off_t::try_from(file_offset)
++            .map_err(|_| "shared mapping file offset does not fit off_t".to_string())?;
++        let address = unsafe { (self.ptr as *mut u8).add(start) };
++        let mapped = unsafe {
++            libc::mmap(
++                address.cast(),
++                len,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_FIXED | libc::MAP_SHARED,
++                file.as_raw_fd(),
++                file_offset,
++            )
++        };
++        if mapped == libc::MAP_FAILED {
++            return Err(io::Error::last_os_error().to_string());
++        }
++        debug_assert_eq!(mapped, address.cast());
++        self.overlay_count += 1;
++        Ok(())
++    }
++
++    /// Whether any shared file overlay is live inside this allocation.
++    pub fn has_overlays(&self) -> bool {
++        self.overlay_count > 0
++    }
++
++    /// Replace a range of this allocation with fresh private anonymous pages.
++    ///
++    /// The caller must ensure that the range is not concurrently accessed while
++    /// the mapping is being replaced.
++    #[cfg(not(target_os = "windows"))]
++    pub fn restore_private_anonymous(&mut self, start: usize, len: usize) -> Result<(), String> {
++        self.validate_overlay_range(start, len, 0)?;
++        let address = unsafe { (self.ptr as *mut u8).add(start) };
++        let mapped = unsafe {
++            libc::mmap(
++                address.cast(),
++                len,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
++                -1,
++                0,
++            )
++        };
++        if mapped == libc::MAP_FAILED {
++            return Err(io::Error::last_os_error().to_string());
++        }
++        debug_assert_eq!(mapped, address.cast());
++        self.overlay_count = self.overlay_count.saturating_sub(1);
++        Ok(())
++    }
++
++    #[cfg(not(target_os = "windows"))]
++    fn validate_overlay_range(
++        &self,
++        start: usize,
++        len: usize,
++        file_offset: u64,
++    ) -> Result<(), String> {
++        let page_size = region::page::size();
++        if len == 0 {
++            return Err("shared mapping length must not be zero".to_string());
++        }
++        if start % page_size != 0 || len % page_size != 0 {
++            return Err("shared mapping range is not host-page aligned".to_string());
++        }
++        if file_offset % page_size as u64 != 0 {
++            return Err("shared mapping file offset is not host-page aligned".to_string());
++        }
++        let end = start
++            .checked_add(len)
++            .ok_or_else(|| "shared mapping range overflows".to_string())?;
++        if end > self.total_size {
++            return Err("shared mapping range is outside the allocation".to_string());
++        }
++        Ok(())
++    }
++
++    #[cfg(target_os = "windows")]
++    pub fn overlay_shared_file(
++        &mut self,
++        _start: usize,
++        _len: usize,
++        _file: &std::fs::File,
++        _file_offset: u64,
++    ) -> Result<(), String> {
++        Err("shared file overlays are not supported on Windows".to_string())
++    }
++
++    #[cfg(target_os = "windows")]
++    pub fn restore_private_anonymous(&mut self, _start: usize, _len: usize) -> Result<(), String> {
++        Err("shared file overlays are not supported on Windows".to_string())
++    }
++
+     /// Return the allocated memory as a slice of u8.
+     pub fn as_slice(&self) -> &[u8] {
+         unsafe { slice::from_raw_parts(self.ptr as *const u8, self.total_size) }
+@@ -404,3 +525,31 @@ fn _assert() {
+     fn _assert_send_sync<T: Send + Sync>() {}
+     _assert_send_sync::<Mmap>();
+ }
++
++#[cfg(all(test, not(target_os = "windows")))]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::FileExt;
++
++    #[test]
++    fn shared_file_overlay_is_visible_between_allocations() {
++        let page_size = region::page::size();
++        let file = tempfile::tempfile().unwrap();
++        file.set_len(page_size as u64).unwrap();
++        file.write_all_at(&[7], 0).unwrap();
++
++        let mut first = Mmap::with_at_least(page_size).unwrap();
++        let mut second = Mmap::with_at_least(page_size).unwrap();
++        first.overlay_shared_file(0, page_size, &file, 0).unwrap();
++        second.overlay_shared_file(0, page_size, &file, 0).unwrap();
++
++        assert_eq!(first.as_slice()[0], 7);
++        first.as_mut_slice()[1] = 42;
++        assert_eq!(second.as_slice()[1], 42);
++
++        first.restore_private_anonymous(0, page_size).unwrap();
++        assert_eq!(first.as_slice()[0], 0);
++        second.as_mut_slice()[0] = 99;
++        assert_eq!(first.as_slice()[0], 0);
++    }
++}

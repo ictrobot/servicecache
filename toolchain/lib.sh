@@ -27,6 +27,10 @@ sc_init() {
     return 1
   fi
 
+  # Only the version's own declaration counts: an inherited value would
+  # silently change the CLI below and the assembly gate.
+  unset SC_GUEST_EXTENSIONS
+
   source "$SC_VERSION_DIR/version.env"
   if [[ -f "$SC_SERVICE_DIR/versions.sh" ]]; then
     source "$SC_SERVICE_DIR/versions.sh"
@@ -34,7 +38,17 @@ sc_init() {
   source "$SC_TOOLCHAIN/versions.sh"
   source "$SC_TOOLCHAIN/env.sh"
 
-  export SC_SERVICE SC_VERSION SC_ROOT SC_WORK SC_TOOLCHAIN
+  # The Wasmer CLI this package's modules run under, picked up by
+  # run-wasix.sh for smoke tests and build-time execution: stock, or the
+  # extensions variant when the version declares SC_GUEST_EXTENSIONS.
+  SC_WASMER="$SC_WORK/wasmer/stock/bin/wasmer"
+  if [[ -n "${SC_GUEST_EXTENSIONS:-}" ]]; then
+    SC_WASMER="$SC_WORK/wasmer/extensions/bin/wasmer"
+    echo "$SC_SERVICE $SC_VERSION: extensions $SC_GUEST_EXTENSIONS," \
+      "modules run under ${SC_WASMER#"$SC_ROOT/"}" >&2
+  fi
+
+  export SC_SERVICE SC_VERSION SC_ROOT SC_WORK SC_TOOLCHAIN SC_WASMER
   export SC_SERVICE_DIR SC_VERSION_DIR SC_SRC SC_BUILD SC_OUT
 }
 
@@ -193,7 +207,83 @@ sc_assemble() {
     cp -a "$artifact" "$SC_OUT_DIR/"
   done
   sed "s/{version}/$SC_VERSION/g" "$manifest" > "$SC_OUT_DIR/service.toml"
+  sc_check_guest_imports "$SC_OUT_DIR" || return 1
   export SC_OUT_DIR
+}
+
+# Baseline WASIX import namespaces: what a plain WASIX program references.
+SC_BASELINE_IMPORTS="env wasi wasi_snapshot_preview1 wasix_32v1"
+
+# SC_GUEST_EXTENSIONS, from the version's version.env, enables extensions
+# for a package: space-separated import namespaces its modules may
+# reference beyond the baseline, each specified in extensions/<name>/ and
+# listed under `extensions` in service.toml.
+#
+# The manifest may list more than the built modules import, never less: it is
+# the allowance for every module the service loads, including ones it does not
+# name. Checked here at assembly — the stock Wasmer CLI reads each module's
+# import section — and recorded in BUILD-INFO.
+#
+# Only import extensions in permissively licensed modules (ARCHITECTURE.md,
+# Extensions); never set the variable to clear an import-check failure.
+sc_check_guest_imports() {
+  local out_dir="$1"
+  local wasmer="$SC_ROOT/work/wasmer/stock/bin/wasmer"
+  if [[ ! -x "$wasmer" ]]; then
+    sc_fail "stock Wasmer is required to check guest imports: run make wasmer-stock"
+    return 1
+  fi
+
+  local allowed=" $SC_BASELINE_IMPORTS " declared=" " line namespace
+  for namespace in ${SC_GUEST_EXTENSIONS:-}; do
+    allowed+="$namespace "
+    declared+="$namespace "
+  done
+
+  local manifest_exts=" "
+  line="$(grep -E '^extensions *= *\[' "$out_dir/service.toml" || true)"
+  if [[ -n "$line" ]]; then
+    while IFS= read -r namespace; do
+      manifest_exts+="$namespace "
+    done < <(grep -oE '"[^"]+"' <<< "$line" | tr -d '"')
+  fi
+  # The two declarations must name the same namespaces: a manifest entry
+  # SC_GUEST_EXTENSIONS does not declare would have the host register a
+  # namespace the package never built or smoke-tested against.
+  local ok=1
+  for namespace in $declared; do
+    [[ "$manifest_exts" == *" $namespace "* ]] || {
+      sc_fail "SC_GUEST_EXTENSIONS declares $namespace but service.toml has no matching extensions entry"
+      ok=0
+    }
+  done
+  for namespace in $manifest_exts; do
+    [[ "$declared" == *" $namespace "* ]] || {
+      sc_fail "service.toml lists extension $namespace but SC_GUEST_EXTENSIONS does not declare it"
+      ok=0
+    }
+  done
+  [[ $ok -eq 1 ]] || return 1
+
+  # Every file in the package with the WebAssembly magic is checked,
+  # wherever it sits and whatever its name: assembly may ship a module
+  # under a second name, or in a subdirectory, for a guest that executes
+  # it by path. Symlinks are followed, so a linked module is checked too.
+  local module namespaces bad=0
+  while IFS= read -r -d '' module; do
+    [[ "$(head -c 4 "$module" | od -An -tx1 | tr -d ' \n')" == "0061736d" ]] || continue
+    namespaces="$("$wasmer" inspect "$module" | sed -n 's/^ *"\([^"]*\)"\..*/\1/p' | sort -u)" || {
+      sc_fail "could not inspect ${module#"$out_dir"/}"
+      return 1
+    }
+    for namespace in $namespaces; do
+      if [[ "$allowed" != *" $namespace "* ]]; then
+        sc_fail "${module#"$out_dir"/} imports namespace $namespace, outside the WASIX baseline and SC_GUEST_EXTENSIONS (see SC_BASELINE_IMPORTS in toolchain/lib.sh)"
+        bad=1
+      fi
+    done
+  done < <(find -L "$out_dir" -type f -print0)
+  [[ $bad -eq 0 ]]
 }
 
 # The content hash of the patch series the sysroot's libc carries
@@ -226,5 +316,6 @@ sc_write_build_info() {
     echo "WASIX LLVM: $WASIX_LLVM_TAG"
     echo "Binaryen: $BINARYEN_TAG"
     echo "Wasmer: $WASMER_VERSION"
+    echo "Guest extensions: ${SC_GUEST_EXTENSIONS:-none}"
   } > "$out_dir/BUILD-INFO"
 }

@@ -6,19 +6,27 @@ work/wasmer/<variant>/bin/wasmer, mirroring how services are laid out.
 Every variant builds only the Cranelift compiler backend; ServiceCache does
 not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
 
-- stock: no patches. Every guest must run under it unchanged, and it is
-  the unpatched baseline for test.sh.
+- stock: no patches. A guest with no extension declaration must run under
+  it unchanged, and it is the unpatched baseline for test.sh.
 
 - fixes: fixes to upstream Wasmer that are not specific to ServiceCache.
 
+- extensions: the import namespaces a guest can opt into — currently
+  ictrobot_shm_v1, cross-instance shared memory — with none of the host
+  machinery. It applies the fixes set and then every extension's set, so
+  an extension guest runs standalone, needing nothing from the servicecache
+  set. Each extension lives whole in extensions/<name>/ at the repository root:
+  its specification, guest header, demo, smoke test and its own patch set.
+  A package that declares extensions builds and smoke-tests under this CLI.
+
 - servicecache: the runtime the host embeds ([patch.crates-io] in Cargo.toml
-  points at its checkout). It applies the fixes set and then its own, which
-  makes a guest coroutine suspend on a blocking host wait instead of parking
-  its OS thread, lets guest threads be resurrected on fresh threads in a forked
-  child, rebuilds the selector after a fork, replaces a clone's listening
-  socket, and keeps host I/O from going through a runtime handle captured at
-  construction. Suspension is off unless the host enables it; the I/O changes
-  apply always.
+  points at its checkout). It applies the fixes and extensions sets and then
+  its own, which makes a guest coroutine suspend on a blocking host wait
+  instead of parking its OS thread, lets guest threads be resurrected on fresh
+  threads in a forked child, rebuilds the selector after a fork, replaces a
+  clone's listening socket, and keeps host I/O from going through a runtime
+  handle captured at construction. Suspension is off unless the host enables
+  it; the I/O changes apply always.
 
 build.sh <variant> builds and installs a variant's CLI; setup.sh <variant>
 only prepares its checkout; test.sh <variant> runs the unit tests of the

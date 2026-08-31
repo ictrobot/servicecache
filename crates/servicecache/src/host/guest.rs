@@ -54,6 +54,9 @@ pub struct GuestRuntime {
     networking: Arc<HostNetworking>,
     cache: ModuleCache,
     modules: Mutex<HashMap<PathBuf, Module>>,
+    /// The extension namespaces the manifest declares: the only ones the
+    /// runtime registers for this service's guests.
+    extensions: std::collections::BTreeSet<String>,
 }
 
 impl GuestRuntime {
@@ -68,6 +71,7 @@ impl GuestRuntime {
         mounts: &[ReadOnlyMount],
         networking: Arc<HostNetworking>,
         cache: ModuleCache,
+        extensions: impl IntoIterator<Item = String>,
     ) -> Result<Self> {
         let fs = read_only_mounts(mounts, &tasks.handle())?;
         Ok(Self {
@@ -77,6 +81,7 @@ impl GuestRuntime {
             networking,
             cache,
             modules: Mutex::new(HashMap::new()),
+            extensions: extensions.into_iter().collect(),
         })
     }
 
@@ -166,6 +171,11 @@ impl GuestRuntime {
             .capabilities_mut()
             .threading
             .enable_asynchronous_threading = false;
+        // Only the namespaces the manifest declares exist for this guest:
+        // a module importing anything else fails to instantiate, exactly
+        // as it would under stock Wasmer. Children inherit the setting
+        // with the capabilities.
+        builder.capabilities_mut().extensions = Some(self.extensions.clone());
 
         let env = builder
             .build()

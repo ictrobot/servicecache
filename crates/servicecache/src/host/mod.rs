@@ -245,7 +245,13 @@ impl Host {
                     .collect()
             })
             .unwrap_or_default();
-        let guests = GuestRuntime::new(tasks.clone(), &mounts, networking.clone(), cache)?;
+        let guests = GuestRuntime::new(
+            tasks.clone(),
+            &mounts,
+            networking.clone(),
+            cache,
+            manifest.service.extensions.iter().cloned(),
+        )?;
 
         Ok(Self {
             manifest,

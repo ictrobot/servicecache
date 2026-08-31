@@ -25,12 +25,13 @@ index 52770bf..6054d8f 100644
  pub use crate::mmap::{Mmap, MmapType};
  pub use crate::probestack::PROBESTACK;
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index de28f44..9332064 100644
+index 2a9d1b8..ff6c15b 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
-@@ -1,5 +1,9 @@
- // This file contains code from external sources.
+@@ -2,6 +2,10 @@
  // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
+ //
+ // Modified to add the ictrobot_shm_v1 extension for shared memory.
 +//
 +// Modified for ServiceCache: every linear memory is
 +// registered while it lives, so that an embedder can find its mapping
@@ -38,7 +39,7 @@ index de28f44..9332064 100644
  
  //! Memory management for linear memories.
  //!
-@@ -19,10 +23,82 @@ use std::cell::UnsafeCell;
+@@ -21,10 +25,82 @@ use std::cell::UnsafeCell;
  use std::convert::TryInto;
  use std::ptr::NonNull;
  use std::slice;
@@ -122,7 +123,7 @@ index de28f44..9332064 100644
  // The memory mapped area
  #[derive(Debug)]
  struct WasmMmap {
-@@ -167,7 +243,7 @@ impl WasmMmap {
+@@ -216,7 +292,7 @@ impl WasmMmap {
              .copy(Some(mem_length))
              .map_err(MemoryError::Generic)?;
          let base_ptr = alloc.as_mut_ptr();
@@ -131,7 +132,7 @@ index de28f44..9332064 100644
              vm_memory_definition: MaybeInstanceOwned::Host(Box::new(UnsafeCell::new(
                  VMMemoryDefinition {
                      base: base_ptr,
-@@ -176,7 +252,16 @@ impl WasmMmap {
+@@ -225,7 +301,16 @@ impl WasmMmap {
              ))),
              alloc,
              size: self.size,
@@ -149,7 +150,7 @@ index de28f44..9332064 100644
      }
  }
  
-@@ -340,6 +425,7 @@ impl VMOwnedMemory {
+@@ -389,6 +474,7 @@ impl VMOwnedMemory {
              let mapped_pages = memory.minimum;
              let mapped_bytes = mapped_pages.bytes();
  
@@ -157,7 +158,7 @@ index de28f44..9332064 100644
              let mut alloc =
                  Mmap::accessible_reserved(mapped_bytes.0, request_bytes, backing_file, memory_type)
                      .map_err(MemoryError::Region)?;
-@@ -368,6 +454,7 @@ impl VMOwnedMemory {
+@@ -417,6 +503,7 @@ impl VMOwnedMemory {
                  alloc,
                  size: Bytes::from(mem_length).try_into().unwrap(),
              };
