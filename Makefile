@@ -8,7 +8,8 @@ SERVICE_TARGETS := $(foreach file,$(SERVICE_VERSION_FILES),service-$(word 2,$(su
 SMOKE_SERVICE_TARGETS := $(addprefix smoke-,$(SERVICE_TARGETS))
 CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
 PURGE_SERVICE_TARGETS := $(addprefix purge-,$(SERVICE_TARGETS))
-RUN_SERVICE_TARGETS := $(addprefix run-,$(SERVICE_TARGETS))
+RUN_TARGETS := $(patsubst service-%,run-%,$(SERVICE_TARGETS))
+REQUEST_TARGETS := $(patsubst service-%,request-%,$(SERVICE_TARGETS))
 LIFECYCLE_SERVICE_TARGETS := $(addprefix lifecycle-,$(SERVICE_TARGETS))
 # Per-name aggregates that fan out to every installed version of a service.
 SERVICE_NAMES := $(sort $(foreach file,$(SERVICE_VERSION_FILES),$(word 2,$(subst /, ,$(file)))))
@@ -16,7 +17,7 @@ SERVICE_NAME_TARGETS := $(foreach verb,service smoke-service clean-service purge
 
 .PHONY: help bootstrap setup-wasmer build test lint check serve services services-list smoke smoke-toolchain smoke-services lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
-.PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_SERVICE_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
+.PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
 .PHONY: $(SERVICE_NAME_TARGETS)
 
 help:
@@ -38,7 +39,8 @@ help:
 	@echo "lifecycle-service-<name>-<version> build if needed, then run its quick lifecycle trials"
 	@echo "serve                           serve the manager's HTTP API for services under work/services (--socket/SERVICECACHE_SOCKET overrides the socket)"
 	@echo "services-list                   list services assembled under work/services"
-	@echo "run-service-<name>-<version>    run one service through a host and print its endpoint; RECIPE=<file> feeds the initializer, CLONES=<n> forks clones on Enter"
+	@echo "run-<name>-<version>            run one service through a host and print its endpoint; RECIPE=<file> feeds the initializer, CLONES=<n> forks clones on Enter"
+	@echo "request-<name>-<version>        request an instance from the running manager; RECIPE=<file> feeds the initializer"
 	@echo "check                           lint, test and smoke-toolchain"
 	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
 	@echo "clean-services                  remove every service's build and output; keep source checkouts"
@@ -122,8 +124,11 @@ work/services/$(1)-$(2)/BUILD-INFO: services/$(1)/build.sh services/$(1)/service
 smoke-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO
 	services/$(1)/smoke/smoke.sh $(2)
 
-run-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO | setup-wasmer
+run-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO | setup-wasmer
 	SERVICECACHE_SERVICES_DIR=work/services cargo run --release -- run $(1)@$(2) $$(if $$(RECIPE),--recipe $$(RECIPE)) $$(if $$(CLONES),--clones $$(CLONES))
+
+request-$(1)-$(2): | setup-wasmer
+	cargo run -- request $(1)@$(2) $$(if $$(RECIPE),--recipe $$(RECIPE))
 
 lifecycle-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO | setup-wasmer
 	SERVICECACHE_LIFECYCLE=1 cargo test --test lifecycle -- '$(1)::$(2)::'
