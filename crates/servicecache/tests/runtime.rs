@@ -64,6 +64,23 @@ fn stdin_is_a_pipe_and_the_network_is_denied() {
 }
 
 #[test]
+fn a_signal_during_a_handler_still_wakes_the_wait() {
+    let Some(output) = run(&smoke_root().join("signal-during-handler.wasm"), &[], b"") else {
+        return;
+    };
+    assert_eq!(
+        output.status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "WASIX signal during a handler still wakes the wait"
+    );
+}
+
+#[test]
 fn a_signal_handler_self_pipe_wakes_every_epoll_registration() {
     let Some(output) = run(&smoke_root().join("signal-epoll.wasm"), &[], b"") else {
         return;

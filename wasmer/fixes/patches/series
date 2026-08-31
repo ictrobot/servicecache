@@ -6,3 +6,4 @@
 0006-wasix-honor-nonblocking-joins-for-any-child.patch
 0007-wasix-virtual-net-close-sockets-with-their-last-WASI.patch
 0008-virtual-net-reassert-level-triggered-listener-readin.patch
+0009-wasix-recheck-pending-signals-before-a-wait-sleeps-a.patch

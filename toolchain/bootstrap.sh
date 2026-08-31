@@ -256,6 +256,11 @@ run_smoke() {
     -o "$build_dir/epoll-interest-switch.wasm"
   run_fixes_expecting epoll-interest-switch.wasm \
     "WASIX epoll interest switch keeps level readiness"
+  "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread \
+    "$SC_ROOT/toolchain/smoke/signal-during-handler.c" \
+    -o "$build_dir/signal-during-handler.wasm"
+  run_fixes_expecting signal-during-handler.wasm \
+    "WASIX signal during a handler still wakes the wait"
 }
 
 install_current_set() {

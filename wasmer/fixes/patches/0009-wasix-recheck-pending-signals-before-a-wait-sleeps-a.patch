@@ -1,0 +1,37 @@
+Subject: wasix: recheck pending signals before a wait sleeps again
+
+AsyncifyPoller checks the signal queue, and only a check that finds it
+empty subscribes the waker. When the check finds signals, they are
+popped and the guest handlers run, and the waker is re-subscribed only
+afterwards: a signal delivered while the handlers ran is pushed to a
+queue whose waker list is empty and wakes nobody. The poller then
+returned Pending with that signal still queued, and the wait slept
+until an unrelated wake arrived; for a guest blocked with no timeout,
+that is forever.
+
+The window is hit by signals arriving back to back: a handler for the
+first is still running when the second lands, and the thread then
+sleeps in epoll_wait with the wake it needs already queued. Two
+cooperating processes that signal each other and then go quiet
+deadlock until any later signal drains the queue. Re-check the queue
+after the handlers run and schedule another poll when it is not empty,
+so the stragglers are processed before the wait can sleep.
+
+diff --git a/lib/wasix/src/syscalls/mod.rs b/lib/wasix/src/syscalls/mod.rs
+index 66689e8..90bdb31 100644
+--- a/lib/wasix/src/syscalls/mod.rs
++++ b/lib/wasix/src/syscalls/mod.rs
+@@ -423,6 +423,13 @@ where
+                         if let Err(err) = WasiEnv::do_pending_link_operations(self.ctx, false) {
+                             return Poll::Ready(Err(err));
+                         }
++                        // A signal that arrived while the handlers above ran was
++                        // pushed to a queue with no subscribed waker and woke
++                        // nobody; sleeping now would strand it until an
++                        // unrelated wake. Schedule another poll to process it.
++                        if !self.ctx.data().thread.signals().lock().unwrap().0.is_empty() {
++                            cx.waker().wake_by_ref();
++                        }
+                         Poll::Pending
+                     }
+                 }
