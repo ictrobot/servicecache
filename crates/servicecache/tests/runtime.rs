@@ -62,3 +62,20 @@ fn stdin_is_a_pipe_and_the_network_is_denied() {
         "the network was not denied: {text}"
     );
 }
+
+#[test]
+fn a_signal_handler_self_pipe_wakes_every_epoll_registration() {
+    let Some(output) = run(&smoke_root().join("signal-epoll.wasm"), &[], b"") else {
+        return;
+    };
+    assert_eq!(
+        output.status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "WASIX signal wakes every epoll registration"
+    );
+}

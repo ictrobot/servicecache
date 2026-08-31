@@ -132,6 +132,7 @@ impl Runtime {
             .stderr(Box::new(stderr_writer))
             .mount_fs(filesystem)
             .runtime(Arc::new(runtime));
+        builder.add_mapped_command(program_name, request.module.to_string_lossy());
         builder.add_preopen_build(|preopen| {
             preopen
                 .directory("/")

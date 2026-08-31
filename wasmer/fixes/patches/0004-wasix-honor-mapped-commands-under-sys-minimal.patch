@@ -1,0 +1,40 @@
+Subject: wasix: honor mapped commands under sys-minimal
+
+The builder's mapped commands were registered only in builds with the
+full sys feature: under sys-minimal, map_commands does not exist and
+from_init silently dropped init.mapped_commands. An embedder on the
+minimal feature that maps a command name to a module path then watches
+posix_spawnp fail to resolve that name at runtime. Compile the mapping
+in under sys-minimal too; it needs nothing the minimal feature lacks.
+
+diff --git a/lib/wasix/src/state/env.rs b/lib/wasix/src/state/env.rs
+index be2e04b..72e1e71 100644
+--- a/lib/wasix/src/state/env.rs
++++ b/lib/wasix/src/state/env.rs
+@@ -453,7 +453,7 @@ impl WasiEnv {
+             env.use_package(pkg)?;
+         }
+ 
+-        #[cfg(feature = "sys")]
++        #[cfg(any(feature = "sys", feature = "sys-minimal"))]
+         env.map_commands(init.mapped_commands.clone())?;
+ 
+         Ok(env)
+@@ -1210,7 +1210,7 @@ impl WasiEnv {
+         Ok(())
+     }
+ 
+-    #[cfg(feature = "sys")]
++    #[cfg(any(feature = "sys", feature = "sys-minimal"))]
+     pub fn map_commands(
+         &self,
+         map_commands: std::collections::HashMap<String, std::path::PathBuf>,
+@@ -1223,7 +1223,7 @@ impl WasiEnv {
+         #[allow(unused_imports)]
+         use virtual_fs::FileSystem;
+ 
+-        #[cfg(feature = "sys")]
++        #[cfg(any(feature = "sys", feature = "sys-minimal"))]
+         for (command, target) in map_commands.iter() {
+             // Read the file
+             let file = std::fs::read(target).map_err(|err| {
