@@ -12,7 +12,9 @@ use virtual_fs::{MountFileSystem, Pipe, host_fs};
 use wasmer::{Engine, Module};
 use wasmer_wasix::{
     PluggableRuntime, Runtime, UnsupportedVirtualNetworking, WasiEnv,
-    bin_factory::spawn_exec_module, os::task::TaskJoinHandle,
+    bin_factory::spawn_exec_module,
+    os::task::TaskJoinHandle,
+    runtime::module_cache::{ModuleCache as _, SharedCache},
 };
 
 use super::{net::HostNetworking, tasks::HostTaskManager};
@@ -109,6 +111,10 @@ impl GuestRuntime {
 
         let mut runtime = PluggableRuntime::new(Arc::new(self.tasks.clone()));
         runtime.set_engine(self.engine.clone());
+        // Child processes load modules lazily through the WASIX runtime. Put
+        // its shared in-memory cache in front of the same persistent cache as
+        // top-level modules.
+        runtime.set_module_cache(SharedCache::new().with_fallback(self.cache.clone()));
         if run.network {
             runtime.networking = self.networking.clone();
         } else {

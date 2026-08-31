@@ -3163,6 +3163,7 @@ dependencies = [
  "virtual-mio",
  "virtual-net",
  "wasmer",
+ "wasmer-types",
  "wasmer-vm",
  "wasmer-wasix",
 ]

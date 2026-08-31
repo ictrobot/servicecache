@@ -11,11 +11,10 @@
 //! missing on the same entry take turns: the first compiles and stores it,
 //! the rest wait for it.
 //!
-//! Wasmer's own caches are not used: `wasmer-cache` keys by module hash
-//! alone and writes entries in place, and wasmer-wasix's module cache is
-//! asynchronous and compiles on a miss wherever the runtime decides, whereas
-//! the host must compile on a thread pool it can tear down before a freeze.
-//! The serialisation underneath is the same.
+//! `wasmer-cache` is not used: it keys by module hash alone and writes entries
+//! in place. Commands spawned inside a guest use the same persistent entries
+//! through Wasmer-wasix's module-cache interface, with its shared in-memory
+//! cache in front. The serialisation underneath is the same.
 //!
 //! The directory is `--cache-dir`, else `SERVICECACHE_CACHE_DIR`, else
 //! `$XDG_CACHE_HOME/servicecache` (`~/.cache/servicecache`). Loading an
@@ -32,6 +31,8 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use sha2::{Digest, Sha256};
 use wasmer::{CompileError, Engine, Module};
+use wasmer_types::ModuleHash;
+use wasmer_wasix::runtime::module_cache::{CacheError, ModuleCache as WasixModuleCache};
 
 /// The cache directory, from the flag, the environment or the XDG default.
 ///
@@ -100,69 +101,133 @@ impl ModuleCache {
         compile: impl FnOnce(&Engine, &[u8]) -> Result<Module, CompileError>,
     ) -> Result<Module> {
         let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-        let entry_dir = self.dir.join("modules").join(engine_key(engine));
-        let entry = entry_dir.join(format!("{:x}.bin", Sha256::digest(&bytes)));
+        self.load_bytes(engine, &bytes, &path.display().to_string(), compile)
+    }
 
-        if let Some(module) = load_entry(engine, path, &entry, false) {
+    /// The compiled form of `bytes`, keyed by their content rather than the
+    /// name from which they were read. The entry lock covers `compile`.
+    pub(crate) fn load_bytes(
+        &self,
+        engine: &Engine,
+        bytes: &[u8],
+        label: &str,
+        compile: impl FnOnce(&Engine, &[u8]) -> Result<Module, CompileError>,
+    ) -> Result<Module> {
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let (entry_dir, entry) = self.entry(engine, &hash);
+
+        if let Some(module) = load_entry(engine, label, &entry, false) {
             return Ok(module);
         }
 
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&entry_dir)
-            .with_context(|| format!("failed to create {}", entry_dir.display()))?;
         // One compile per entry at a time: the first process to take the
         // entry's lock compiles and stores, the others wait on it and then
         // find the artifact in place. The lock lasts until `lock_file` is
         // dropped; the kernel drops it if its holder dies; the empty lock
         // file stays.
-        let lock_path = entry.with_extension("lock");
-        let lock_file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&lock_path)
-            .with_context(|| format!("failed to open {}", lock_path.display()))?;
-        lock_file
-            .lock()
-            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-        if let Some(module) = load_entry(engine, path, &entry, true) {
+        let _lock_file = lock_entry(&entry_dir, &entry)?;
+        if let Some(module) = load_entry(engine, label, &entry, true) {
             return Ok(module);
         }
 
         let started = std::time::Instant::now();
-        let module = compile(engine, &bytes)
-            .with_context(|| format!("failed to compile {}", path.display()))?;
+        let module =
+            compile(engine, bytes).with_context(|| format!("failed to compile {label}"))?;
         tracing::info!(
-            module = %path.display(),
+            module = label,
             bytes = bytes.len(),
             elapsed = ?started.elapsed(),
             "compiled module"
         );
-        // Written whole under another name, then renamed: a reader sees
-        // either no artifact or a complete one.
-        let partial = entry_dir.join(format!(
-            "{}.tmp-{}",
-            entry
-                .file_name()
-                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
-            std::process::id()
-        ));
-        module
-            .serialize_to_file(&partial)
-            .with_context(|| format!("failed to write {}", partial.display()))?;
-        fs::rename(&partial, &entry)
-            .with_context(|| format!("failed to move {} into place", partial.display()))?;
+        store_entry(&entry_dir, &entry, &module)?;
         Ok(module)
     }
+
+    fn entry(&self, engine: &Engine, hash: &str) -> (PathBuf, PathBuf) {
+        let entry_dir = self.dir.join("modules").join(engine_key(engine));
+        let entry = entry_dir.join(format!("{hash}.bin"));
+        (entry_dir, entry)
+    }
+
+    fn save_hashed(&self, engine: &Engine, hash: &str, module: &Module) -> Result<()> {
+        let (entry_dir, entry) = self.entry(engine, hash);
+        let _lock_file = lock_entry(&entry_dir, &entry)?;
+        // A complete artifact with this content and engine key is equivalent.
+        if entry.is_file() {
+            return Ok(());
+        }
+        store_entry(&entry_dir, &entry, module)
+    }
+}
+
+#[async_trait::async_trait]
+impl WasixModuleCache for ModuleCache {
+    async fn load(&self, key: ModuleHash, engine: &Engine) -> Result<Module, CacheError> {
+        let hash = key.to_string().to_ascii_lowercase();
+        let (_, entry) = self.entry(engine, &hash);
+        load_entry(engine, &hash, &entry, false).ok_or(CacheError::NotFound)
+    }
+
+    async fn contains(&self, key: ModuleHash, engine: &Engine) -> Result<bool, CacheError> {
+        let hash = key.to_string().to_ascii_lowercase();
+        let (_, entry) = self.entry(engine, &hash);
+        Ok(entry.is_file())
+    }
+
+    async fn save(
+        &self,
+        key: ModuleHash,
+        engine: &Engine,
+        module: &Module,
+    ) -> Result<(), CacheError> {
+        let hash = key.to_string().to_ascii_lowercase();
+        self.save_hashed(engine, &hash, module)
+            .map_err(|error| CacheError::other(std::io::Error::other(error.to_string())))
+    }
+}
+
+fn lock_entry(entry_dir: &Path, entry: &Path) -> Result<fs::File> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(entry_dir)
+        .with_context(|| format!("failed to create {}", entry_dir.display()))?;
+    let lock_path = entry.with_extension("lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    lock_file
+        .lock()
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    Ok(lock_file)
+}
+
+/// Writes under another name and then renames, so a reader sees either no
+/// artifact or a complete one. The caller holds the entry lock.
+fn store_entry(entry_dir: &Path, entry: &Path, module: &Module) -> Result<()> {
+    let partial = entry_dir.join(format!(
+        "{}.tmp-{}",
+        entry
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        std::process::id()
+    ));
+    module
+        .serialize_to_file(&partial)
+        .with_context(|| format!("failed to write {}", partial.display()))?;
+    fs::rename(&partial, entry)
+        .with_context(|| format!("failed to move {} into place", partial.display()))?;
+    Ok(())
 }
 
 /// The artifact at `entry`, if there is one and it loads. One that does not
 /// load is reported and treated as absent, so it gets recompiled. `waited`
 /// says whether the caller held the entry's lock first, for the log.
-fn load_entry(engine: &Engine, path: &Path, entry: &Path, waited: bool) -> Option<Module> {
+fn load_entry(engine: &Engine, label: &str, entry: &Path, waited: bool) -> Option<Module> {
     let Ok(metadata) = entry.metadata() else {
         return None;
     };
@@ -176,7 +241,7 @@ fn load_entry(engine: &Engine, path: &Path, entry: &Path, waited: bool) -> Optio
     match unsafe { Module::deserialize_from_file(engine, entry) } {
         Ok(module) => {
             tracing::debug!(
-                module = %path.display(),
+                module = label,
                 entry = %entry.display(),
                 bytes = metadata.len(),
                 elapsed = ?started.elapsed(),
@@ -187,7 +252,7 @@ fn load_entry(engine: &Engine, path: &Path, entry: &Path, waited: bool) -> Optio
         }
         Err(error) => {
             tracing::warn!(
-                module = %path.display(),
+                module = label,
                 entry = %entry.display(),
                 %error,
                 "cached artifact did not load; recompiling"
@@ -243,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn second_load_is_a_hit_and_clean_removes_it() {
+    fn same_bytes_under_another_name_are_a_hit_and_clean_removes_it() {
         let Some(module_path) = fixture() else {
             eprintln!("skipped: the toolchain smoke fixtures are not built");
             return;
@@ -251,6 +316,9 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("servicecache-cache-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("test dir");
+        let renamed_module = dir.join("a-different-name");
+        fs::copy(&module_path, &renamed_module).expect("copy fixture under another name");
         let cache = ModuleCache::new(dir.clone());
         let engine = Engine::default();
         let compiles = AtomicUsize::new(0);
@@ -270,14 +338,43 @@ mod tests {
         assert_eq!(entries.len(), 1, "one engine directory");
 
         cache
-            .load(&engine, &module_path, |_, _| {
-                panic!("second load must not compile")
+            .load(&engine, &renamed_module, |_, _| {
+                panic!("same bytes under another name must not compile")
             })
-            .expect("second load hits");
+            .expect("content hash hits");
 
         assert!(clean(&dir).expect("clean"));
         assert!(!dir.exists());
         assert!(!clean(&dir).expect("clean again"));
+    }
+
+    #[test]
+    fn path_and_wasix_cache_interfaces_share_an_entry() {
+        let Some(module_path) = fixture() else {
+            eprintln!("skipped: the toolchain smoke fixtures are not built");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "servicecache-cache-wasix-interface-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = ModuleCache::new(dir.clone());
+        let engine = Engine::default();
+        let bytes = fs::read(&module_path).expect("read fixture");
+
+        cache
+            .load(&engine, &module_path, Module::from_binary)
+            .expect("path interface stores the artifact");
+        let key = ModuleHash::new(&bytes);
+        assert!(
+            virtual_mio::block_on(WasixModuleCache::contains(&cache, key, &engine))
+                .expect("contains")
+        );
+        virtual_mio::block_on(WasixModuleCache::load(&cache, key, &engine))
+            .expect("WASIX interface loads the same artifact");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
