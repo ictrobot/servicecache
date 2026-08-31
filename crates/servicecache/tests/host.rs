@@ -257,7 +257,9 @@ fn guest_sees_correct_ports() {
     let dir = std::env::temp_dir().join(format!("servicecache-netprobe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
-    std::os::unix::fs::symlink(&fixture, dir.join("netprobe.wasm")).expect("symlink the fixture");
+    // Copied, not symlinked: a manifest path must resolve inside the
+    // package.
+    std::fs::copy(&fixture, dir.join("netprobe.wasm")).expect("copy the fixture");
     std::fs::write(
         dir.join("service.toml"),
         "[service]\nname = \"netprobe\"\nversion = \"0\"\n\n[guest]\nmodule = \"netprobe.wasm\"\nargs = [\"4000\"]\nlisten_port = 4000\n",

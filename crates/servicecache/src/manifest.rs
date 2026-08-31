@@ -87,12 +87,17 @@ struct RawInitializer {
 }
 
 impl Manifest {
-    /// Parse and validate a manifest, resolving package paths relative to it.
+    /// Parse and validate a manifest, resolving package paths relative to
+    /// it. A package path must stay inside the package: plain relative
+    /// components only, and what it resolves to — through any symlink —
+    /// under the manifest's directory, so a package cannot reference
+    /// files its digest does not cover.
     ///
     /// # Errors
     ///
     /// Returns an error for unreadable or invalid TOML, unsupported keys,
-    /// absolute package paths, invalid mount paths, or missing artifacts.
+    /// absolute or escaping package paths, invalid mount paths, or
+    /// missing artifacts.
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("failed to read manifest {}", path.display()))?;
@@ -102,6 +107,12 @@ impl Manifest {
             .parent()
             .context("manifest path has no parent directory")?
             .to_path_buf();
+        let canonical = fs::canonicalize(&directory).with_context(|| {
+            format!(
+                "failed to resolve package directory {}",
+                directory.display()
+            )
+        })?;
 
         ensure!(
             !raw.service.name.is_empty(),
@@ -114,10 +125,10 @@ impl Manifest {
 
         let prepare = raw
             .prepare
-            .map(|table| resolve_prepare(table, &directory))
+            .map(|table| resolve_prepare(table, &directory, &canonical))
             .transpose()?;
         let guest = Guest {
-            module: resolve_module(&directory, &raw.guest.module, "guest module")?,
+            module: resolve_module(&directory, &canonical, &raw.guest.module, "guest module")?,
             args: raw.guest.args,
             listen_port: raw.guest.listen_port,
         };
@@ -125,7 +136,12 @@ impl Manifest {
             .initializer
             .map(|table| {
                 Ok::<Initializer, anyhow::Error>(Initializer {
-                    module: resolve_module(&directory, &table.module, "initializer module")?,
+                    module: resolve_module(
+                        &directory,
+                        &canonical,
+                        &table.module,
+                        "initializer module",
+                    )?,
                     args: table.args,
                 })
             })
@@ -186,7 +202,7 @@ impl Prepare {
     }
 }
 
-fn resolve_prepare(raw: RawPrepare, directory: &Path) -> Result<Prepare> {
+fn resolve_prepare(raw: RawPrepare, directory: &Path, canonical: &Path) -> Result<Prepare> {
     let mut mounts = BTreeMap::new();
     for (guest, source) in raw.fs {
         ensure!(
@@ -201,25 +217,26 @@ fn resolve_prepare(raw: RawPrepare, directory: &Path) -> Result<Prepare> {
             "prepare mount path {} must not contain '..'",
             guest.display()
         );
-        reject_absolute(&source, "prepare mount source")?;
+        reject_escape(&source, "prepare mount source")?;
         let resolved = directory.join(&source);
         ensure!(
             resolved.is_dir(),
             "prepare mount source {} is not a directory",
             resolved.display()
         );
+        ensure_contained(&resolved, canonical, "prepare mount source")?;
         mounts.insert(guest, resolved);
     }
 
     let module = raw
         .module
         .as_deref()
-        .map(|path| resolve_module(directory, path, "prepare module"))
+        .map(|path| resolve_module(directory, canonical, path, "prepare module"))
         .transpose()?;
     let stdin_file = raw
         .stdin_file
         .as_deref()
-        .map(|path| resolve_file(directory, path, "prepare stdin file"))
+        .map(|path| resolve_file(directory, canonical, path, "prepare stdin file"))
         .transpose()?;
 
     Ok(Prepare {
@@ -230,25 +247,57 @@ fn resolve_prepare(raw: RawPrepare, directory: &Path) -> Result<Prepare> {
     })
 }
 
-fn resolve_module(directory: &Path, path: &Path, description: &str) -> Result<PathBuf> {
-    resolve_file(directory, path, description)
+fn resolve_module(
+    directory: &Path,
+    canonical: &Path,
+    path: &Path,
+    description: &str,
+) -> Result<PathBuf> {
+    resolve_file(directory, canonical, path, description)
 }
 
-fn resolve_file(directory: &Path, path: &Path, description: &str) -> Result<PathBuf> {
-    reject_absolute(path, description)?;
+fn resolve_file(
+    directory: &Path,
+    canonical: &Path,
+    path: &Path,
+    description: &str,
+) -> Result<PathBuf> {
+    reject_escape(path, description)?;
     let resolved = directory.join(path);
     ensure!(
         resolved.is_file(),
         "{description} {} is not a file",
         resolved.display()
     );
+    ensure_contained(&resolved, canonical, description)?;
     Ok(resolved)
 }
 
-fn reject_absolute(path: &Path, description: &str) -> Result<()> {
-    if path.is_absolute() {
-        bail!("{description} {} must be relative", path.display());
+/// A package path must be plain names, nothing else: no root, no `..`,
+/// no `.`, so it cannot name anything above the manifest's directory.
+fn reject_escape(path: &Path, description: &str) -> Result<()> {
+    if !path
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        bail!(
+            "{description} {} must be a plain relative path inside the package",
+            path.display()
+        );
     }
+    Ok(())
+}
+
+/// What the path resolves to — through any symlink — must stay under the
+/// package directory, so nothing outside the package's digest is used.
+fn ensure_contained(resolved: &Path, canonical_directory: &Path, description: &str) -> Result<()> {
+    let canonical = fs::canonicalize(resolved)
+        .with_context(|| format!("failed to resolve {description} {}", resolved.display()))?;
+    ensure!(
+        canonical.starts_with(canonical_directory),
+        "{description} {} resolves outside the package",
+        resolved.display()
+    );
     Ok(())
 }
 
@@ -304,6 +353,89 @@ mod tests {
             "#,
         );
 
+        let manifest = Manifest::load(&directory.0.join("service.toml")).expect("load manifest");
+        assert_eq!(manifest.guest.module, directory.0.join("server.wasm"));
+    }
+
+    /// A manifest for `directory` whose guest module is `module`.
+    fn manifest_with_module(directory: &TestDirectory, module: &str) {
+        directory.write(
+            "service.toml",
+            &format!(
+                r#"
+                    [service]
+                    name = "example"
+                    version = "1"
+
+                    [guest]
+                    module = "{module}"
+                    listen_port = 1234
+                "#
+            ),
+        );
+    }
+
+    #[test]
+    fn rejects_paths_that_leave_the_package() {
+        let directory = TestDirectory::new();
+        let outside = TestDirectory::new();
+        outside.write("server.wasm", "module");
+
+        // `..` components are refused before anything is resolved.
+        manifest_with_module(&directory, "../server.wasm");
+        let error = Manifest::load(&directory.0.join("service.toml")).expect_err("escape");
+        assert!(
+            error.to_string().contains("plain relative path"),
+            "{error:#}"
+        );
+
+        // A lexically clean path whose symlink resolves outside is refused
+        // too: the package's digest would not cover what runs.
+        std::os::unix::fs::symlink(
+            outside.0.join("server.wasm"),
+            directory.0.join("server.wasm"),
+        )
+        .expect("symlink");
+        manifest_with_module(&directory, "server.wasm");
+        let error = Manifest::load(&directory.0.join("service.toml")).expect_err("symlink escape");
+        assert!(
+            error.to_string().contains("resolves outside the package"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_mount_sources_that_leave_the_package() {
+        let directory = TestDirectory::new();
+        directory.write("server.wasm", "module");
+        directory.write(
+            "service.toml",
+            r#"
+                [service]
+                name = "example"
+                version = "1"
+
+                [prepare]
+                fs = { "/usr/share/example" = "../share" }
+
+                [guest]
+                module = "server.wasm"
+                listen_port = 1234
+            "#,
+        );
+        let error = Manifest::load(&directory.0.join("service.toml")).expect_err("escape");
+        assert!(
+            error.to_string().contains("plain relative path"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn follows_symlinks_that_stay_inside_the_package() {
+        let directory = TestDirectory::new();
+        directory.write("real.wasm", "module");
+        std::os::unix::fs::symlink("real.wasm", directory.0.join("server.wasm")).expect("symlink");
+        manifest_with_module(&directory, "server.wasm");
         let manifest = Manifest::load(&directory.0.join("service.toml")).expect("load manifest");
         assert_eq!(manifest.guest.module, directory.0.join("server.wasm"));
     }
@@ -397,7 +529,7 @@ mod tests {
         );
         let absolute_error = Manifest::load(&directory.0.join("service.toml"))
             .expect_err("absolute path should fail");
-        assert!(absolute_error.to_string().contains("must be relative"));
+        assert!(absolute_error.to_string().contains("plain relative path"));
 
         directory.write(
             "service.toml",
@@ -437,7 +569,7 @@ mod tests {
         );
         let absolute_error = Manifest::load(&directory.0.join("service.toml"))
             .expect_err("absolute mount source should fail");
-        assert!(absolute_error.to_string().contains("must be relative"));
+        assert!(absolute_error.to_string().contains("plain relative path"));
 
         directory.write(
             "service.toml",
@@ -482,7 +614,7 @@ mod tests {
         );
         let absolute_error = Manifest::load(&directory.0.join("service.toml"))
             .expect_err("absolute stdin path should fail");
-        assert!(absolute_error.to_string().contains("must be relative"));
+        assert!(absolute_error.to_string().contains("plain relative path"));
 
         directory.write(
             "service.toml",
