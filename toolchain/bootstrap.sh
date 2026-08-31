@@ -231,6 +231,31 @@ run_smoke() {
       fail "relative-path race smoke test failed (wasixcc ${flags:-default flags})"
   done
   echo "WASIX relative-path race test passed"
+
+  # Guest fixtures for the fixes patch set run under the fixes variant:
+  # stock does not carry the behaviour they test. PATH covers their
+  # spawn-by-name of themselves.
+  "$SC_ROOT/wasmer/build.sh" fixes >/dev/null ||
+    fail "could not build the fixes Wasmer CLI (wasmer/build.sh fixes)"
+  run_fixes_expecting() {
+    local module="$1" expected="$2" output
+    output="$("$SC_ROOT/work/wasmer/fixes/bin/wasmer" run --net \
+      --volume "$SC_ROOT:$SC_ROOT" --cwd "$build_dir" \
+      --env "PATH=$build_dir" "$build_dir/$module")" ||
+      fail "$module failed under the fixes variant"
+    [[ "$output" == "$expected" ]] ||
+      fail "$module: expected \"$expected\", got \"$output\""
+    printf '%s\n' "$output"
+  }
+  "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread \
+    "$SC_ROOT/toolchain/smoke/signal-epoll.c" -o "$build_dir/signal-epoll.wasm"
+  run_fixes_expecting signal-epoll.wasm \
+    "WASIX signal wakes every epoll registration"
+  "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread \
+    "$SC_ROOT/toolchain/smoke/epoll-interest-switch.c" \
+    -o "$build_dir/epoll-interest-switch.wasm"
+  run_fixes_expecting epoll-interest-switch.wasm \
+    "WASIX epoll interest switch keeps level readiness"
 }
 
 install_current_set() {

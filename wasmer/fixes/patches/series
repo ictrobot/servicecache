@@ -1,2 +1,3 @@
 0001-wasix-allow-the-journal-only-code-in-builds-without-.patch
 0002-virtual-fs-accept-create-without-write-access.patch
+0003-wasix-support-multiple-epoll-registrations-per-file.patch

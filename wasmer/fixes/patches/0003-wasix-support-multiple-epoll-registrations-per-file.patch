@@ -1,0 +1,503 @@
+Subject: wasix: support multiple epoll registrations per file
+
+The virtual epoll kept one interest registration per file, so adding
+the same file to a second epoll instance displaced the first waiter,
+and one readiness transition woke only one set. Linux gives each epoll
+instance its own registration, and multi-process servers rely on that:
+a latch self-pipe sits in several wait-event sets, and a signal
+handler's write must wake whichever set is being waited on. Keep an
+EpollInterestRegistry of independent registrations per file and fan
+readiness out to every interested epoll instance. Every subscription
+reinstalls a socket source's selector registration, so one that
+arrives on a live descriptor - an interest switch after a request -
+snapshots the level-triggered readiness it joined.
+
+diff --git a/lib/wasix/src/fs/fd.rs b/lib/wasix/src/fs/fd.rs
+index ee9e945..93d2631 100644
+--- a/lib/wasix/src/fs/fd.rs
++++ b/lib/wasix/src/fs/fd.rs
+@@ -9,7 +9,7 @@ use virtual_fs::{Pipe, PipeRx, PipeTx, VirtualFile};
+ use wasmer_wasix_types::wasi::{Fdflags, Fdflagsext, Filestat, Rights};
+ 
+ use crate::net::socket::InodeSocket;
+-use crate::os::epoll::EpollState;
++use crate::os::epoll::{EpollInterestRegistry, EpollState};
+ 
+ use super::{InodeGuard, InodeWeakGuard, NotificationInner};
+ 
+@@ -66,6 +66,7 @@ pub struct InodeVal {
+     pub is_preopened: bool,
+     pub name: RwLock<Cow<'static, str>>,
+     pub kind: RwLock<Kind>,
++    pub(crate) epoll_interest: Arc<EpollInterestRegistry>,
+ }
+ 
+ impl InodeVal {
+diff --git a/lib/wasix/src/fs/fd_list.rs b/lib/wasix/src/fs/fd_list.rs
+index 70dcf93..ad28724 100644
+--- a/lib/wasix/src/fs/fd_list.rs
++++ b/lib/wasix/src/fs/fd_list.rs
+@@ -321,6 +321,7 @@ mod tests {
+                     kind: RwLock::new(Kind::Buffer { buffer: vec![] }),
+                     name: RwLock::new(Cow::Borrowed("")),
+                     stat: RwLock::new(Default::default()),
++                    epoll_interest: Default::default(),
+                 }),
+                 open_handles: Arc::new(AtomicI32::new(0)),
+             },
+diff --git a/lib/wasix/src/fs/mod.rs b/lib/wasix/src/fs/mod.rs
+index c1dcd7f..412224d 100644
+--- a/lib/wasix/src/fs/mod.rs
++++ b/lib/wasix/src/fs/mod.rs
+@@ -858,6 +858,7 @@ impl WasiFs {
+             is_preopened: true,
+             name: RwLock::new("/".into()),
+             kind: RwLock::new(root_kind),
++            epoll_interest: Default::default(),
+         });
+ 
+         let wasi_fs = Self {
+@@ -2003,6 +2004,7 @@ impl WasiFs {
+             is_preopened,
+             name: RwLock::new(name),
+             kind: RwLock::new(kind),
++            epoll_interest: Default::default(),
+         })
+     }
+ 
+@@ -2587,6 +2589,7 @@ impl WasiFs {
+                 is_preopened: true,
+                 name: RwLock::new(name.to_string().into()),
+                 kind: RwLock::new(kind),
++                epoll_interest: Default::default(),
+             })
+         };
+         self.fd_map.write().unwrap().insert(
+diff --git a/lib/wasix/src/os/epoll/mod.rs b/lib/wasix/src/os/epoll/mod.rs
+index a0731d6..2c0ada5 100644
+--- a/lib/wasix/src/os/epoll/mod.rs
++++ b/lib/wasix/src/os/epoll/mod.rs
+@@ -40,7 +40,7 @@
+ use std::{
+     collections::VecDeque,
+     sync::{
+-        Arc, Mutex as StdMutex,
++        Arc, Mutex as StdMutex, Weak,
+         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+     },
+ };
+@@ -128,44 +128,125 @@ impl EpollFd {
+     }
+ }
+ 
++#[derive(Debug, Default)]
++struct EpollInterestRegistryInner {
++    next_id: u64,
++    handlers: FnvHashMap<u64, Box<dyn InterestHandler>>,
++}
++
++/// Fans readiness from a source's single handler slot out to every epoll
++/// instance watching that open file description.
++#[derive(Debug, Default)]
++pub(crate) struct EpollInterestRegistry {
++    inner: StdMutex<EpollInterestRegistryInner>,
++}
++
++impl EpollInterestRegistry {
++    fn subscribe<E, F>(
++        self: &Arc<Self>,
++        handler: Box<dyn InterestHandler>,
++        install: F,
++    ) -> Result<u64, E>
++    where
++        F: FnOnce(Box<dyn InterestHandler>) -> Result<(), E>,
++    {
++        let id = {
++            let mut inner = self.inner.lock().unwrap();
++            let id = inner.next_id;
++            inner.next_id = inner.next_id.wrapping_add(1);
++            inner.handlers.insert(id, handler);
++            id
++        };
++
++        // The dispatcher is installed on the source for every subscription,
++        // not only the first: installing is what replays the source's
++        // current readiness, and a registration added later — an interest
++        // switch on a live descriptor — must observe the level-triggered
++        // state it joined. The replay reaches every registration, and the
++        // spurious level events the others receive are within epoll
++        // semantics. The lock is not held across the install, because the
++        // replay re-enters the registry to dispatch.
++        match install(Box::new(EpollInterestDispatcher {
++            registry: self.clone(),
++        })) {
++            Ok(()) => Ok(id),
++            Err(error) => {
++                self.inner.lock().unwrap().handlers.remove(&id);
++                Err(error)
++            }
++        }
++    }
++
++    fn unsubscribe(&self, id: u64) {
++        self.inner.lock().unwrap().handlers.remove(&id);
++    }
++
++    #[cfg(test)]
++    fn handler_count(&self) -> usize {
++        self.inner.lock().unwrap().handlers.len()
++    }
++}
++
++#[derive(Debug)]
++struct EpollInterestDispatcher {
++    registry: Arc<EpollInterestRegistry>,
++}
++
++impl InterestHandler for EpollInterestDispatcher {
++    fn push_interest(&mut self, interest: InterestType) {
++        for handler in self.registry.inner.lock().unwrap().handlers.values_mut() {
++            handler.push_interest(interest);
++        }
++    }
++
++    fn pop_interest(&mut self, interest: InterestType) -> bool {
++        self.registry
++            .inner
++            .lock()
++            .unwrap()
++            .handlers
++            .values_mut()
++            .fold(false, |popped, handler| {
++                handler.pop_interest(interest) || popped
++            })
++    }
++
++    fn has_interest(&self, interest: InterestType) -> bool {
++        self.registry
++            .inner
++            .lock()
++            .unwrap()
++            .handlers
++            .values()
++            .any(|handler| handler.has_interest(interest))
++    }
++}
++
+ #[derive(Debug)]
+ pub struct EpollJoinGuard {
+-    /// Underlying poll registration guard.
+-    fd_guard: InodeValFilePollGuard,
++    /// Keeps the underlying source alive for the registration's lifetime.
++    _fd_guard: InodeValFilePollGuard,
++    registry: Arc<EpollInterestRegistry>,
++    registration: u64,
+ }
+ 
+ impl EpollJoinGuard {
+-    fn new(fd_guard: InodeValFilePollGuard) -> Self {
+-        Self { fd_guard }
++    fn new(
++        fd_guard: InodeValFilePollGuard,
++        registry: Arc<EpollInterestRegistry>,
++        registration: u64,
++    ) -> Self {
++        Self {
++            _fd_guard: fd_guard,
++            registry,
++            registration,
++        }
+     }
+ }
+ 
+ impl Drop for EpollJoinGuard {
+     fn drop(&mut self) {
+-        // Dropping a subscription must detach its interest handler from the source.
+-        match &self.fd_guard.mode {
+-            InodeValFilePollGuardMode::File(_) => {
+-                // Intentionally ignored, epoll doesn't work with files
+-            }
+-            InodeValFilePollGuardMode::Socket { inner } => {
+-                let mut inner = inner.protected.write().unwrap();
+-                inner.remove_handler();
+-            }
+-            InodeValFilePollGuardMode::EventNotifications(inner) => {
+-                inner.remove_interest_handler();
+-            }
+-            InodeValFilePollGuardMode::DuplexPipe { pipe } => {
+-                let inner = pipe.write().unwrap();
+-                inner.remove_interest_handler();
+-            }
+-            InodeValFilePollGuardMode::PipeRx { rx } => {
+-                let inner = rx.write().unwrap();
+-                inner.remove_interest_handler();
+-            }
+-            InodeValFilePollGuardMode::PipeTx { .. } => {
+-                // Intentionally ignored, the sending end of a pipe can't have an interest handler
+-            }
+-        }
++        self.registry.unsubscribe(self.registration);
+     }
+ }
+ 
+@@ -526,18 +607,23 @@ pub(crate) fn drain_ready_events(
+ struct EpollHandler {
+     /// Watched fd associated with the subscription.
+     fd: WasiFd,
+-    /// Parent epoll state for queueing and wakeups.
+-    epoll_state: Arc<EpollState>,
+-    /// Per-subscription state updated by interest callbacks.
+-    sub_state: Arc<EpollSubState>,
++    /// Parent epoll state for queueing and wakeups. Weak, because this
++    /// handler lives in the watched inode's interest registry: a strong
++    /// reference would cycle registry -> handler -> epoll state ->
++    /// subscription -> join guard -> registry and keep the inode, and a
++    /// socket's host descriptor, alive after the epoll fd closed.
++    epoll_state: Weak<EpollState>,
++    /// Per-subscription state updated by interest callbacks; Weak for the
++    /// same cycle.
++    sub_state: Weak<EpollSubState>,
+ }
+ 
+ impl EpollHandler {
+     fn new(fd: WasiFd, epoll_state: Arc<EpollState>, sub_state: Arc<EpollSubState>) -> Box<Self> {
+         Box::new(Self {
+             fd,
+-            epoll_state,
+-            sub_state,
++            epoll_state: Arc::downgrade(&epoll_state),
++            sub_state: Arc::downgrade(&sub_state),
+         })
+     }
+ }
+@@ -546,16 +632,20 @@ impl InterestHandler for EpollHandler {
+     /// Producer path:
+     /// set pending bits, enqueue once, and wake one waiter.
+     fn push_interest(&mut self, interest: InterestType) {
++        let (Some(epoll_state), Some(sub_state)) =
++            (self.epoll_state.upgrade(), self.sub_state.upgrade())
++        else {
++            return;
++        };
+         EPOLL_ENQUEUE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+         let bit = interest_to_pending_bit(interest);
+-        if !self.sub_state.set_pending(bit) {
++        if !sub_state.set_pending(bit) {
+             EPOLL_ENQUEUE_DEDUPE_HITS.fetch_add(1, Ordering::Relaxed);
+             return;
+         }
+ 
+-        if self.sub_state.mark_enqueued() {
+-            self.epoll_state
+-                .enqueue_ready(self.fd, self.sub_state.generation());
++        if sub_state.mark_enqueued() {
++            epoll_state.enqueue_ready(self.fd, sub_state.generation());
+         } else {
+             EPOLL_ENQUEUE_DEDUPE_HITS.fetch_add(1, Ordering::Relaxed);
+         }
+@@ -563,18 +653,21 @@ impl InterestHandler for EpollHandler {
+ 
+     /// Clears one readiness bit from this subscription only.
+     fn pop_interest(&mut self, interest: InterestType) -> bool {
++        let Some(sub_state) = self.sub_state.upgrade() else {
++            return false;
++        };
+         let bit = interest_to_pending_bit(interest);
+-        let old = self
+-            .sub_state
+-            .pending_bits
+-            .fetch_and(!bit, Ordering::AcqRel);
++        let old = sub_state.pending_bits.fetch_and(!bit, Ordering::AcqRel);
+         (old & bit) != 0
+     }
+ 
+     /// Checks whether this subscription currently has a readiness bit set.
+     fn has_interest(&self, interest: InterestType) -> bool {
++        let Some(sub_state) = self.sub_state.upgrade() else {
++            return false;
++        };
+         let bit = interest_to_pending_bit(interest);
+-        (self.sub_state.pending_bits() & bit) != 0
++        (sub_state.pending_bits() & bit) != 0
+     }
+ }
+ 
+@@ -587,6 +680,7 @@ pub(crate) fn register_epoll_handler(
+     epoll_state: Arc<EpollState>,
+     sub_state: Arc<EpollSubState>,
+ ) -> Result<Option<EpollJoinGuard>, Errno> {
++    let registry = state.fs.get_fd_inode(event.fd())?.epoll_interest.clone();
+     let mut type_ = Eventtype::FdRead;
+     let mut peb = PollEventBuilder::new();
+     if event.events().contains(EpollType::EPOLLOUT) {
+@@ -619,20 +713,6 @@ pub(crate) fn register_epoll_handler(
+             // Intentionally ignored, epoll doesn't work with files
+             return Ok(None);
+         }
+-        InodeValFilePollGuardMode::Socket { inner, .. } => {
+-            let mut inner = inner.protected.write().unwrap();
+-            inner.set_handler(handler).map_err(net_error_into_io_err)?;
+-            drop(inner);
+-        }
+-        InodeValFilePollGuardMode::EventNotifications(inner) => inner.set_interest_handler(handler),
+-        InodeValFilePollGuardMode::DuplexPipe { pipe } => {
+-            let inner = pipe.write().unwrap();
+-            inner.set_interest_handler(handler);
+-        }
+-        InodeValFilePollGuardMode::PipeRx { rx } => {
+-            let inner = rx.write().unwrap();
+-            inner.set_interest_handler(handler);
+-        }
+         InodeValFilePollGuardMode::PipeTx { .. } => {
+             // The sending end of a pipe can't have an interest handler, since we
+             // only support "readable" interest on pipes; they're considered to
+@@ -640,11 +720,51 @@ pub(crate) fn register_epoll_handler(
+             prime_immediate_writable_if_applicable(event, &fd_guard, &epoll_state, &sub_state);
+             return Ok(None);
+         }
++        _ => {}
+     }
+ 
++    let registry_for_error = registry.clone();
++    let registration = registry.subscribe(handler, |handler| -> Result<(), Errno> {
++        match &fd_guard.mode {
++            InodeValFilePollGuardMode::Socket { inner, .. } => {
++                let mut inner = inner.protected.write().unwrap();
++                // Drop the previous registration before installing, so the
++                // source registers afresh and snapshots its current
++                // readiness: a handler swap alone replays nothing, and a
++                // registration arriving on a live descriptor — an interest
++                // switch after a request — must see the level-triggered
++                // state it joined.
++                inner.remove_handler();
++                if let Err(error) = inner.set_handler(handler) {
++                    // The old registration is already gone; leave a
++                    // dispatcher behind on a best-effort basis so the
++                    // failure deafens only this subscription, not every
++                    // registration on the descriptor.
++                    let _ = inner.set_handler(Box::new(EpollInterestDispatcher {
++                        registry: registry_for_error.clone(),
++                    }));
++                    return Err(net_error_into_io_err(error).into());
++                }
++            }
++            InodeValFilePollGuardMode::EventNotifications(inner) => {
++                inner.set_interest_handler(handler)
++            }
++            InodeValFilePollGuardMode::DuplexPipe { pipe } => {
++                pipe.write().unwrap().set_interest_handler(handler)
++            }
++            InodeValFilePollGuardMode::PipeRx { rx } => {
++                rx.write().unwrap().set_interest_handler(handler)
++            }
++            InodeValFilePollGuardMode::File(_) | InodeValFilePollGuardMode::PipeTx { .. } => {
++                unreachable!("unsupported epoll source passed the initial mode check")
++            }
++        }
++        Ok(())
++    })?;
++
+     prime_immediate_writable_if_applicable(event, &fd_guard, &epoll_state, &sub_state);
+ 
+-    Ok(Some(EpollJoinGuard::new(fd_guard)))
++    Ok(Some(EpollJoinGuard::new(fd_guard, registry, registration)))
+ }
+ 
+ /// Increments stale-generation dequeue metric.
+@@ -779,6 +899,44 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn epoll_interest_registry_fans_out_to_every_subscription() {
++        let registry = Arc::new(EpollInterestRegistry::default());
++        let dispatcher = Arc::new(StdMutex::new(None));
++        let (epoll_a, sub_a, handler_a) = test_epoll_handler(7);
++        let (epoll_b, sub_b, handler_b) = test_epoll_handler(7);
++
++        let dispatcher_out = dispatcher.clone();
++        registry
++            .subscribe(handler_a, move |handler| {
++                *dispatcher_out.lock().unwrap() = Some(handler);
++                Ok::<(), ()>(())
++            })
++            .unwrap();
++        // Every subscription reinstalls the dispatcher, because installing
++        // is what replays the source's current readiness to a registration
++        // that arrives on a live descriptor.
++        let dispatcher_out = dispatcher.clone();
++        registry
++            .subscribe(handler_b, move |handler| {
++                *dispatcher_out.lock().unwrap() = Some(handler);
++                Ok::<(), ()>(())
++            })
++            .unwrap();
++
++        dispatcher
++            .lock()
++            .unwrap()
++            .as_mut()
++            .unwrap()
++            .push_interest(InterestType::Readable);
++
++        assert_ne!(sub_a.pending_bits(), 0);
++        assert_ne!(sub_b.pending_bits(), 0);
++        assert_eq!(epoll_a.ready.lock().unwrap().len(), 1);
++        assert_eq!(epoll_b.ready.lock().unwrap().len(), 1);
++    }
++
+     #[test]
+     fn epoll_type_to_pending_bit_has_stable_mapping() {
+         assert_eq!(
+@@ -914,23 +1072,31 @@ mod tests {
+         let sub = Arc::new(EpollSubState::new(EpollFd::from_event_ctl(55, &event), 1));
+         epoll_state.insert_subscription(55, sub.clone());
+ 
++        let registry = Arc::new(EpollInterestRegistry::default());
++        let (_, _, handler) = test_epoll_handler(55);
++        let registration = registry.subscribe(handler, |_| Ok::<(), ()>(())).unwrap();
++
+         let (tx, _rx) = Pipe::new().split();
+-        sub.add_join(EpollJoinGuard::new(InodeValFilePollGuard {
+-            fd: 55,
+-            peb: PollEventBuilder::new().build(),
+-            subscription: Subscription {
+-                userdata: 0,
+-                type_: Eventtype::FdRead,
+-                data: SubscriptionUnion {
+-                    fd_readwrite: SubscriptionFsReadwrite {
+-                        file_descriptor: 55,
++        sub.add_join(EpollJoinGuard::new(
++            InodeValFilePollGuard {
++                fd: 55,
++                peb: PollEventBuilder::new().build(),
++                subscription: Subscription {
++                    userdata: 0,
++                    type_: Eventtype::FdRead,
++                    data: SubscriptionUnion {
++                        fd_readwrite: SubscriptionFsReadwrite {
++                            file_descriptor: 55,
++                        },
+                     },
+                 },
++                mode: InodeValFilePollGuardMode::PipeTx {
++                    tx: Arc::new(RwLock::new(Box::new(tx))),
++                },
+             },
+-            mode: InodeValFilePollGuardMode::PipeTx {
+-                tx: Arc::new(RwLock::new(Box::new(tx))),
+-            },
+-        }));
++            registry.clone(),
++            registration,
++        ));
+ 
+         let leaked_ref = sub.clone();
+         assert_eq!(leaked_ref.joins.lock().unwrap().len(), 1);
+@@ -938,5 +1104,6 @@ mod tests {
+         epoll_state.apply_del(55).unwrap();
+ 
+         assert_eq!(leaked_ref.joins.lock().unwrap().len(), 0);
++        assert_eq!(registry.handler_count(), 0);
+     }
+ }
