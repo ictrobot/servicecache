@@ -13,7 +13,7 @@ Files also keep their position in process memory and use `pread` and
 `pwrite`: a forked child shares the kernel's file offset with its parent
 and siblings through the inherited open file description, and a
 seek-then-read in one process read whatever page another had moved the
-offset to. `open` accepts create without write, as Linux does.
+offset to.
 
 Synchronous I/O is the simplest way to keep a guest thread's I/O
 independent of a runtime that fork cannot carry across, and it fits a
@@ -26,7 +26,7 @@ The positional reads and writes are not a choice: clones share the
 kernel's file offset whichever thread does the reading.
 
 diff --git a/lib/virtual-fs/src/host_fs.rs b/lib/virtual-fs/src/host_fs.rs
-index c765c4d..097ff12 100644
+index 701eb40..41dc1e5 100644
 --- a/lib/virtual-fs/src/host_fs.rs
 +++ b/lib/virtual-fs/src/host_fs.rs
 @@ -6,19 +6,25 @@ use bytes::{Buf, Bytes};
@@ -73,19 +73,7 @@ index c765c4d..097ff12 100644
      }
  
      fn prepare_path(&self, path: &Path) -> Result<PathBuf> {
-@@ -343,7 +351,10 @@ impl crate::FileOpener for FileSystem {
- 
-         let mut oo = fs::OpenOptions::new();
-         oo.read(conf.read())
--            .write(conf.write())
-+            // Linux accepts O_CREAT without write access (a program may probe
-+            // a directory's writability by creating a file that way);
-+            // `OpenOptions` would reject create-without-write with EINVAL.
-+            .write(conf.write() || conf.create() || conf.create_new())
-             .create_new(conf.create_new())
-             .create(conf.create())
-             .append(append)
-@@ -351,14 +362,8 @@ impl crate::FileOpener for FileSystem {
+@@ -354,14 +362,8 @@ impl crate::FileOpener for FileSystem {
              .open(&path)
              .map_err(Into::into)
              .map(|file| {
@@ -102,7 +90,7 @@ index c765c4d..097ff12 100644
              })
      }
  }
-@@ -366,10 +371,15 @@ impl crate::FileOpener for FileSystem {
+@@ -369,10 +371,15 @@ impl crate::FileOpener for FileSystem {
  /// A thin wrapper around `std::fs::File`
  #[derive(Debug)]
  pub struct File {
@@ -120,7 +108,7 @@ index c765c4d..097ff12 100644
  }
  
  impl File {
-@@ -378,8 +388,21 @@ impl File {
+@@ -381,8 +388,21 @@ impl File {
      const APPEND: u16 = 4;
  
      /// creates a new host file from a `std::fs::File` and a path
@@ -143,7 +131,7 @@ index c765c4d..097ff12 100644
          file: fs::File,
          host_path: PathBuf,
          read: bool,
-@@ -400,12 +423,12 @@ impl File {
+@@ -403,12 +423,12 @@ impl File {
              _flags |= Self::APPEND;
          }
  
@@ -159,7 +147,7 @@ index c765c4d..097ff12 100644
          }
      }
  
-@@ -468,18 +491,12 @@ impl VirtualFile for File {
+@@ -471,18 +491,12 @@ impl VirtualFile for File {
          None
      }
  
@@ -182,7 +170,7 @@ index c765c4d..097ff12 100644
          Poll::Ready(Ok(remaining as usize))
      }
  
-@@ -491,64 +508,103 @@ impl VirtualFile for File {
+@@ -494,64 +508,103 @@ impl VirtualFile for File {
  impl AsyncRead for File {
      fn poll_read(
          mut self: Pin<&mut Self>,
@@ -314,7 +302,7 @@ index c765c4d..097ff12 100644
      }
  }
  
-@@ -559,23 +615,11 @@ impl Drop for File {
+@@ -562,23 +615,11 @@ impl Drop for File {
  }
  
  /// A wrapper type around Stdout that implements `VirtualFile`.
@@ -343,7 +331,7 @@ index c765c4d..097ff12 100644
  
  /// Default size for write buffers.
  ///
-@@ -637,39 +681,31 @@ impl AsyncRead for Stdout {
+@@ -640,39 +681,31 @@ impl AsyncRead for Stdout {
  
  impl AsyncWrite for Stdout {
      fn poll_write(
@@ -394,7 +382,7 @@ index c765c4d..097ff12 100644
      }
  }
  
-@@ -684,23 +720,11 @@ impl AsyncSeek for Stdout {
+@@ -687,23 +720,11 @@ impl AsyncSeek for Stdout {
  }
  
  /// A wrapper type around Stderr that implements `VirtualFile`.
@@ -423,7 +411,7 @@ index c765c4d..097ff12 100644
  
  impl AsyncRead for Stderr {
      fn poll_read(
-@@ -714,39 +738,31 @@ impl AsyncRead for Stderr {
+@@ -717,39 +738,31 @@ impl AsyncRead for Stderr {
  
  impl AsyncWrite for Stderr {
      fn poll_write(
@@ -474,7 +462,7 @@ index c765c4d..097ff12 100644
      }
  }
  
-@@ -800,30 +816,25 @@ impl VirtualFile for Stderr {
+@@ -803,30 +816,25 @@ impl VirtualFile for Stderr {
  }
  
  /// A wrapper type around Stdin that implements `VirtualFile`.
@@ -510,7 +498,7 @@ index c765c4d..097ff12 100644
          buf: &mut tokio::io::ReadBuf<'_>,
      ) -> Poll<io::Result<()>> {
          let max_size = buf.remaining();
-@@ -840,9 +851,14 @@ impl AsyncRead for Stdin {
+@@ -843,9 +851,14 @@ impl AsyncRead for Stdin {
              }
          }
  
@@ -528,7 +516,7 @@ index c765c4d..097ff12 100644
      }
  }
  
-@@ -916,12 +932,9 @@ impl VirtualFile for Stdin {
+@@ -919,12 +932,9 @@ impl VirtualFile for Stdin {
              }
          }
  

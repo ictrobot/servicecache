@@ -15,7 +15,8 @@ checkout="${1:-$root/work/wasmer-dev}"
 
 # range-start range-end set-directory, innermost first.
 SETS=(
-  "v$WASMER_VERSION servicecache wasmer/servicecache/patches"
+  "v$WASMER_VERSION fixes wasmer/fixes/patches"
+  "fixes servicecache wasmer/servicecache/patches"
 )
 
 for entry in "${SETS[@]}"; do

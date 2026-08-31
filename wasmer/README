@@ -9,13 +9,16 @@ not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
 - stock: no patches. Every guest must run under it unchanged, and it is
   the unpatched baseline for test.sh.
 
+- fixes: fixes to upstream Wasmer that are not specific to ServiceCache.
+
 - servicecache: the runtime the host embeds ([patch.crates-io] in Cargo.toml
-  points at its checkout). Its patch set makes a guest coroutine suspend on
-  a blocking host wait instead of parking its OS thread, lets guest threads
-  be resurrected on fresh threads in a forked child, rebuilds the selector
-  after a fork, replaces a clone's listening socket, and keeps host I/O
-  from going through a runtime handle captured at construction. Suspension
-  is off unless the host enables it; the I/O changes apply always.
+  points at its checkout). It applies the fixes set and then its own, which
+  makes a guest coroutine suspend on a blocking host wait instead of parking
+  its OS thread, lets guest threads be resurrected on fresh threads in a forked
+  child, rebuilds the selector after a fork, replaces a clone's listening
+  socket, and keeps host I/O from going through a runtime handle captured at
+  construction. Suspension is off unless the host enables it; the I/O changes
+  apply always.
 
 build.sh <variant> builds and installs a variant's CLI; setup.sh <variant>
 only prepares its checkout; test.sh <variant> runs the unit tests of the

@@ -1,0 +1,51 @@
+Subject: virtual-fs: accept create without write access
+
+Linux accepts O_CREAT without write access (a program may probe a
+directory's writability by creating a file that way), but host_fs
+passed the guest's write flag straight to `OpenOptions`, which rejects
+create-without-write with EINVAL before making any syscall, so such an
+open failed inside the guest. Request write access from the host
+whenever the open creates.
+
+diff --git a/lib/virtual-fs/src/host_fs.rs b/lib/virtual-fs/src/host_fs.rs
+index c765c4d..701eb40 100644
+--- a/lib/virtual-fs/src/host_fs.rs
++++ b/lib/virtual-fs/src/host_fs.rs
+@@ -343,7 +343,10 @@ impl crate::FileOpener for FileSystem {
+ 
+         let mut oo = fs::OpenOptions::new();
+         oo.read(conf.read())
+-            .write(conf.write())
++            // Linux accepts O_CREAT without write access (a program may probe
++            // a directory's writability by creating a file that way);
++            // `OpenOptions` would reject create-without-write with EINVAL.
++            .write(conf.write() || conf.create() || conf.create_new())
+             .create_new(conf.create_new())
+             .create(conf.create())
+             .append(append)
+@@ -968,6 +971,25 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn test_create_without_write_access() {
++        let temp = TempDir::new().unwrap();
++        let fs = FileSystem::new(Handle::current(), temp.path()).expect("get filesystem");
++
++        assert!(
++            fs.new_open_options()
++                .read(true)
++                .create(true)
++                .open(Path::new("/probe.txt"))
++                .is_ok(),
++            "create with read-only access succeeds, as it does on Linux"
++        );
++        assert!(
++            temp.path().join("probe.txt").exists(),
++            "probe.txt exists in host_fs"
++        );
++    }
++
+     #[tokio::test]
+     async fn test_create_dir() {
+         let temp: TempDir = TempDir::new().unwrap();
