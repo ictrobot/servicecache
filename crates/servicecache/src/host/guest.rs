@@ -23,6 +23,16 @@ use crate::{
     runtime::{ReadOnlyMount, read_only_mounts},
 };
 
+/// Compiles on a private Rayon pool that is dropped before this returns.
+/// Rayon's global pool is permanent and would make the host unforkable.
+fn compile_module(engine: &Engine, bytes: &[u8]) -> Result<Module, wasmer::CompileError> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("compile-{i}"))
+        .build()
+        .map_err(|error| wasmer::CompileError::Resource(error.to_string()))?;
+    pool.install(|| Module::from_binary(engine, bytes))
+}
+
 /// One run of a module: the prepare step, the serving guest, or the
 /// initializer.
 #[derive(Debug)]
@@ -84,18 +94,7 @@ impl GuestRuntime {
         if let Some(module) = modules.get(path) {
             return Ok(module.clone());
         }
-        let module = self.cache.load(&self.engine, path, |engine, bytes| {
-            // The compiler parallelises with rayon, partly on the global
-            // pool, whose workers would live for the rest of the process: a
-            // freeze cannot allow that, and a forked child could not compile
-            // against the parent's dead workers. A private pool, dropped
-            // afterwards, leaves no threads behind.
-            let pool = rayon::ThreadPoolBuilder::new()
-                .thread_name(|i| format!("compile-{i}"))
-                .build()
-                .map_err(|error| wasmer::CompileError::Resource(error.to_string()))?;
-            pool.install(|| Module::from_binary(engine, bytes))
-        })?;
+        let module = self.cache.load(&self.engine, path, compile_module)?;
         modules.insert(path.to_path_buf(), module.clone());
         Ok(module)
     }
@@ -113,8 +112,16 @@ impl GuestRuntime {
         runtime.set_engine(self.engine.clone());
         // Child processes load modules lazily through the WASIX runtime. Put
         // its shared in-memory cache in front of the same persistent cache as
-        // top-level modules.
+        // top-level modules. The compiler goes through `load_bytes` too: its
+        // second lookup and cross-process lock close the gap between WASIX's
+        // separate load and compile/save calls.
         runtime.set_module_cache(SharedCache::new().with_fallback(self.cache.clone()));
+        let cache = self.cache.clone();
+        runtime.set_module_compiler(move |engine, bytes, _progress| {
+            cache
+                .load_bytes(engine, bytes, "spawned WASIX module", compile_module)
+                .map_err(|error| wasmer::CompileError::Resource(error.to_string()))
+        });
         if run.network {
             runtime.networking = self.networking.clone();
         } else {

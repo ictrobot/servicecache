@@ -14,7 +14,9 @@
 //! `wasmer-cache` is not used: it keys by module hash alone and writes entries
 //! in place. Commands spawned inside a guest use the same persistent entries
 //! through Wasmer-wasix's module-cache interface, with its shared in-memory
-//! cache in front. The serialisation underneath is the same.
+//! cache in front. `ServiceCache` also replaces the cache-miss compiler so it
+//! can hold this cache's cross-process lock over compilation while using a
+//! disposable thread pool. The serialisation underneath is the same.
 //!
 //! The directory is `--cache-dir`, else `SERVICECACHE_CACHE_DIR`, else
 //! `$XDG_CACHE_HOME/servicecache` (`~/.cache/servicecache`). Loading an
@@ -153,6 +155,8 @@ impl ModuleCache {
         let (entry_dir, entry) = self.entry(engine, hash);
         let _lock_file = lock_entry(&entry_dir, &entry)?;
         // A complete artifact with this content and engine key is equivalent.
+        // In particular, the compiler hook normally stored it just before
+        // Wasmer-wasix calls `save` on its cache chain.
         if entry.is_file() {
             return Ok(());
         }

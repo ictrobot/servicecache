@@ -1,0 +1,283 @@
+Subject: wasix: let a runtime replace module compilation
+
+The first compilation of a spawned module happens lazily inside the
+runtime, on a global Rayon pool that is created on first use and never
+torn down. An embedder that stops every thread and forks, as a host
+that freezes guests does, cannot tolerate permanent compiler workers
+appearing as a side effect of an exec. Add a ModuleCompiler hook to
+the Runtime trait: when it is set, a module cache miss compiles
+through the callback, and the embedder chooses where that work runs,
+for example a disposable pool it joins before returning. The test
+checks the hook is used once and the cache answers from then on.
+
+diff --git a/lib/wasix/src/runtime/mod.rs b/lib/wasix/src/runtime/mod.rs
+index 739a128..fbe02c4 100644
+--- a/lib/wasix/src/runtime/mod.rs
++++ b/lib/wasix/src/runtime/mod.rs
+@@ -303,6 +303,52 @@ impl<'a> ModuleInput<'a> {
+     }
+ }
+ 
++type ModuleCompilerCallback = dyn Fn(&Engine, &[u8], Option<CompilationProgressCallback>) -> Result<Module, wasmer::CompileError>
++    + Send
++    + Sync;
++
++/// A runtime hook that compiles a module after a module-cache miss.
++///
++/// The hook is synchronous, like Wasmer's built-in compilation path. A host
++/// can use it to choose where compilation runs, for example on a disposable
++/// thread pool that will not outlive the compilation.
++#[derive(Clone)]
++pub struct ModuleCompiler {
++    callback: Arc<ModuleCompilerCallback>,
++}
++
++impl ModuleCompiler {
++    pub fn new(
++        callback: impl Fn(
++            &Engine,
++            &[u8],
++            Option<CompilationProgressCallback>,
++        ) -> Result<Module, wasmer::CompileError>
++        + Send
++        + Sync
++        + 'static,
++    ) -> Self {
++        Self {
++            callback: Arc::new(callback),
++        }
++    }
++
++    fn compile(
++        &self,
++        engine: &Engine,
++        wasm: &[u8],
++        progress: Option<CompilationProgressCallback>,
++    ) -> Result<Module, wasmer::CompileError> {
++        (self.callback)(engine, wasm, progress)
++    }
++}
++
++impl fmt::Debug for ModuleCompiler {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("ModuleCompiler(..)")
++    }
++}
++
+ /// Runtime components used when running WebAssembly programs.
+ ///
+ /// Think of this as the "System" in "WebAssembly Systems Interface".
+@@ -333,6 +379,11 @@ where
+         Arc::new(ThreadLocalCache::default())
+     }
+ 
++    /// A replacement for Wasmer's built-in compilation after a cache miss.
++    fn module_compiler(&self) -> Option<&ModuleCompiler> {
++        None
++    }
++
+     /// The package registry.
+     fn source(&self) -> Arc<dyn Source + Send + Sync>;
+ 
+@@ -423,7 +474,10 @@ where
+ 
+         let module_cache = self.module_cache();
+ 
+-        let task = async move { load_module(&engine, &module_cache, input, on_progress).await };
++        let compiler = self.module_compiler();
++        let task = async move {
++            load_module_with_compiler(&engine, &module_cache, input, on_progress, compiler).await
++        };
+         Box::pin(task)
+     }
+ 
+@@ -531,6 +585,16 @@ pub async fn load_module(
+     module_cache: &(dyn ModuleCache + Send + Sync),
+     input: ModuleInput<'_>,
+     on_progress: Option<ModuleLoadProgressReporter>,
++) -> Result<Module, crate::SpawnError> {
++    load_module_with_compiler(engine, module_cache, input, on_progress, None).await
++}
++
++async fn load_module_with_compiler(
++    engine: &Engine,
++    module_cache: &(dyn ModuleCache + Send + Sync),
++    input: ModuleInput<'_>,
++    on_progress: Option<ModuleLoadProgressReporter>,
++    compiler: Option<&ModuleCompiler>,
+ ) -> Result<Module, crate::SpawnError> {
+     let wasm_hash = input.hash();
+ 
+@@ -554,16 +618,19 @@ pub async fn load_module(
+         }
+     }
+ 
+-    let res = if let Some(progress) = on_progress {
+-        #[allow(unused_variables)]
+-        let p = CompilationProgressCallback::new(move |p| {
++    let progress = on_progress.map(|progress| {
++        CompilationProgressCallback::new(move |p| {
+             progress.notify(ModuleLoadProgress::CompilingModule(p))
+-        });
++        })
++    });
++    let res = if let Some(compiler) = compiler {
++        compiler.compile(engine, input.wasm(), progress)
++    } else if let Some(_progress) = progress {
+         #[cfg(feature = "sys")]
+         {
+             if engine.is_sys() {
+                 use wasmer::sys::NativeEngineExt;
+-                engine.new_module_with_progress(input.wasm(), p)
++                engine.new_module_with_progress(input.wasm(), _progress)
+             } else {
+                 Module::new(&engine, input.wasm())
+             }
+@@ -626,6 +693,7 @@ pub struct PluggableRuntime {
+     pub source: Arc<dyn Source + Send + Sync>,
+     pub engine: Engine,
+     pub module_cache: Arc<dyn ModuleCache + Send + Sync>,
++    pub module_compiler: Option<ModuleCompiler>,
+     pub tty: Option<Arc<dyn TtyBridge + Send + Sync>>,
+     #[cfg(feature = "journal")]
+     pub read_only_journals: Vec<Arc<DynReadableJournal>>,
+@@ -667,6 +735,7 @@ impl PluggableRuntime {
+             source: Arc::new(source),
+             package_loader: Arc::new(loader),
+             module_cache: Arc::new(module_cache::in_memory()),
++            module_compiler: None,
+             #[cfg(feature = "journal")]
+             read_only_journals: Vec::new(),
+             #[cfg(feature = "journal")]
+@@ -701,6 +770,21 @@ impl PluggableRuntime {
+         self
+     }
+ 
++    pub fn set_module_compiler(
++        &mut self,
++        compiler: impl Fn(
++            &Engine,
++            &[u8],
++            Option<CompilationProgressCallback>,
++        ) -> Result<Module, wasmer::CompileError>
++        + Send
++        + Sync
++        + 'static,
++    ) -> &mut Self {
++        self.module_compiler = Some(ModuleCompiler::new(compiler));
++        self
++    }
++
+     pub fn set_source(&mut self, source: impl Source + Send + 'static) -> &mut Self {
+         self.source = Arc::new(source);
+         self
+@@ -853,6 +937,10 @@ impl Runtime for PluggableRuntime {
+         self.module_cache.clone()
+     }
+ 
++    fn module_compiler(&self) -> Option<&ModuleCompiler> {
++        self.module_compiler.as_ref()
++    }
++
+     fn additional_imports(
+         &self,
+         module: &wasmer::Module,
+@@ -917,6 +1005,7 @@ pub struct OverriddenRuntime {
+     source: Option<Arc<dyn Source + Send + Sync>>,
+     engine: Option<Engine>,
+     module_cache: Option<Arc<dyn ModuleCache + Send + Sync>>,
++    module_compiler: Option<ModuleCompiler>,
+     tty: Option<Arc<dyn TtyBridge + Send + Sync>>,
+     instantiation_hooks: Vec<Arc<dyn InstantiationHook>>,
+     #[cfg(feature = "journal")]
+@@ -936,6 +1025,7 @@ impl OverriddenRuntime {
+             source: None,
+             engine: None,
+             module_cache: None,
++            module_compiler: None,
+             tty: None,
+             instantiation_hooks: Vec::new(),
+             #[cfg(feature = "journal")]
+@@ -983,6 +1073,21 @@ impl OverriddenRuntime {
+         self
+     }
+ 
++    pub fn with_module_compiler(
++        mut self,
++        compiler: impl Fn(
++            &Engine,
++            &[u8],
++            Option<CompilationProgressCallback>,
++        ) -> Result<Module, wasmer::CompileError>
++        + Send
++        + Sync
++        + 'static,
++    ) -> Self {
++        self.module_compiler = Some(ModuleCompiler::new(compiler));
++        self
++    }
++
+     pub fn with_tty(mut self, tty: Arc<dyn TtyBridge + Send + Sync>) -> Self {
+         self.tty.replace(tty);
+         self
+@@ -1076,6 +1181,12 @@ impl Runtime for OverriddenRuntime {
+         }
+     }
+ 
++    fn module_compiler(&self) -> Option<&ModuleCompiler> {
++        self.module_compiler
++            .as_ref()
++            .or_else(|| self.inner.module_compiler())
++    }
++
+     fn engine(&self) -> Engine {
+         if let Some(engine) = self.engine.clone() {
+             engine
+@@ -1192,7 +1303,15 @@ impl Runtime for OverriddenRuntime {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::InstantiationState;
++    use std::sync::{
++        Arc,
++        atomic::{AtomicUsize, Ordering},
++    };
++
++    use super::{
++        InstantiationState, ModuleCompiler, ModuleInput, load_module_with_compiler,
++        module_cache::SharedCache,
++    };
+ 
+     #[test]
+     fn instantiation_state_round_trips_the_hook_data() {
+@@ -1217,4 +1336,30 @@ mod tests {
+         let err = state.take::<u32>().unwrap_err();
+         assert!(err.to_string().contains("does not belong to this hook"));
+     }
++
++    #[test]
++    fn module_compiler_is_used_once_then_the_cache_wins() {
++        let engine = wasmer::Engine::default();
++        let cache = SharedCache::new();
++        let calls = Arc::new(AtomicUsize::new(0));
++        let called = calls.clone();
++        let compiler = ModuleCompiler::new(move |engine, wasm, _progress| {
++            called.fetch_add(1, Ordering::SeqCst);
++            wasmer::Module::new(engine, wasm)
++        });
++        let wasm = b"(module (func (export \"run\")))";
++
++        for _ in 0..2 {
++            virtual_mio::block_on(load_module_with_compiler(
++                &engine,
++                &cache,
++                ModuleInput::Bytes(wasm.as_slice().into()),
++                None,
++                Some(&compiler),
++            ))
++            .unwrap();
++        }
++
++        assert_eq!(calls.load(Ordering::SeqCst), 1);
++    }
+ }

@@ -11,3 +11,4 @@
 0011-virtual-io-virtual-net-replace-a-listener-after-a-fo.patch
 0012-virtual-net-accept-as-the-local-stream-type.patch
 0013-vm-keep-a-registry-of-linear-memories.patch
+0014-wasix-let-a-runtime-replace-module-compilation.patch
