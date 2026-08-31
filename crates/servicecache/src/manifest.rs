@@ -273,13 +273,18 @@ fn resolve_file(
     Ok(resolved)
 }
 
-/// A package path must be plain names, nothing else: no root, no `..`,
-/// no `.`, so it cannot name anything above the manifest's directory.
+/// A package path must be plain names and `.`, nothing else: no root and
+/// no `..`, so it cannot name anything above the manifest's directory.
 fn reject_escape(path: &Path, description: &str) -> Result<()> {
-    if !path
-        .components()
-        .all(|part| matches!(part, std::path::Component::Normal(_)))
-    {
+    // `.` components are harmless — `.` itself mounts the package root —
+    // and containment is enforced through the canonical path anyway; only
+    // parent, root and prefix components can try to leave.
+    if !path.components().all(|part| {
+        matches!(
+            part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
         bail!(
             "{description} {} must be a plain relative path inside the package",
             path.display()
@@ -402,6 +407,30 @@ mod tests {
             error.to_string().contains("resolves outside the package"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn mounts_the_package_root_as_a_source() {
+        let directory = TestDirectory::new();
+        directory.write("server.wasm", "module");
+        directory.write(
+            "service.toml",
+            r#"
+                [service]
+                name = "example"
+                version = "1"
+
+                [prepare]
+                fs = { "/service" = "." }
+
+                [guest]
+                module = "server.wasm"
+                listen_port = 1234
+            "#,
+        );
+        let manifest = Manifest::load(&directory.0.join("service.toml")).expect("load manifest");
+        let prepare = manifest.prepare.expect("a prepare step");
+        assert_eq!(prepare.fs[&PathBuf::from("/service")], directory.0);
     }
 
     #[test]
