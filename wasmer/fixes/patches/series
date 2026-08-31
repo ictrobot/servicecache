@@ -2,3 +2,5 @@
 0002-virtual-fs-accept-create-without-write-access.patch
 0003-wasix-support-multiple-epoll-registrations-per-file.patch
 0004-wasix-honor-mapped-commands-under-sys-minimal.patch
+0005-wasix-signal-the-parent-when-a-virtual-process-exits.patch
+0006-wasix-honor-nonblocking-joins-for-any-child.patch

@@ -1,0 +1,171 @@
+Subject: wasix: honor nonblocking joins for any child
+
+waitpid(-1, WNOHANG) could not tell "children exist but none has
+finished" from "there are no children", and did not reliably reap an
+arbitrary finished child; a parent cycling workers saw phantom ECHILD
+or a join that never completed. try_join_any_child now reaps a
+finished child when there is one, reports that children are still
+running otherwise, and returns ECHILD only when the process has none;
+proc_join uses it for the nonblocking any-child case.
+
+diff --git a/lib/wasix/src/os/task/process.rs b/lib/wasix/src/os/task/process.rs
+index 6d8e4ed..4deeb12 100644
+--- a/lib/wasix/src/os/task/process.rs
++++ b/lib/wasix/src/os/task/process.rs
+@@ -868,6 +868,27 @@ impl WasiProcess {
+         Ok(Some((child.pid, code)))
+     }
+ 
++    /// Attempts to join any child process without blocking.
++    pub fn try_join_any_child(&mut self) -> Result<Option<(WasiProcessId, ExitCode)>, Errno> {
++        let mut inner = self.inner.0.lock().unwrap();
++        if inner.children.is_empty() {
++            return Err(Errno::Child);
++        }
++
++        let finished = inner
++            .children
++            .iter()
++            .find_map(|child| child.try_join().map(|result| (child.pid, result)));
++        let Some((pid, result)) = finished else {
++            return Ok(None);
++        };
++
++        inner.children.retain(|child| child.pid != pid);
++        let code = result
++            .unwrap_or_else(|err| err.as_exit_code().unwrap_or_else(|| Errno::Canceled.into()));
++        Ok(Some((pid, code)))
++    }
++
+     /// Terminate the process and all its threads
+     pub fn terminate(&self, exit_code: ExitCode) {
+         let pid = self.pid;
+@@ -912,7 +933,7 @@ fn signal_process_internal(process: &LockableWasiProcessInner, signal: Signal) {
+ 
+     // Check if there are subprocesses that will receive this signal
+     // instead of this process
+-    if guard.waiting.load(Ordering::Acquire) > 0 {
++    if signal != Signal::Sigchld && guard.waiting.load(Ordering::Acquire) > 0 {
+         let mut triggered = false;
+         for child in guard.children.iter() {
+             child.signal_process(signal);
+@@ -995,7 +1016,42 @@ mod tests {
+         child.set_parent(&parent);
+ 
+         assert_eq!(child.ppid(), parent.pid());
++        let _wait = WasiProcessWait::new(&parent);
+         child.signal_parent(Signal::Sigchld);
+         assert!(parent_thread.as_thread().has_signal(&[Signal::Sigchld]));
+     }
++
++    #[test]
++    fn joining_any_child_can_be_non_blocking() {
++        let plane = WasiControlPlane::default();
++        let mut parent = plane.new_process(ModuleHash::random()).unwrap();
++        let first = plane.new_process(ModuleHash::random()).unwrap();
++        let _first_thread = first
++            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
++            .unwrap();
++        let second = plane.new_process(ModuleHash::random()).unwrap();
++        let _second_thread = second
++            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
++            .unwrap();
++        parent
++            .lock()
++            .children
++            .extend([first.clone(), second.clone()]);
++
++        assert!(parent.try_join_any_child().unwrap().is_none());
++
++        second.terminate(ExitCode::from(7));
++        assert_eq!(
++            parent.try_join_any_child().unwrap(),
++            Some((second.pid(), ExitCode::from(7)))
++        );
++        assert!(parent.try_join_any_child().unwrap().is_none());
++
++        first.terminate(ExitCode::from(0));
++        assert_eq!(
++            parent.try_join_any_child().unwrap(),
++            Some((first.pid(), ExitCode::from(0)))
++        );
++        assert_eq!(parent.try_join_any_child(), Err(Errno::Child));
++    }
+ }
+diff --git a/lib/wasix/src/syscalls/wasix/proc_join.rs b/lib/wasix/src/syscalls/wasix/proc_join.rs
+index 67e2add..894fa5e 100644
+--- a/lib/wasix/src/syscalls/wasix/proc_join.rs
++++ b/lib/wasix/src/syscalls/wasix/proc_join.rs
+@@ -9,7 +9,7 @@ use crate::{WasiProcess, syscalls::*};
+ 
+ #[derive(Serialize, Deserialize)]
+ enum JoinStatusResult {
+-    Nothing,
++    Nothing(Option<WasiProcessId>),
+     ExitNormal(WasiProcessId, ExitCode),
+     Err(Errno),
+ }
+@@ -48,10 +48,20 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
+ 
+             let view = unsafe { ctx.data().memory_view(&ctx) };
+             let status = match status {
+-                JoinStatusResult::Nothing => JoinStatus {
+-                    tag: JoinStatusType::Nothing,
+-                    u: JoinStatusUnion { nothing: 0 },
+-                },
++                JoinStatusResult::Nothing(pid) => {
++                    if let Some(pid) = pid {
++                        let option_pid = OptionPid {
++                            tag: OptionTag::Some,
++                            pid: pid.raw() as Pid,
++                        };
++                        pid_ptr.write(&view, option_pid).ok();
++                    }
++
++                    JoinStatus {
++                        tag: JoinStatusType::Nothing,
++                        u: JoinStatusUnion { nothing: 0 },
++                    }
++                }
+                 JoinStatusResult::ExitNormal(pid, exit_code) => {
+                     let option_pid = OptionPid {
+                         tag: OptionTag::Some,
+@@ -118,6 +128,21 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
+         None => {
+             let mut process = ctx.data_mut().process.clone();
+ 
++            if flags.contains(JoinFlags::NON_BLOCKING) {
++                let result = match process.try_join_any_child() {
++                    Ok(Some((pid, exit_code))) => JoinStatusResult::ExitNormal(pid, exit_code),
++                    Ok(None) => {
++                        // wasix-libc distinguishes "children are still running"
++                        // from ECHILD using the output PID, even though waitpid()
++                        // returns zero for this status.
++                        let pid = process.lock().children.first().map(|child| child.pid());
++                        JoinStatusResult::Nothing(pid)
++                    }
++                    Err(err) => JoinStatusResult::Err(err),
++                };
++                return ret_result(ctx, result);
++            }
++
+             // We wait for any process to exit (if it takes too long
+             // then we go into a deep sleep)
+             let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
+@@ -184,7 +209,7 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
+                 let exit_code = status.unwrap_or_else(|_| Errno::Child.into());
+                 ret_result(ctx, JoinStatusResult::ExitNormal(pid, exit_code))
+             } else {
+-                ret_result(ctx, JoinStatusResult::Nothing)
++                ret_result(ctx, JoinStatusResult::Nothing(Some(pid)))
+             }
+         } else {
+             // Wait for the process to finish
+@@ -201,6 +226,6 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
+         }
+     } else {
+         trace!(ret_id = pid.raw(), "status=nothing");
+-        ret_result(ctx, JoinStatusResult::Nothing)
++        ret_result(ctx, JoinStatusResult::Nothing(None))
+     }
+ }

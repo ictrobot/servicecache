@@ -1,0 +1,106 @@
+Subject: wasix: signal the parent when a virtual process exits
+
+A parent that waits for SIGCHLD could miss its children's exits: an
+exiting virtual process did not consistently signal the process that
+spawned it, so a reaping loop driven by the signal never ran and
+finished children sat unreaped. Give every process a weak reference to
+its parent, set when it is spawned, and deliver SIGCHLD through it on
+termination. The test observes a child's exit through the delivered
+signal alone.
+
+diff --git a/lib/wasix/src/os/task/process.rs b/lib/wasix/src/os/task/process.rs
+index a0b1fc5..6d8e4ed 100644
+--- a/lib/wasix/src/os/task/process.rs
++++ b/lib/wasix/src/os/task/process.rs
+@@ -9,7 +9,7 @@ use std::{
+     convert::TryInto,
+     ops::Range,
+     sync::{
+-        Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
++        Arc, Condvar, Mutex, MutexGuard, Weak,
+         atomic::{AtomicU32, Ordering},
+     },
+     task::Waker,
+@@ -95,7 +95,7 @@ pub struct WasiProcess {
+     /// Hash of the module that this process is using
+     pub(crate) module_hash: ModuleHash,
+     /// List of all the children spawned from this thread
+-    pub(crate) parent: Option<Weak<RwLock<WasiProcessInner>>>,
++    pub(crate) parent: Option<Weak<(Mutex<WasiProcessInner>, Condvar)>>,
+     /// The inner protected region of the process with a conditional
+     /// variable that is used for coordination such as snapshots.
+     pub(crate) inner: LockableWasiProcessInner,
+@@ -492,6 +492,17 @@ impl WasiProcess {
+ 
+     pub(super) fn set_pid(&mut self, pid: WasiProcessId) {
+         self.pid = pid;
++        self.inner.0.lock().unwrap().pid = pid;
++    }
++
++    pub(crate) fn set_parent(&mut self, parent: &WasiProcess) {
++        self.parent = Some(Arc::downgrade(&parent.inner));
++    }
++
++    pub(crate) fn signal_parent(&self, signal: Signal) {
++        if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
++            signal_process_internal(&parent, signal);
++        }
+     }
+ 
+     /// Gets the process ID of this process
+@@ -504,7 +515,7 @@ impl WasiProcess {
+         self.parent
+             .iter()
+             .filter_map(|parent| parent.upgrade())
+-            .map(|parent| parent.read().unwrap().pid)
++            .map(|parent| parent.0.lock().unwrap().pid)
+             .next()
+             .unwrap_or(WasiProcessId(0))
+     }
+@@ -967,3 +978,24 @@ impl SignalHandlerAbi for WasiProcess {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::os::task::control_plane::WasiControlPlane;
++
++    #[test]
++    fn child_signals_are_delivered_to_the_parent() {
++        let plane = WasiControlPlane::default();
++        let parent = plane.new_process(ModuleHash::random()).unwrap();
++        let parent_thread = parent
++            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
++            .unwrap();
++        let mut child = plane.new_process(ModuleHash::random()).unwrap();
++        child.set_parent(&parent);
++
++        assert_eq!(child.ppid(), parent.pid());
++        child.signal_parent(Signal::Sigchld);
++        assert!(parent_thread.as_thread().has_signal(&[Signal::Sigchld]));
++    }
++}
+diff --git a/lib/wasix/src/state/env.rs b/lib/wasix/src/state/env.rs
+index 72e1e71..1555bc5 100644
+--- a/lib/wasix/src/state/env.rs
++++ b/lib/wasix/src/state/env.rs
+@@ -253,7 +253,8 @@ impl WasiEnv {
+ 
+     /// Forking the WasiState is used when either fork or vfork is called
+     pub fn fork(&self) -> Result<(Self, WasiThreadHandle), ControlPlaneError> {
+-        let process = self.control_plane.new_process(self.process.module_hash)?;
++        let mut process = self.control_plane.new_process(self.process.module_hash)?;
++        process.set_parent(&self.process);
+         let handle = process.new_thread(self.layout.clone(), ThreadStartType::MainThread)?;
+ 
+         let thread = handle.as_thread();
+@@ -1315,6 +1316,7 @@ impl WasiEnv {
+                     // Otherwise a pending Sigquit can win the status race and
+                     // make waiters observe a successful exit.
+                     process.terminate(process_exit_code);
++                    process.signal_parent(Signal::Sigchld);
+                     process.signal_process(Signal::Sigquit);
+                 }
+             })
