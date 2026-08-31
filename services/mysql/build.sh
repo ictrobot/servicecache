@@ -48,6 +48,11 @@ case "$SC_VERSION" in
     ;;
 esac
 
+# MySQL's CMake sniffs the host distribution with `rpm -qf /`; on a .el9
+# host that leaks -Wl,--copy-dt-needed-entries into the link options,
+# which wasm-ld rejects.
+distro_options=(-DMY_RPM=MY_RPM-NOTFOUND)
+
 servicecache_revision="$(git -C "$SC_ROOT" rev-parse --short HEAD)"
 cmake -S "$SC_SRC" -B "$SC_BUILD" \
   -G "Unix Makefiles" \
@@ -59,6 +64,7 @@ cmake -S "$SC_SRC" -B "$SC_BUILD" \
   -DCMAKE_INSTALL_PREFIX="$SC_BUILD/install" \
   -DTMPDIR=/tmp \
   -DFORCE_UNSUPPORTED_COMPILER=ON \
+  "${distro_options[@]}" \
   -DWITH_DEFAULT_COMPILER_OPTIONS=OFF \
   -DWITH_UNIT_TESTS=OFF \
   -DWITH_ROUTER=OFF \
