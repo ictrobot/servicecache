@@ -125,7 +125,7 @@ impl HostProcess {
     ///
     /// # Errors
     ///
-    /// Fails if the guest exits before listening or the request is refused.
+    /// Fails if the guest exits before it is ready or the request is refused.
     pub fn start(&mut self) -> Result<SocketAddr> {
         let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind a listener")?;
         let reply = self.request(Request::Start, &[], &[listener.as_raw_fd()])?;

@@ -3150,6 +3150,7 @@ dependencies = [
  "libtest-mimic",
  "nix 0.29.0",
  "rayon",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",

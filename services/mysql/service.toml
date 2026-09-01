@@ -11,6 +11,8 @@ args = ["--no-defaults", "--initialize-insecure", "--user=root", "--basedir=/", 
 module = "mysqld.wasm"
 args = ["--no-defaults", "--user=root", "--basedir=/", "--datadir=/data", "--tmpdir=/tmp", "--lc-messages-dir=/usr/share/mysql", "--character-sets-dir=/usr/share/mysql/charsets", "--port=3306", "--bind-address=127.0.0.1", "--socket=", "--pid-file=/data/mysqld.pid", "--innodb-buffer-pool-size=16M", "--innodb-redo-log-capacity=16M", "--innodb-open-files=64", "--innodb-read-io-threads=1", "--innodb-write-io-threads=1", "--innodb-purge-threads=1", "--innodb-page-cleaners=1", "--skip-log-bin", "--console"]
 listen_port = 3306
+# The greeting: a packet length, sequence zero, protocol version ten
+ready = { matches = '(?s-u)\A.{3}\x00\x0a' }
 
 [initializer]
 module = "mysql.wasm"

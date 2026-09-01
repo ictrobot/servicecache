@@ -10,6 +10,7 @@
 mod freeze;
 pub mod guest;
 pub mod net;
+mod probe;
 pub mod protocol;
 pub mod tasks;
 
@@ -108,7 +109,7 @@ enum Phase {
     Fresh,
     /// The prepare step has completed.
     Prepared,
-    /// The guest is running (and, once `ready`, listening).
+    /// The guest is running (and, once `ready`, serving).
     Running { ready: bool },
     /// The guest is frozen; only `fork` and `stop` are accepted.
     Frozen,
@@ -130,6 +131,8 @@ enum Event {
     Listening = 1,
     /// A run ended.
     RunEnded = 2,
+    /// The readiness probe finished, either way.
+    Probed = 3,
 }
 
 impl TryFrom<u8> for Event {
@@ -139,6 +142,7 @@ impl TryFrom<u8> for Event {
         match byte {
             1 => Ok(Self::Listening),
             2 => Ok(Self::RunEnded),
+            3 => Ok(Self::Probed),
             other => bail!("unexpected byte {other} in the event pipe"),
         }
     }
@@ -152,6 +156,8 @@ struct Events {
     /// A run ended. The loop re-reads the run's status, so a stale byte
     /// costs nothing.
     run_ended: bool,
+    /// The readiness probe finished; its outcome says how.
+    probed: bool,
 }
 
 impl EventPipe {
@@ -187,6 +193,7 @@ impl EventPipe {
                 match Event::try_from(byte)? {
                     Event::Listening => events.listening = true,
                     Event::RunEnded => events.run_ended = true,
+                    Event::Probed => events.probed = true,
                 }
             }
         }
@@ -215,6 +222,9 @@ struct Host {
     guests: GuestRuntime,
     events: EventPipe,
     guest: Option<TaskJoinHandle>,
+    /// The readiness probe's outcome slot, once one is running. A failure
+    /// carries the last attempt's summary.
+    probe: Option<Arc<std::sync::OnceLock<Result<(), String>>>>,
     shared_memory: Option<wasmer_wasix::SharedMemorySnapshot>,
     phase: Phase,
     /// The zero-page scan of a frozen guest, until it is done.
@@ -262,6 +272,7 @@ impl Host {
             guests,
             events,
             guest: None,
+            probe: None,
             shared_memory: None,
             phase: Phase::Fresh,
             compaction: None,
@@ -344,15 +355,10 @@ impl Host {
         });
     }
 
-    /// Reports what happened since the last tick: the guest listening or
-    /// exiting, clones exiting. Returns `true` when the host should end.
+    /// Reports what happened since the last tick: the guest or clones
+    /// exiting. Returns `true` when the host should end.
     fn tick(&mut self, channel: &Channel) -> Result<bool> {
-        if self.events.drain()?.listening
-            && let Phase::Running { ready: false } = self.phase
-        {
-            self.phase = Phase::Running { ready: true };
-            channel.send(&self.ready_reply()?, &[], &[])?;
-        }
+        self.events.drain()?;
         if self.phase != Phase::Frozen
             && let Some(status) = self.guest.as_ref().and_then(exit_status)
         {
@@ -402,7 +408,7 @@ impl Host {
 
     fn ready_reply(&self) -> Result<Reply> {
         let endpoint = self.networking.endpoint()?;
-        tracing::info!(%endpoint, "guest listening");
+        tracing::info!(%endpoint, "guest ready");
         Ok(Reply::Ready {
             endpoint: endpoint.to_string(),
         })
@@ -522,12 +528,48 @@ impl Host {
         self.phase = Phase::Running { ready: false };
         tracing::info!(module = %guest.module.display(), "guest started");
 
-        // Ready, or dead before it listened.
+        // Ready, or dead before it listened. With a probe declared,
+        // listening starts it and its outcome decides readiness; without
+        // one, listening is readiness.
         loop {
             let readable = self.wait(channel, TICK)?;
-            if self.events.drain()?.listening {
-                self.phase = Phase::Running { ready: true };
-                return Ok(Some(self.ready_reply()?));
+            let events = self.events.drain()?;
+            if events.listening {
+                match &self.manifest.guest.ready {
+                    Some(probe) if self.probe.is_none() => {
+                        let outcome = Arc::new(std::sync::OnceLock::new());
+                        probe::spawn(
+                            self.networking.endpoint()?,
+                            probe.clone(),
+                            outcome.clone(),
+                            self.events.notifier(Event::Probed),
+                        )
+                        .context("failed to start the readiness probe")?;
+                        self.probe = Some(outcome);
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.phase = Phase::Running { ready: true };
+                        return Ok(Some(self.ready_reply()?));
+                    }
+                }
+            }
+            if events.probed {
+                let outcome = self
+                    .probe
+                    .as_ref()
+                    .and_then(|outcome| outcome.get().cloned())
+                    .unwrap_or_else(|| Err("the probe ended without an outcome".to_owned()));
+                match outcome {
+                    Ok(()) => {
+                        self.phase = Phase::Running { ready: true };
+                        return Ok(Some(self.ready_reply()?));
+                    }
+                    Err(summary) => bail!(
+                        "the guest did not answer its readiness probe within {:?}: {summary}",
+                        probe::DEADLINE
+                    ),
+                }
             }
             if let Some(status) = self.guest.as_ref().and_then(exit_status) {
                 return Ok(Some(Reply::Exited {
@@ -544,7 +586,7 @@ impl Host {
 
     fn initialize(&mut self, channel: &Channel, recipe: &[u8]) -> Result<Option<Reply>> {
         if self.phase != (Phase::Running { ready: true }) {
-            bail!("initialize is only accepted while the guest is listening");
+            bail!("initialize is only accepted while the guest is ready");
         }
         let Some(initializer) = self.manifest.initializer.clone() else {
             bail!("the manifest has no initializer");
@@ -583,7 +625,7 @@ impl Host {
         if self.phase != (Phase::Running { ready: true }) {
             return Self::refuse(
                 channel,
-                "freeze is only accepted while the guest is listening".to_owned(),
+                "freeze is only accepted while the guest is ready".to_owned(),
             );
         }
         // Terminal from here, whatever happens.

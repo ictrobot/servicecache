@@ -47,6 +47,18 @@ pub struct Guest {
     pub module: PathBuf,
     pub args: Vec<String>,
     pub listen_port: u16,
+    /// Optional proof the server is serving: bytes the host writes to the
+    /// guest's endpoint and a pattern its response must match before the
+    /// guest is reported ready. Absent, listening is readiness.
+    pub ready: Option<ReadyProbe>,
+}
+
+/// A readiness probe: what to send, empty where the server speaks
+/// first, and what a serving guest answers.
+#[derive(Debug, Clone)]
+pub struct ReadyProbe {
+    pub send: Vec<u8>,
+    pub matches: regex::bytes::Regex,
 }
 
 /// An optional module used to initialize the serving guest.
@@ -83,6 +95,15 @@ struct RawGuest {
     #[serde(default)]
     args: Vec<String>,
     listen_port: u16,
+    ready: Option<RawReadyProbe>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReadyProbe {
+    #[serde(default)]
+    send: String,
+    matches: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +159,18 @@ impl Manifest {
             module: resolve_module(&directory, &canonical, &raw.guest.module, "guest module")?,
             args: raw.guest.args,
             listen_port: raw.guest.listen_port,
+            ready: raw
+                .guest
+                .ready
+                .map(|probe| {
+                    Ok::<ReadyProbe, anyhow::Error>(ReadyProbe {
+                        send: decode_byte_string(&probe.send)
+                            .context("invalid ready probe send bytes")?,
+                        matches: regex::bytes::Regex::new(&probe.matches)
+                            .context("invalid ready probe pattern")?,
+                    })
+                })
+                .transpose()?,
         };
         let initializer = raw
             .initializer
@@ -252,6 +285,38 @@ fn resolve_prepare(raw: RawPrepare, directory: &Path, canonical: &Path) -> Resul
         args: raw.args,
         stdin_file,
     })
+}
+
+/// Decode a manifest byte string: printable ASCII verbatim, `\xNN` for any
+/// byte, `\\` for a backslash. Everything else is refused, so a typo fails
+/// the load rather than the probe, and the manifest stays reviewable.
+fn decode_byte_string(source: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(source.len());
+    let mut chars = source.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('\\') => bytes.push(b'\\'),
+                Some('x') => {
+                    let high = chars.next().and_then(|c| c.to_digit(16));
+                    let low = chars.next().and_then(|c| c.to_digit(16));
+                    match (high, low) {
+                        (Some(high), Some(low)) => bytes.push(
+                            u8::try_from(high * 16 + low).expect("two hex digits fit a byte"),
+                        ),
+                        _ => bail!("\\x needs two hex digits"),
+                    }
+                }
+                other => bail!(
+                    "unsupported escape {}",
+                    other.map_or_else(|| "at end of string".to_owned(), |c| format!("\\{c}"))
+                ),
+            },
+            ' '..='~' => bytes.push(ch as u8),
+            _ => bail!("unsupported character {ch:?}; escape bytes as \\xNN"),
+        }
+    }
+    Ok(bytes)
 }
 
 fn resolve_module(
@@ -439,6 +504,66 @@ mod tests {
         let prepare = manifest.prepare.expect("a prepare step");
         assert_eq!(prepare.fs[&PathBuf::from("/service")], directory.0);
         assert!(manifest.service.extensions.is_empty());
+    }
+
+    #[test]
+    fn byte_strings_decode_strictly() {
+        assert_eq!(
+            decode_byte_string(r"user\x00example\x00\\").expect("decode"),
+            b"user\0example\0\\"
+        );
+        assert_eq!(decode_byte_string("").expect("decode"), b"");
+        for bad in [r"\q", r"\x0", r"\x0g", "\\", "caf\u{e9}", "tab\there"] {
+            assert!(decode_byte_string(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn ready_probes_are_parsed() {
+        let directory = TestDirectory::new();
+        directory.write("server.wasm", "module");
+        directory.write(
+            "service.toml",
+            r#"
+                [service]
+                name = "example"
+                version = "1"
+
+                [guest]
+                module = "server.wasm"
+                listen_port = 1234
+                ready = { send = '\x00ping', matches = '^ok\x00' }
+            "#,
+        );
+        let manifest = Manifest::load(&directory.0.join("service.toml")).expect("load manifest");
+        let probe = manifest.guest.ready.expect("a probe");
+        assert_eq!(probe.send, b"\x00ping");
+        assert!(probe.matches.is_match(b"ok\x00v1"));
+        assert!(!probe.matches.is_match(b"no\x00starting"));
+    }
+
+    #[test]
+    fn a_probe_may_send_nothing_where_the_server_speaks_first() {
+        let directory = TestDirectory::new();
+        directory.write("server.wasm", "module");
+        directory.write(
+            "service.toml",
+            r#"
+                [service]
+                name = "example"
+                version = "1"
+
+                [guest]
+                module = "server.wasm"
+                listen_port = 1234
+                ready = { matches = '(?s-u)\A.{2}\x02' }
+            "#,
+        );
+        let manifest = Manifest::load(&directory.0.join("service.toml")).expect("load manifest");
+        let probe = manifest.guest.ready.expect("a probe");
+        assert_eq!(probe.send, b"");
+        assert!(probe.matches.is_match(b"\x0a\x80\x02hello"));
+        assert!(!probe.matches.is_match(b"\x0a\x80\x03"));
     }
 
     #[test]

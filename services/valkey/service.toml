@@ -6,6 +6,8 @@ version = "{version}"
 module = "valkey-server.wasm"
 args = ["--bind", "127.0.0.1", "--port", "6380", "--protected-mode", "no", "--daemonize", "no", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction", "--dir", "/"]
 listen_port = 6380
+# DBSIZE is refused while a dataset loads, whereas PING would answer
+ready = { send = 'DBSIZE\x0d\x0a', matches = '\A:[0-9]+\x0d\x0a' }
 
 [initializer]
 module = "valkey-cli.wasm"

@@ -85,6 +85,7 @@ stdin_file = "share/bootstrap.sql"              # optional: package file piped t
 module      = "exampledbd.wasm"
 args        = ["--data=/data", "--port=4000"]
 listen_port = 4000
+ready       = { send = '\x00ping', matches = '^ok\x00' }  # optional: proof it serves
 
 [initializer]                                   # optional: run against the guest, recipe on stdin
 module = "exampledb-cli.wasm"
@@ -94,5 +95,6 @@ args   = ["--host", "{host}", "--port", "{port}"]
 - Paths are relative to the manifest's directory; absolute paths are an error.
 - The writable filesystem always starts clean; no state is shipped. `[prepare]` builds what `[guest]` starts on: `fs` mounts read-only trees shipped in the package, and `module`, if present, runs to completion on that filesystem with no network; `stdin_file`, if present, is a package file piped to that run's standard input.
 - `listen_port` is the port the server binds inside the guest. The socket it gets is the one the manager passed, so a guest never binds a real host port; a bind on any other port is refused.
+- `ready`, if present, is bytes the host writes to the guest's endpoint and a bytes regex the response must match before the guest is reported ready. It delays ready, and the initializer with it, where a server has a startup phase in which it answers connections with an error; and it ensures the server is actually in its accept loop before the template freezes. `send` is a byte string, printable ASCII with `\xNN` escapes, omitted where the server speaks first; write both fields in single-quoted TOML strings. Absent, listening is readiness.
 - `[initializer]` runs against the guest's endpoint with `{host}` and `{port}` substituted, receives the recipe on stdin, and must exit 0. The manager never interprets its arguments.
 - Manifests are plain files; the manager never merges or inherits them.
