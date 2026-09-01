@@ -38,6 +38,10 @@ fn compile_module(engine: &Engine, bytes: &[u8]) -> Result<Module, wasmer::Compi
 #[derive(Debug)]
 pub struct GuestRun<'a> {
     pub module: &'a Path,
+    /// What the guest sees as argv[0]: the module's guest-visible path
+    /// where a mount serves it, so a guest that re-executes itself by its
+    /// own program name asks for a path its filesystem can serve.
+    pub program_name: String,
     pub args: Vec<String>,
     pub stdin: &'a [u8],
     /// Whether the run gets the host's networking; the prepare step does not.
@@ -141,13 +145,9 @@ impl GuestRuntime {
             .context("failed to buffer the guest's stdin")?;
         drop(stdin_writer);
 
-        let program_name = run
-            .module
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or("module");
+        let program_name = run.program_name.clone();
         let fs: Arc<dyn virtual_fs::FileSystem + Send + Sync> = self.fs.clone();
-        let mut builder = WasiEnv::builder(program_name)
+        let mut builder = WasiEnv::builder(program_name.clone())
             .args(&run.args)
             .stdin(Box::new(stdin_reader))
             .stdout(Box::new(host_fs::Stderr))

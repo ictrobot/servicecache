@@ -450,6 +450,23 @@ impl Host {
         Ok(Outcome::Continue)
     }
 
+    /// The module's guest-visible path through the manifest's read-only
+    /// mounts, or its file name where no mount serves it: what every run
+    /// gets as its program name.
+    fn program_name(&self, module: &std::path::Path) -> String {
+        self.manifest
+            .prepare
+            .as_ref()
+            .and_then(|prepare| guest_visible_path(&prepare.fs, module))
+            .unwrap_or_else(|| {
+                module
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("module")
+                    .to_owned()
+            })
+    }
+
     fn prepare(&mut self, channel: &Channel) -> Result<Option<Reply>> {
         if self.phase != Phase::Fresh {
             bail!("prepare is only accepted before anything has run");
@@ -460,6 +477,7 @@ impl Host {
                 let stdin = prepare.read_stdin()?;
                 let handle = self.guests.spawn(&GuestRun {
                     module: &module,
+                    program_name: self.program_name(&module),
                     args: prepare.args.clone(),
                     stdin: &stdin,
                     network: false,
@@ -494,6 +512,7 @@ impl Host {
         let guest = self.manifest.guest.clone();
         let handle = self.guests.spawn(&GuestRun {
             module: &guest.module,
+            program_name: self.program_name(&guest.module),
             args: guest.args,
             stdin: &[],
             network: true,
@@ -541,6 +560,7 @@ impl Host {
             .collect();
         let handle = self.guests.spawn(&GuestRun {
             module: &initializer.module,
+            program_name: self.program_name(&initializer.module),
             args,
             stdin: recipe,
             network: true,
@@ -687,5 +707,43 @@ impl Host {
             &[],
         )?;
         Ok(true)
+    }
+}
+
+/// The guest-visible path of a module under one of the manifest's read-only
+/// mounts: the mount's guest point plus the module's path below the mount's
+/// host directory.
+fn guest_visible_path(
+    mounts: &std::collections::BTreeMap<PathBuf, PathBuf>,
+    module: &std::path::Path,
+) -> Option<String> {
+    mounts.iter().find_map(|(guest, host)| {
+        let relative = module.strip_prefix(host).ok()?;
+        Some(guest.join(relative).to_string_lossy().into_owned())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mounted_modules_resolve_to_their_guest_path() {
+        let mounts = std::collections::BTreeMap::from([(
+            PathBuf::from("/service"),
+            PathBuf::from("/packages/exampledb-1"),
+        )]);
+        assert_eq!(
+            guest_visible_path(
+                &mounts,
+                std::path::Path::new("/packages/exampledb-1/server.wasm")
+            )
+            .as_deref(),
+            Some("/service/server.wasm")
+        );
+        assert_eq!(
+            guest_visible_path(&mounts, std::path::Path::new("/elsewhere/tool.wasm")),
+            None
+        );
     }
 }
