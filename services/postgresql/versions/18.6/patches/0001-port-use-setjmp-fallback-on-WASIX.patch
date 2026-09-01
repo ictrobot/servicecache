@@ -1,0 +1,22 @@
+Subject: [PATCH 1/8] port: use setjmp fallback on WASIX
+
+The WASIX sysroot implements setjmp/longjmp through Wasm exception
+handling but does not expose the POSIX sigsetjmp aliases. PostgreSQL does
+not ask the facility to preserve the signal mask, so the existing
+Windows-style fallback has the required semantics here too.
+
+diff --git a/src/include/c.h b/src/include/c.h
+index ae9dbaf..7fccccb 100644
+--- a/src/include/c.h
++++ b/src/include/c.h
+@@ -1354,6 +1354,10 @@ typedef intptr_t sigjmp_buf[5];
+ #define sigsetjmp(x,y) setjmp(x)
+ #define siglongjmp longjmp
+ #endif							/* __MINGW64__ */
++#elif defined(__wasi__)
++#define sigjmp_buf jmp_buf
++#define sigsetjmp(x,y) setjmp(x)
++#define siglongjmp longjmp
+ #endif							/* WIN32 */
+ 
+ /* /port compatibility functions */

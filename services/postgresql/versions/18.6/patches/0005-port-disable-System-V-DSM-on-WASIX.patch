@@ -1,0 +1,36 @@
+Subject: [PATCH 5/8] port: disable System V DSM on WASIX
+
+PostgreSQL assumes that every non-Windows platform has System V dynamic
+shared memory, but WASIX does not provide the required headers or calls.
+Keep the POSIX and file-backed mmap implementations while omitting only the
+unavailable System V implementation.
+
+diff --git a/src/backend/storage/ipc/dsm_impl.c b/src/backend/storage/ipc/dsm_impl.c
+index 6bf8ab5..a0e3ea4 100644
+--- a/src/backend/storage/ipc/dsm_impl.c
++++ b/src/backend/storage/ipc/dsm_impl.c
+@@ -53,8 +53,10 @@
+ #include <unistd.h>
+ #ifndef WIN32
+ #include <sys/mman.h>
++#ifndef __wasi__
+ #include <sys/ipc.h>
+ #include <sys/shm.h>
++#endif
+ #include <sys/stat.h>
+ #endif
+ 
+diff --git a/src/include/storage/dsm_impl.h b/src/include/storage/dsm_impl.h
+index 7248cb1..24d8c9e 100644
+--- a/src/include/storage/dsm_impl.h
++++ b/src/include/storage/dsm_impl.h
+@@ -31,7 +31,9 @@
+ #define USE_DSM_POSIX
+ #define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_POSIX
+ #endif
++#ifndef __wasi__
+ #define USE_DSM_SYSV
++#endif
+ #ifndef DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE
+ #define DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE		DSM_IMPL_SYSV
+ #endif

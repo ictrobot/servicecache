@@ -1,0 +1,440 @@
+Subject: [PATCH 7/8] port: spawn every child directly on WASIX
+
+WASIX has no fork, so refuse it with ENOSYS rather than reference an
+unavailable symbol, and launch every postmaster child by posix_spawn
+of the server's own binary, the EXEC_BACKEND path. initdb spawns its
+bootstrap server the same way instead of through a shell, and
+validate_exec accepts the mounted module, which is part of the same
+immutable service package as the caller.
+
+diff --git a/src/backend/postmaster/fork_process.c b/src/backend/postmaster/fork_process.c
+index a64eeb7..14fa2a6 100644
+--- a/src/backend/postmaster/fork_process.c
++++ b/src/backend/postmaster/fork_process.c
+@@ -32,6 +32,10 @@
+ pid_t
+ fork_process(void)
+ {
++#ifdef __wasi__
++	errno = ENOSYS;
++	return -1;
++#else
+ 	pid_t		result;
+ 	const char *oomfilename;
+ 	sigset_t	save_mask;
+@@ -123,6 +127,7 @@ fork_process(void)
+ 	}
+ 
+ 	return result;
++#endif
+ }
+ 
+ #endif							/* ! WIN32 */
+diff --git a/src/backend/postmaster/launch_backend.c b/src/backend/postmaster/launch_backend.c
+index ae94cc9..0f25e8d 100644
+--- a/src/backend/postmaster/launch_backend.c
++++ b/src/backend/postmaster/launch_backend.c
+@@ -31,6 +31,9 @@
+ 
+ #include "postgres.h"
+ 
++#ifdef __wasi__
++#include <spawn.h>
++#endif
+ #include <unistd.h>
+ 
+ #include "libpq/libpq-be.h"
+@@ -71,6 +74,10 @@
+ #include "tcop/tcopprot.h"
+ #include "utils/injection_point.h"
+ 
++#ifdef __wasi__
++extern char **environ;
++#endif
++
+ /* Type for a socket that can be inherited to a client process */
+ #ifdef WIN32
+ typedef struct
+@@ -377,16 +384,35 @@ internal_forkexec(const char *child_kind, int child_slot,
+ 				 errmsg("could not write to file \"%s\": %m", tmpfilename)));
+ 		return -1;
+ 	}
+-
+ 	/* set up argv properly */
++#ifdef __wasi__
++	argv[0] = postgres_exec_path;
++#else
+ 	argv[0] = "postgres";
++#endif
+ 	snprintf(forkav, MAXPGPATH, "--forkchild=%s", child_kind);
+ 	argv[1] = forkav;
+ 	/* Insert temp file name after --forkchild argument */
+ 	argv[2] = tmpfilename;
+ 	argv[3] = NULL;
+ 
+-	/* Fire off execv in child */
++	/* Fire off the executable module directly on WASIX. */
++#ifdef __wasi__
++	{
++		int			spawn_error;
++
++		spawn_error = posix_spawn(&pid, postgres_exec_path, NULL, NULL,
++								  argv, environ);
++		if (spawn_error != 0)
++		{
++			errno = spawn_error;
++			ereport(LOG,
++					(errmsg("could not execute server process \"%s\": %m",
++							postgres_exec_path)));
++			return -1;
++		}
++	}
++#else
+ 	if ((pid = fork_process()) == 0)
+ 	{
+ 		if (execv(postgres_exec_path, argv) < 0)
+@@ -398,6 +424,7 @@ internal_forkexec(const char *child_kind, int child_slot,
+ 			exit(1);
+ 		}
+ 	}
++#endif
+ 
+ 	return pid;					/* Parent returns pid, or -1 on fork failure */
+ }
+@@ -915,8 +942,8 @@ read_backend_variables(char *id, void **startup_data, size_t *startup_data_len)
+ 		write_stderr("could not open backend variables file \"%s\": %m\n", id);
+ 		exit(1);
+ 	}
+-
+-	if (fread(&param, sizeof(param), 1, fp) != 1)
++	/* Flexible-array tail padding differs from its offset on wasm32. */
++	if (fread(&param, offsetof(BackendParameters, startup_data), 1, fp) != 1)
+ 	{
+ 		write_stderr("could not read from backend variables file \"%s\": %m\n", id);
+ 		exit(1);
+diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
+index f1a6db1..c1abb9c 100644
+--- a/src/bin/initdb/initdb.c
++++ b/src/bin/initdb/initdb.c
+@@ -51,6 +51,10 @@
+ #include <dirent.h>
+ #include <fcntl.h>
+ #include <netdb.h>
++#ifdef __wasi__
++#include <spawn.h>
++#include <sys/wait.h>
++#endif
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+ #ifdef USE_ICU
+@@ -268,6 +272,10 @@ static bool guc_value_requires_quotes(const char *guc_value);
+ static char **readfile(const char *path);
+ static void writefile(char *path, char **lines);
+ static FILE *popen_check(const char *command, const char *mode);
++#ifdef __wasi__
++static pid_t wasix_initdb_child_pid = -1;
++static int	wasix_pclose_check(FILE *stream);
++#endif
+ static char *get_id(void);
+ static int	get_encoding_id(const char *encoding_name);
+ static void set_input(char **dest, const char *filename);
+@@ -325,11 +333,19 @@ do { \
+ 		exit(1); /* message already printed by popen_check */ \
+ } while (0)
+ 
++#ifdef __wasi__
++#define PG_CMD_CLOSE() \
++do { \
++	if (wasix_pclose_check(cmdfd)) \
++		exit(1); /* message already printed by pclose_check */ \
++} while (0)
++#else
+ #define PG_CMD_CLOSE() \
+ do { \
+ 	if (pclose_check(cmdfd)) \
+ 		exit(1); /* message already printed by pclose_check */ \
+ } while (0)
++#endif
+ 
+ #define PG_CMD_PUTS(line) \
+ do { \
+@@ -748,12 +764,185 @@ popen_check(const char *command, const char *mode)
+ 
+ 	fflush(NULL);
+ 	errno = 0;
++#ifdef __wasi__
++	{
++		char	   *command_copy = pg_strdup(command);
++		char	   *argv[128];
++		char	   *src = command_copy;
++		char	   *dst = command_copy;
++		int			argc = 0;
++		int			pipefd[2];
++		int			devnullfd;
++		int			rc;
++		posix_spawn_file_actions_t actions;
++		extern char **environ;
++
++		bool		parse_ok = true;
++
++		Assert(strcmp(mode, "w") == 0);
++
++		/*
++		 * Only initdb's own PG_CMD_OPEN commands reach this: the
++		 * double-quoted backend path, bare option words, and at most one
++		 * trailing >DEVNULL redirection, which the spawn below implements
++		 * by pointing stdout at DEVNULL regardless. There is no shell here
++		 * to give other quoting or redirection its meaning, so anything
++		 * else is refused rather than guessed at.
++		 */
++		while (parse_ok && *src != '\0')
++		{
++			while (*src == ' ' || *src == '\t')
++				src++;
++			if (*src == '\0')
++				break;
++			if (*src == '>')
++			{
++				/*
++				 * The one redirection these commands carry: stdout to
++				 * DEVNULL, which the spawn below implements by pointing
++				 * stdout there. Any other target would have its output
++				 * silently discarded, so refuse it.
++				 */
++				if (strncmp(src + 1, DEVNULL, strlen(DEVNULL)) != 0)
++				{
++					parse_ok = false;
++					break;
++				}
++				src += 1 + strlen(DEVNULL);
++				while (*src == ' ' || *src == '\t')
++					src++;
++				parse_ok = (*src == '\0');
++				break;
++			}
++			if (argc >= lengthof(argv) - 1)
++			{
++				parse_ok = false;
++				break;
++			}
++			if (*src == '"')
++			{
++				char	   *close = strchr(src + 1, '"');
++
++				if (close == NULL ||
++					(close[1] != '\0' && close[1] != ' ' && close[1] != '\t'))
++				{
++					parse_ok = false;
++					break;
++				}
++				argv[argc++] = dst;
++				memmove(dst, src + 1, close - (src + 1));
++				dst += close - (src + 1);
++				*dst++ = '\0';
++				src = close + 1;
++				continue;
++			}
++			argv[argc++] = dst;
++			while (*src != '\0' && *src != ' ' && *src != '\t')
++			{
++				if (*src == '"' || *src == '\'' || *src == '\\' ||
++					*src == '<' || *src == '>' || *src == '\n' || *src == '\r')
++				{
++					parse_ok = false;
++					break;
++				}
++				*dst++ = *src++;
++			}
++			*dst++ = '\0';
++		}
++		argv[argc] = NULL;
++
++		if (!parse_ok || argc == 0)
++		{
++			free(command_copy);
++			errno = EINVAL;
++			pg_log_error("could not parse command \"%s\": unsupported shell syntax", command);
++			return NULL;
++		}
++
++		if (pipe(pipefd) != 0)
++		{
++			free(command_copy);
++			pg_log_error("could not execute command \"%s\": %m", command);
++			return NULL;
++		}
++		devnullfd = open(DEVNULL, O_WRONLY);
++		if (devnullfd < 0)
++		{
++			close(pipefd[0]);
++			close(pipefd[1]);
++			free(command_copy);
++			pg_log_error("could not execute command \"%s\": %m", command);
++			return NULL;
++		}
++
++		rc = posix_spawn_file_actions_init(&actions);
++		if (rc == 0)
++			rc = posix_spawn_file_actions_adddup2(&actions, pipefd[0],
++												  STDIN_FILENO);
++		if (rc == 0)
++			rc = posix_spawn_file_actions_adddup2(&actions, devnullfd,
++												  STDOUT_FILENO);
++		if (rc == 0)
++			rc = posix_spawn_file_actions_addclose(&actions, pipefd[0]);
++		if (rc == 0)
++			rc = posix_spawn_file_actions_addclose(&actions, pipefd[1]);
++		if (rc == 0)
++			rc = posix_spawn_file_actions_addclose(&actions, devnullfd);
++		if (rc == 0)
++			rc = posix_spawnp(&wasix_initdb_child_pid, argv[0], &actions, NULL,
++							  argv, environ);
++		posix_spawn_file_actions_destroy(&actions);
++		close(pipefd[0]);
++		close(devnullfd);
++		free(command_copy);
++		if (rc != 0)
++		{
++			close(pipefd[1]);
++			wasix_initdb_child_pid = -1;
++			errno = rc;
++			pg_log_error("could not execute command \"%s\": %m", command);
++			return NULL;
++		}
++		cmdfd = fdopen(pipefd[1], mode);
++		if (cmdfd == NULL)
++		{
++			close(pipefd[1]);
++			(void) waitpid(wasix_initdb_child_pid, NULL, 0);
++			wasix_initdb_child_pid = -1;
++		}
++	}
++#else
+ 	cmdfd = popen(command, mode);
++#endif
+ 	if (cmdfd == NULL)
+ 		pg_log_error("could not execute command \"%s\": %m", command);
+ 	return cmdfd;
+ }
+ 
++#ifdef __wasi__
++static int
++wasix_pclose_check(FILE *stream)
++{
++	int			status;
++
++	if (fclose(stream) != 0 ||
++		waitpid(wasix_initdb_child_pid, &status, 0) < 0)
++	{
++		pg_log_error("could not wait for child process: %m");
++		return -1;
++	}
++	wasix_initdb_child_pid = -1;
++	if (status != 0)
++	{
++		char	   *reason = wait_result_to_str(status);
++
++		pg_log_error("%s", reason);
++		free(reason);
++	}
++	return status;
++}
++#endif
++
+ /*
+  * clean up any files we created on failure
+  * if we created the data directory remove it too
+@@ -816,6 +1005,14 @@ get_id(void)
+ {
+ 	const char *username;
+ 
++#ifdef __wasi__
++
++	/*
++	 * WASIX has no host passwd database; this is only an informational
++	 * default.
++	 */
++	username = "wasix";
++#else
+ #ifndef WIN32
+ 	if (geteuid() == 0)			/* 0 is root's uid */
+ 	{
+@@ -826,6 +1023,7 @@ get_id(void)
+ #endif
+ 
+ 	username = get_user_name_or_exit(progname);
++#endif
+ 
+ 	return pg_strdup(username);
+ }
+@@ -1075,7 +1273,9 @@ set_null_conf(void)
+ static const char *
+ choose_dsm_implementation(void)
+ {
+-#if defined(HAVE_SHM_OPEN) && !defined(__sun__)
++#ifdef __wasi__
++	return "posix";
++#elif defined(HAVE_SHM_OPEN) && !defined(__sun__)
+ 	int			ntries = 10;
+ 	pg_prng_state prng_state;
+ 
+@@ -2835,6 +3035,10 @@ setup_data_file_paths(void)
+ void
+ setup_text_search(void)
+ {
++#ifdef __wasi__
++	/* Dynamically loaded Snowball dictionaries are unavailable on WASIX. */
++	default_text_search_config = "simple";
++#else
+ 	if (!default_text_search_config)
+ 	{
+ 		default_text_search_config = find_matching_ts_config(lc_ctype);
+@@ -2860,6 +3064,7 @@ setup_text_search(void)
+ 						   default_text_search_config, lc_ctype);
+ 		}
+ 	}
++#endif
+ 
+ 	printf(_("The default text search configuration will be set to \"%s\".\n"),
+ 		   default_text_search_config);
+@@ -3133,13 +3338,17 @@ initialize_data_directory(void)
+ 
+ 	setup_collation(cmdfd);
+ 
++#ifndef __wasi__
+ 	setup_run_file(cmdfd, dictionary_file);
++#endif
+ 
+ 	setup_privileges(cmdfd);
+ 
+ 	setup_schema(cmdfd);
+ 
++#ifndef __wasi__
+ 	load_plpgsql(cmdfd);
++#endif
+ 
+ 	vacuum_db(cmdfd);
+ 
+diff --git a/src/common/exec.c b/src/common/exec.c
+index 8b690a1..fe35a5e 100644
+--- a/src/common/exec.c
++++ b/src/common/exec.c
+@@ -327,6 +327,10 @@ find_other_exec(const char *argv0, const char *target,
+ 	if (validate_exec(retpath) != 0)
+ 		return -1;
+ 
++#ifdef __wasi__
++	/* The mounted module is part of the same immutable service package. */
++	return 0;
++#else
+ 	snprintf(cmd, sizeof(cmd), "\"%s\" -V", retpath);
+ 
+ 	if ((line = pipe_read_line(cmd)) == NULL)
+@@ -340,6 +344,7 @@ find_other_exec(const char *argv0, const char *target,
+ 
+ 	pfree(line);
+ 	return 0;
++#endif
+ }
+ 
+ 

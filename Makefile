@@ -81,7 +81,7 @@ test: setup-wasmer
 lint: setup-wasmer
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
-	! grep -rniE 'mysql|valkey|beanstalkd' crates/servicecache
+	! grep -rniE 'mysql|mariadb|postgres|valkey|beanstalkd' crates/servicecache
 
 check: lint test smoke-toolchain
 

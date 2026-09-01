@@ -1,0 +1,372 @@
+Subject: [PATCH 8/8] port: back shared memory with ictrobot_shm_v1
+
+An anonymous mapping is private to its instance: every spawned child
+gets an independent copy, and nothing cooperates. Back the main
+segment and POSIX dynamic shared memory with shm_open objects overlaid
+through the ictrobot_shm_v1 extension, so independently instantiated
+guests see the same pages. The import namespace, pointer-width
+selection and errno conversion live in the extension's own header
+rather than being duplicated here: the server depends explicitly on
+the extension, and its platform code only uses the typed C wrapper
+from ictrobot_shm_v1.h.
+
+diff --git a/src/backend/port/wasix_shmem.c b/src/backend/port/wasix_shmem.c
+index 433c4cb..9d54da6 100644
+--- a/src/backend/port/wasix_shmem.c
++++ b/src/backend/port/wasix_shmem.c
+@@ -1,7 +1,7 @@
+ /*-------------------------------------------------------------------------
+  *
+  * wasix_shmem.c
+- *    Anonymous process-shared memory support for WASIX.
++ *    POSIX shared memory via the ictrobot_shm_v1 runtime extension
+  *
+  * Copyright (c) 2026, Ethan Jones
+  * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+@@ -17,13 +17,18 @@
+  */
+ #include "postgres.h"
+ 
++#include <fcntl.h>
+ #include <signal.h>
++#include <stdint.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
++#include <ictrobot_shm_v1.h>
++
+ #include "miscadmin.h"
+ #include "portability/mem.h"
++#include "storage/dsm.h"
+ #include "storage/ipc.h"
+ #include "storage/pg_shmem.h"
+ #include "utils/guc.h"
+@@ -34,11 +39,27 @@ unsigned long UsedShmemSegID = 0;
+ void	   *UsedShmemSegAddr = NULL;
+ 
+ static Size UsedShmemSegSize = 0;
++static bool WasixShmemCreator = false;
++
++static void
++WasixShmemName(unsigned long id, char *name, Size size)
++{
++	snprintf(name, size, "/postgresql-%lu", id);
++}
+ 
+ static void
+ WasixShmemDetach(int status, Datum arg)
+ {
++	char		name[64];
++
+ 	PGSharedMemoryDetach();
++	if (WasixShmemCreator)
++	{
++		WasixShmemName((unsigned long) DatumGetUInt32(arg), name, sizeof(name));
++		if (shm_unlink(name) < 0 && errno != ENOENT)
++			elog(LOG, "could not remove shared memory object \"%s\": %m", name);
++		WasixShmemCreator = false;
++	}
+ }
+ 
+ void
+@@ -67,6 +88,9 @@ PGSharedMemoryCreate(Size size, PGShmemHeader **shim)
+ 	PGShmemHeader *hdr;
+ 	struct stat statbuf;
+ 	void	   *address;
++	Size		map_size;
++	char		name[64];
++	int			fd;
+ 
+ 	if (stat(DataDir, &statbuf) < 0)
+ 		ereport(FATAL,
+@@ -79,13 +103,61 @@ PGSharedMemoryCreate(Size size, PGShmemHeader **shim)
+ 				 errmsg("huge pages not supported on this platform")));
+ 
+ 	Assert(size > MAXALIGN(sizeof(PGShmemHeader)));
+-	address = mmap(NULL, size, PROT_READ | PROT_WRITE,
+-				   PG_MMAP_FLAGS, -1, 0);
++	if (size > UINT32_MAX - (ICTROBOT_SHM_WASM_PAGE_SIZE - 1))
++		ereport(FATAL,
++				(errmsg("requested shared memory size %zu is too large", size)));
++	map_size = (size + ICTROBOT_SHM_WASM_PAGE_SIZE - 1) &
++		~(ICTROBOT_SHM_WASM_PAGE_SIZE - 1);
++
++	UsedShmemSegID = (unsigned long) getpid();
++	WasixShmemName(UsedShmemSegID, name, sizeof(name));
++	(void) shm_unlink(name);
++	fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
++	if (fd < 0)
++		ereport(FATAL,
++				(errcode_for_file_access(),
++				 errmsg("could not create shared memory object \"%s\": %m", name)));
++	if (ftruncate(fd, map_size) < 0)
++	{
++		int			save_errno = errno;
++
++		close(fd);
++		shm_unlink(name);
++		errno = save_errno;
++		ereport(FATAL,
++				(errcode_for_file_access(),
++				 errmsg("could not size shared memory object \"%s\": %m", name)));
++	}
++
++	address = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
++				   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+ 	if (address == MAP_FAILED)
++	{
++		int			save_errno = errno;
++
++		close(fd);
++		shm_unlink(name);
++		errno = save_errno;
+ 		ereport(FATAL,
+ 				(errmsg("could not map anonymous shared memory: %m"),
+ 				 errhint("Reduce PostgreSQL shared memory usage, for example by "
+ 						 "reducing shared_buffers or max_connections.")));
++	}
++	if (ictrobot_shm_fd_map(fd, address, map_size, 0) != 0)
++	{
++		int			save_errno = errno;
++
++		munmap(address, map_size);
++		close(fd);
++		shm_unlink(name);
++		errno = save_errno;
++		ereport(FATAL,
++				(errmsg("could not overlay shared memory object \"%s\": %m", name)));
++	}
++	if (close(fd) < 0)
++		ereport(FATAL,
++				(errcode_for_file_access(),
++				 errmsg("could not close shared memory object \"%s\": %m", name)));
+ 
+ 	SetConfigOption("huge_pages_status", "off",
+ 					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+@@ -100,8 +172,8 @@ PGSharedMemoryCreate(Size size, PGShmemHeader **shim)
+ 	hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
+ 
+ 	UsedShmemSegAddr = address;
+-	UsedShmemSegSize = size;
+-	UsedShmemSegID = (unsigned long) getpid();
++	UsedShmemSegSize = map_size;
++	WasixShmemCreator = true;
+ 	*shim = hdr;
+ 
+ 	/* Keep the lock-file format expected by CreateDataDirLockFile(). */
+@@ -112,31 +184,109 @@ PGSharedMemoryCreate(Size size, PGShmemHeader **shim)
+ 		AddToDataDirLockFile(LOCK_FILE_LINE_SHMEM_KEY, line);
+ 	}
+ 
+-	on_shmem_exit(WasixShmemDetach, (Datum) 0);
++	on_shmem_exit(WasixShmemDetach, UInt32GetDatum((uint32) UsedShmemSegID));
+ 	return hdr;
+ }
+ 
+ bool
+ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
+ {
+-	/* The creator PID is our portable segment identifier on WASIX. */
++	char		name[64];
++	int			fd;
++
+ 	if (id1 == 0)
+ 		return false;
+-	if (kill((pid_t) id1, 0) == 0)
+-		return true;
+-	return errno != ESRCH;
++	WasixShmemName(id1, name, sizeof(name));
++	fd = shm_open(name, O_RDWR, 0);
++	if (fd < 0)
++		return false;
++	close(fd);
++	return true;
+ }
+ 
++#ifdef EXEC_BACKEND
++
++void
++PGSharedMemoryReAttach(void)
++{
++	PGShmemHeader *hdr;
++	struct stat statbuf;
++	char		name[64];
++	uintptr_t	current_end;
++	uintptr_t	target_end;
++	int			fd;
++
++	Assert(UsedShmemSegAddr != NULL);
++	Assert(IsUnderPostmaster);
++
++	WasixShmemName(UsedShmemSegID, name, sizeof(name));
++	fd = shm_open(name, O_RDWR, 0);
++	if (fd < 0 || fstat(fd, &statbuf) < 0)
++		ereport(FATAL,
++				(errcode_for_file_access(),
++				 errmsg("could not open shared memory object \"%s\": %m", name)));
++	if (statbuf.st_size <= 0 || (uint64) statbuf.st_size > UINT32_MAX ||
++		((uint64) statbuf.st_size & (ICTROBOT_SHM_WASM_PAGE_SIZE - 1)) != 0)
++		ereport(FATAL,
++				(errmsg("shared memory object \"%s\" has invalid size %lld",
++						name, (long long) statbuf.st_size)));
++
++	UsedShmemSegSize = (Size) statbuf.st_size;
++	current_end = (uintptr_t) sbrk(0);
++	target_end = (uintptr_t) UsedShmemSegAddr + UsedShmemSegSize;
++	if (target_end < (uintptr_t) UsedShmemSegAddr ||
++		current_end > (uintptr_t) UsedShmemSegAddr ||
++		(current_end & (ICTROBOT_SHM_WASM_PAGE_SIZE - 1)) != 0 ||
++		((uintptr_t) UsedShmemSegAddr &
++		 (ICTROBOT_SHM_WASM_PAGE_SIZE - 1)) != 0)
++		ereport(FATAL,
++				(errmsg("could not reserve shared memory at address %p", UsedShmemSegAddr)));
++	if (target_end > current_end &&
++		sbrk((intptr_t) (target_end - current_end)) == (void *) -1)
++		ereport(FATAL,
++				(errmsg("could not grow memory to reattach shared memory at %p: %m",
++						UsedShmemSegAddr)));
++
++	if (ictrobot_shm_fd_map(fd, UsedShmemSegAddr, UsedShmemSegSize, 0) != 0)
++		ereport(FATAL,
++				(errmsg("could not reattach shared memory object \"%s\" at %p: %m",
++						name, UsedShmemSegAddr)));
++	if (close(fd) < 0)
++		ereport(FATAL,
++				(errcode_for_file_access(),
++				 errmsg("could not close shared memory object \"%s\": %m", name)));
++
++	hdr = (PGShmemHeader *) UsedShmemSegAddr;
++	if (hdr->magic != PGShmemMagic)
++		ereport(FATAL,
++				(errmsg("shared memory object \"%s\" is not a PostgreSQL segment", name)));
++	dsm_set_control_handle(hdr->dsm_control);
++}
++
++void
++PGSharedMemoryNoReAttach(void)
++{
++	Assert(UsedShmemSegAddr != NULL);
++	Assert(IsUnderPostmaster);
++	UsedShmemSegAddr = NULL;
++	UsedShmemSegID = 0;
++}
++
++#endif
++
+ void
+ PGSharedMemoryDetach(void)
+ {
+ 	if (UsedShmemSegAddr != NULL)
+ 	{
++		if (ictrobot_shm_fd_unmap(UsedShmemSegAddr, UsedShmemSegSize) != 0)
++			elog(LOG, "fd_unmap(%p, %zu) failed: %m",
++				 UsedShmemSegAddr, UsedShmemSegSize);
+ 		if (munmap(UsedShmemSegAddr, UsedShmemSegSize) < 0)
+ 			elog(LOG, "munmap(%p, %zu) failed: %m",
+ 				 UsedShmemSegAddr, UsedShmemSegSize);
+ 		UsedShmemSegAddr = NULL;
+ 		UsedShmemSegSize = 0;
+-		UsedShmemSegID = 0;
+ 	}
++	UsedShmemSegID = 0;
+ }
+diff --git a/src/backend/storage/ipc/dsm_impl.c b/src/backend/storage/ipc/dsm_impl.c
+index a0e3ea4..5cc7136 100644
+--- a/src/backend/storage/ipc/dsm_impl.c
++++ b/src/backend/storage/ipc/dsm_impl.c
+@@ -60,6 +60,10 @@
+ #include <sys/stat.h>
+ #endif
+ 
++#ifdef __wasi__
++#include <ictrobot_shm_v1.h>
++#endif
++
+ #include "common/file_perm.h"
+ #include "libpq/pqsignal.h"
+ #include "miscadmin.h"
+@@ -225,14 +229,26 @@ dsm_impl_posix(dsm_op op, dsm_handle handle, Size request_size,
+ 	/* Handle teardown cases. */
+ 	if (op == DSM_OP_DETACH || op == DSM_OP_DESTROY)
+ 	{
+-		if (*mapped_address != NULL
+-			&& munmap(*mapped_address, *mapped_size) != 0)
++		if (*mapped_address != NULL)
+ 		{
+-			ereport(elevel,
+-					(errcode_for_dynamic_shared_memory(),
+-					 errmsg("could not unmap shared memory segment \"%s\": %m",
+-							name)));
+-			return false;
++			int			unmap_error = 0;
++
++#ifdef __wasi__
++			unmap_error = ictrobot_shm_fd_unmap(*mapped_address, *mapped_size);
++#else
++			unmap_error = munmap(*mapped_address, *mapped_size);
++#endif
++			if (unmap_error != 0)
++			{
++				ereport(elevel,
++						(errcode_for_dynamic_shared_memory(),
++						 errmsg("could not unmap shared memory segment \"%s\": %m",
++								name)));
++				return false;
++			}
++#ifdef __wasi__
++			(void) munmap(*mapped_address, *mapped_size);
++#endif
+ 		}
+ 		*mapped_address = NULL;
+ 		*mapped_size = 0;
+@@ -295,7 +311,14 @@ dsm_impl_posix(dsm_op op, dsm_handle handle, Size request_size,
+ 		}
+ 		request_size = st.st_size;
+ 	}
+-	else if (dsm_impl_posix_resize(fd, request_size) != 0)
++	else
++	{
++#ifdef __wasi__
++		request_size = (request_size + ICTROBOT_SHM_WASM_PAGE_SIZE - 1) &
++			~(ICTROBOT_SHM_WASM_PAGE_SIZE - 1);
++#endif
++	}
++	if (op == DSM_OP_CREATE && dsm_impl_posix_resize(fd, request_size) != 0)
+ 	{
+ 		int			save_errno;
+ 
+@@ -314,8 +337,24 @@ dsm_impl_posix(dsm_op op, dsm_handle handle, Size request_size,
+ 	}
+ 
+ 	/* Map it. */
++#ifdef __wasi__
++	address = mmap(NULL, request_size, PROT_READ | PROT_WRITE,
++				   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (address != MAP_FAILED)
++	{
++		int			map_error;
++
++		map_error = ictrobot_shm_fd_map(fd, address, request_size, 0);
++		if (map_error != 0)
++		{
++			(void) munmap(address, request_size);
++			address = MAP_FAILED;
++		}
++	}
++#else
+ 	address = mmap(NULL, request_size, PROT_READ | PROT_WRITE,
+ 				   MAP_SHARED | MAP_HASSEMAPHORE | MAP_NOSYNC, fd, 0);
++#endif
+ 	if (address == MAP_FAILED)
+ 	{
+ 		int			save_errno;
+@@ -366,7 +405,7 @@ dsm_impl_posix_resize(int fd, off_t size)
+ 		sigprocmask(SIG_SETMASK, &BlockSig, &save_sigmask);
+ 
+ 	pgstat_report_wait_start(WAIT_EVENT_DSM_ALLOCATE);
+-#if defined(HAVE_POSIX_FALLOCATE) && defined(__linux__)
++#if defined(HAVE_POSIX_FALLOCATE) && defined(__linux__) && !defined(__wasi__)
+ 
+ 	/*
+ 	 * On Linux, a shm_open fd is backed by a tmpfs file.  If we were to use

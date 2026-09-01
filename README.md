@@ -16,7 +16,7 @@ Early development prototype. Interfaces, service packages and runtime patches ma
 
 - Linux on x86-64.
 - Rust, normally installed through [rustup](https://rustup.rs/).
-- Bash, Git, GNU Make, CMake, Python 3, curl, tar and `sha256sum`.
+- Bash, Git, GNU Make, CMake, Perl, Bison, Flex, Python 3, curl, tar, `sha256sum` and `zic` (the tz compiler, from your libc or tzdata package).
 - Enough time and disk space for source builds. The pinned WASIX toolchain, source checkouts and database build trees can occupy multiple gigabytes.
 
 Project-generated toolchain, source and service state is kept below `work/`. Rust build output goes below `target/`.
@@ -61,10 +61,11 @@ ServiceCache is designed to be generic: the manager knows how to run, freeze, sn
 |------------|-----------------------------------|
 | MariaDB    | 10.11.19, 11.4.13, 11.8.9, 12.3.3 |
 | MySQL      | 8.0.40, 8.0.46, 8.4.11, 9.7.2     |
+| PostgreSQL | 18.6                              |
 | Valkey     | 7.2.14, 8.1.9, 9.1.1              |
 | beanstalkd | 1.13                              |
 
-Each service is built from an exact upstream release plus a small patch series for WASIX.
+Each service is built from an exact upstream release plus a small patch series for WASIX. PostgreSQL's series targets WASIX with the ictrobot_shm_v1 shared memory extension.
 
 ## Trust model and scope
 
@@ -102,6 +103,7 @@ ServiceCache is an independent project. It is not affiliated with, sponsored by,
 
 - MariaDB is a registered trademark of MariaDB plc.
 - Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its affiliates.
+- Postgres, PostgreSQL and the Slonik Logo are trademarks or registered trademarks of the PostgreSQL Community Association of Canada.
 - Valkey and the Valkey logo are trademarks of LF Projects, LLC.
 - Wasmer is a trademark of Wasmer, Inc.
 - Other names may be trademarks of their respective owners.

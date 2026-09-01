@@ -1,0 +1,188 @@
+Subject: [PATCH 4/8] port: add anonymous shared memory for WASIX
+
+WASIX does not provide the System V IPC headers PostgreSQL normally
+uses as a small interlock alongside its mmap region. Introduce a
+platform shared-memory implementation and use the data-directory lock
+file as the single-postmaster interlock. A later patch makes this
+initial anonymous mapping reopenable by fresh EXEC_BACKEND guests
+through explicit ictrobot_shm_v1 imports.
+
+diff --git a/configure b/configure
+index 6cef1a5..1dffa36 100755
+--- a/configure
++++ b/configure
+@@ -18543,7 +18543,10 @@ fi
+ 
+ 
+ # Select shared-memory implementation type.
+-if test "$PORTNAME" != "win32"; then
++if test "$host_os" = "wasix"; then
++
++  SHMEM_IMPLEMENTATION="src/backend/port/wasix_shmem.c"
++elif test "$PORTNAME" != "win32"; then
+ 
+ $as_echo "#define USE_SYSV_SHARED_MEMORY 1" >>confdefs.h
+ 
+diff --git a/configure.ac b/configure.ac
+index 527437e..8df4c84 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2297,7 +2297,9 @@ fi
+ 
+ 
+ # Select shared-memory implementation type.
+-if test "$PORTNAME" != "win32"; then
++if test "$host_os" = "wasix"; then
++  SHMEM_IMPLEMENTATION="src/backend/port/wasix_shmem.c"
++elif test "$PORTNAME" != "win32"; then
+   AC_DEFINE(USE_SYSV_SHARED_MEMORY, 1, [Define to select SysV-style shared memory.])
+   SHMEM_IMPLEMENTATION="src/backend/port/sysv_shmem.c"
+ else
+diff --git a/src/backend/port/wasix_shmem.c b/src/backend/port/wasix_shmem.c
+new file mode 100644
+index 0000000..433c4cb
+--- /dev/null
++++ b/src/backend/port/wasix_shmem.c
+@@ -0,0 +1,142 @@
++/*-------------------------------------------------------------------------
++ *
++ * wasix_shmem.c
++ *    Anonymous process-shared memory support for WASIX.
++ *
++ * Copyright (c) 2026, Ethan Jones
++ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * Licensed under the PostgreSQL License (see COPYRIGHT at the tree's
++ * root); the skeleton is adapted from sysv_shmem.c and win32_shmem.c.
++ *
++ * IDENTIFICATION
++ *    src/backend/port/wasix_shmem.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <signal.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "miscadmin.h"
++#include "portability/mem.h"
++#include "storage/ipc.h"
++#include "storage/pg_shmem.h"
++#include "utils/guc.h"
++#include "utils/guc_hooks.h"
++#include "utils/pidfile.h"
++
++unsigned long UsedShmemSegID = 0;
++void	   *UsedShmemSegAddr = NULL;
++
++static Size UsedShmemSegSize = 0;
++
++static void
++WasixShmemDetach(int status, Datum arg)
++{
++	PGSharedMemoryDetach();
++}
++
++void
++GetHugePageSize(Size *hugepagesize, int *mmap_flags)
++{
++	if (hugepagesize)
++		*hugepagesize = 0;
++	if (mmap_flags)
++		*mmap_flags = 0;
++}
++
++bool
++check_huge_page_size(int *newval, void **extra, GucSource source)
++{
++	if (*newval != 0)
++	{
++		GUC_check_errdetail("\"huge_page_size\" must be 0 on this platform.");
++		return false;
++	}
++	return true;
++}
++
++PGShmemHeader *
++PGSharedMemoryCreate(Size size, PGShmemHeader **shim)
++{
++	PGShmemHeader *hdr;
++	struct stat statbuf;
++	void	   *address;
++
++	if (stat(DataDir, &statbuf) < 0)
++		ereport(FATAL,
++				(errcode_for_file_access(),
++				 errmsg("could not stat data directory \"%s\": %m", DataDir)));
++
++	if (huge_pages == HUGE_PAGES_ON)
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("huge pages not supported on this platform")));
++
++	Assert(size > MAXALIGN(sizeof(PGShmemHeader)));
++	address = mmap(NULL, size, PROT_READ | PROT_WRITE,
++				   PG_MMAP_FLAGS, -1, 0);
++	if (address == MAP_FAILED)
++		ereport(FATAL,
++				(errmsg("could not map anonymous shared memory: %m"),
++				 errhint("Reduce PostgreSQL shared memory usage, for example by "
++						 "reducing shared_buffers or max_connections.")));
++
++	SetConfigOption("huge_pages_status", "off",
++					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
++
++	hdr = (PGShmemHeader *) address;
++	hdr->creatorPID = getpid();
++	hdr->magic = PGShmemMagic;
++	hdr->dsm_control = 0;
++	hdr->device = statbuf.st_dev;
++	hdr->inode = statbuf.st_ino;
++	hdr->totalsize = size;
++	hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
++
++	UsedShmemSegAddr = address;
++	UsedShmemSegSize = size;
++	UsedShmemSegID = (unsigned long) getpid();
++	*shim = hdr;
++
++	/* Keep the lock-file format expected by CreateDataDirLockFile(). */
++	{
++		char		line[64];
++
++		sprintf(line, "%9lu %9lu", UsedShmemSegID, 0UL);
++		AddToDataDirLockFile(LOCK_FILE_LINE_SHMEM_KEY, line);
++	}
++
++	on_shmem_exit(WasixShmemDetach, (Datum) 0);
++	return hdr;
++}
++
++bool
++PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
++{
++	/* The creator PID is our portable segment identifier on WASIX. */
++	if (id1 == 0)
++		return false;
++	if (kill((pid_t) id1, 0) == 0)
++		return true;
++	return errno != ESRCH;
++}
++
++void
++PGSharedMemoryDetach(void)
++{
++	if (UsedShmemSegAddr != NULL)
++	{
++		if (munmap(UsedShmemSegAddr, UsedShmemSegSize) < 0)
++			elog(LOG, "munmap(%p, %zu) failed: %m",
++				 UsedShmemSegAddr, UsedShmemSegSize);
++		UsedShmemSegAddr = NULL;
++		UsedShmemSegSize = 0;
++		UsedShmemSegID = 0;
++	}
++}

@@ -1,0 +1,18 @@
+These patches modify PostgreSQL 18.6 for WASIX with the ictrobot_shm_v1
+shared memory extension.
+
+Copyright (c) 2026 Ethan Jones
+
+The patches in this directory are licensed under the PostgreSQL License
+(LICENSE), the licence of the software they modify.
+
+Context lines are from upstream and remain the copyright of their authors
+under upstream's terms.
+
+0004-port-add-anonymous-shared-memory-for-WASIX.patch adds
+src/backend/port/wasix_shmem.c, which adapts the skeleton of upstream's
+sysv_shmem.c and win32_shmem.c: the interface scaffolding, the
+shared-memory header setup and a few error messages. Those portions
+remain copyright of the PostgreSQL Global Development Group and the
+Regents of the University of California, under upstream's terms
+(LICENSE-UPSTREAM); the rest of the file is licensed like the series.

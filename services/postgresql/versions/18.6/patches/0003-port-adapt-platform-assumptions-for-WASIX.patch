@@ -1,0 +1,183 @@
+Subject: [PATCH 3/8] port: adapt platform assumptions for WASIX
+
+The sandbox has no root user to refuse, no host passwd database, no
+`locale -a` to run, no setsid and no dynamic loading, and the
+installation lives at mounted guest paths rather than a configured
+prefix. Guard each assumption: skip the root check, report a fixed
+wasix user, enumerate no system collations, stub dlopen to fail
+cleanly, drop HAVE_SETSID, and resolve the share and pkglib
+directories relative to the running binary's guest path.
+
+diff --git a/src/backend/commands/collationcmds.c b/src/backend/commands/collationcmds.c
+index 8acbfbb..7be6d6f 100644
+--- a/src/backend/commands/collationcmds.c
++++ b/src/backend/commands/collationcmds.c
+@@ -575,7 +575,7 @@ pg_collation_actual_version(PG_FUNCTION_ARGS)
+ 
+ 
+ /* will we use "locale -a" in pg_import_system_collations? */
+-#if !defined(WIN32)
++#if !defined(WIN32) && !defined(__wasi__)
+ #define READ_LOCALE_A_OUTPUT
+ #endif
+ 
+diff --git a/src/backend/main/main.c b/src/backend/main/main.c
+index 32e0e97..0d2f151 100644
+--- a/src/backend/main/main.c
++++ b/src/backend/main/main.c
+@@ -442,7 +442,7 @@ help(const char *progname)
+ static void
+ check_root(const char *progname)
+ {
+-#ifndef WIN32
++#if !defined(WIN32) && !defined(__wasi__)
+ 	if (geteuid() == 0)
+ 	{
+ 		write_stderr("\"root\" execution of the PostgreSQL server is not permitted.\n"
+@@ -466,7 +466,7 @@ check_root(const char *progname)
+ 					 progname);
+ 		exit(1);
+ 	}
+-#else							/* WIN32 */
++#elif defined(WIN32)
+ 	if (pgwin32_is_admin())
+ 	{
+ 		write_stderr("Execution of PostgreSQL by a user with administrative permissions is not\n"
+diff --git a/src/backend/utils/fmgr/dfmgr.c b/src/backend/utils/fmgr/dfmgr.c
+index 1366521..b1fb610 100644
+--- a/src/backend/utils/fmgr/dfmgr.c
++++ b/src/backend/utils/fmgr/dfmgr.c
+@@ -16,9 +16,37 @@
+ 
+ #include <sys/stat.h>
+ 
+-#ifndef WIN32
++#if defined(__wasi__)
++#define RTLD_NOW 0
++#define RTLD_GLOBAL 0
++
++static void *
++dlopen(const char *filename, int flags)
++{
++	errno = ENOSYS;
++	return NULL;
++}
++
++static void *
++dlsym(void *handle, const char *symbol)
++{
++	return NULL;
++}
++
++static int
++dlclose(void *handle)
++{
++	return 0;
++}
++
++static char *
++dlerror(void)
++{
++	return "dynamic loading is not supported on WASIX";
++}
++#elif !defined(WIN32)
+ #include <dlfcn.h>
+-#endif							/* !WIN32 */
++#endif
+ 
+ #include "fmgr.h"
+ #include "lib/stringinfo.h"
+diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
+index df18257..26e8052 100644
+--- a/src/backend/utils/init/miscinit.c
++++ b/src/backend/utils/init/miscinit.c
+@@ -137,7 +137,7 @@ InitPostmasterChild(void)
+ 	 * children, but for consistency we make all postmaster child processes do
+ 	 * this.
+ 	 */
+-#ifdef HAVE_SETSID
++#if defined(HAVE_SETSID) && !defined(__wasi__)
+ 	if (setsid() < 0)
+ 		elog(FATAL, "setsid() failed: %m");
+ #endif
+diff --git a/src/common/username.c b/src/common/username.c
+index ae5f02d..0401620 100644
+--- a/src/common/username.c
++++ b/src/common/username.c
+@@ -30,7 +30,11 @@
+ const char *
+ get_user_name(char **errstr)
+ {
+-#ifndef WIN32
++#ifdef __wasi__
++	/* WASIX does not expose a host passwd database to the sandbox. */
++	*errstr = NULL;
++	return "wasix";
++#elif !defined(WIN32)
+ 	struct passwd *pw;
+ 	uid_t		user_id = geteuid();
+ 
+diff --git a/src/include/port.h b/src/include/port.h
+index 0048ea3..5d0793a 100644
+--- a/src/include/port.h
++++ b/src/include/port.h
+@@ -557,7 +557,9 @@ extern int	wait_result_to_exit_code(int exit_status);
+ #define HAVE_POLL 1
+ #define HAVE_POLL_H 1
+ #define HAVE_READLINK 1
++#ifndef __wasi__
+ #define HAVE_SETSID 1
++#endif
+ #define HAVE_SHM_OPEN 1
+ #define HAVE_SYMLINK 1
+ #endif
+diff --git a/src/port/path.c b/src/port/path.c
+index 7f13940..3674653 100644
+--- a/src/port/path.c
++++ b/src/port/path.c
+@@ -918,7 +918,26 @@ make_absolute_path(const char *path)
+ void
+ get_share_path(const char *my_exec_path, char *ret_path)
+ {
++#ifdef __wasi__
++	char	   *separator;
++
++	if (strncmp(my_exec_path, "/bin/", 5) == 0 ||
++		strncmp(my_exec_path, "/usr/bin/", 9) == 0)
++	{
++		strlcpy(ret_path, "/share", MAXPGPATH);
++		return;
++	}
++
++	strlcpy(ret_path, my_exec_path, MAXPGPATH);
++	separator = last_dir_separator(ret_path);
++	if (separator != NULL)
++		separator[1] = '\0';
++	else
++		ret_path[0] = '\0';
++	strlcat(ret_path, "share", MAXPGPATH);
++#else
+ 	make_relative_path(ret_path, PGSHAREDIR, PGBINDIR, my_exec_path);
++#endif
+ }
+ 
+ /*
+@@ -972,7 +991,18 @@ get_lib_path(const char *my_exec_path, char *ret_path)
+ void
+ get_pkglib_path(const char *my_exec_path, char *ret_path)
+ {
++#ifdef __wasi__
++	char	   *separator;
++
++	strlcpy(ret_path, my_exec_path, MAXPGPATH);
++	separator = last_dir_separator(ret_path);
++	if (separator != NULL)
++		*separator = '\0';
++	else
++		strlcpy(ret_path, ".", MAXPGPATH);
++#else
+ 	make_relative_path(ret_path, PKGLIBDIR, PGBINDIR, my_exec_path);
++#endif
+ }
+ 
+ /*

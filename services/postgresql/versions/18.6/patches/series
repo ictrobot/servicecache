@@ -1,0 +1,8 @@
+0001-port-use-setjmp-fallback-on-WASIX.patch
+0002-build-do-not-request-PIC-in-static-WASIX-build.patch
+0003-port-adapt-platform-assumptions-for-WASIX.patch
+0004-port-add-anonymous-shared-memory-for-WASIX.patch
+0005-port-disable-System-V-DSM-on-WASIX.patch
+0006-build-build-only-static-libpq-on-WASIX.patch
+0007-port-spawn-every-child-directly-on-WASIX.patch
+0008-port-back-shared-memory-with-ictrobot_shm_v1.patch

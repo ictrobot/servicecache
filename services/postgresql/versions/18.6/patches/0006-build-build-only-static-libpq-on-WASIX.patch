@@ -1,0 +1,40 @@
+Subject: [PATCH 6/8] build: build only static libpq on WASIX
+
+WASIX executables are self-contained WebAssembly modules, and this port
+is fully static with no position-independent code. initdb and psql link
+libpq statically, so omit the unused libpq shared-library target on this
+host and satisfy libpq's public encoding API for psql from PostgreSQL's
+non-PIC common-library variant.
+
+diff --git a/src/bin/psql/Makefile b/src/bin/psql/Makefile
+index 5b1545d..c9283f0 100644
+--- a/src/bin/psql/Makefile
++++ b/src/bin/psql/Makefile
+@@ -22,7 +22,11 @@ export with_readline
+ REFDOCDIR= $(top_srcdir)/doc/src/sgml/ref
+ 
+ override CPPFLAGS := -I. -I$(srcdir) -I$(libpq_srcdir) $(CPPFLAGS)
++ifeq ($(host_os),wasix)
++LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils -L$(top_builddir)/src/common -lpgcommon_shlib $(libpq_pgport)
++else
+ LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)
++endif
+ 
+ OBJS = \
+ 	$(WIN32RES) \
+diff --git a/src/interfaces/libpq/Makefile b/src/interfaces/libpq/Makefile
+index da66500..f38df06 100644
+--- a/src/interfaces/libpq/Makefile
++++ b/src/interfaces/libpq/Makefile
+@@ -116,7 +116,11 @@ $(call add_to_list,PKG_CONFIG_REQUIRES_PRIVATE,libcurl)
+ %.pc: override SHLIB_LINK_INTERNAL += -lpq-oauth
+ endif
+ 
++ifeq ($(host_os),wasix)
++all: all-static-lib
++else
+ all: all-lib libpq-refs-stamp
++endif
+ 
+ # Shared library stuff
+ include $(top_srcdir)/src/Makefile.shlib

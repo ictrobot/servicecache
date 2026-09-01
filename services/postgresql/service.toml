@@ -1,0 +1,27 @@
+[service]
+name = "postgresql"
+version = "{version}"
+extensions = ["ictrobot_shm_v1"]
+
+[prepare]
+fs = { "/service" = ".", "/share" = "share/" }
+module = "initdb.wasm"
+args = ["--pgdata=/data", "--username=postgres", "--auth=trust", "--no-sync", "--locale=C", "--encoding=UTF8", "-L", "/share"]
+
+[guest]
+module = "postgres.wasm"
+args = ["-D", "/data", "-h", "127.0.0.1", "-p", "5432", "-c", "listen_addresses=127.0.0.1", "-c", "unix_socket_directories=", "-c", "dynamic_shared_memory_type=posix", "-c", "io_method=sync", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off", "-c", "shared_buffers=16MB", "-c", "max_connections=50"]
+listen_port = 5432
+
+# A starting postmaster accepts connections but answers each with
+# "FATAL: the database system is starting up" (57P03), so listening
+# does not yet mean serving.
+[guest.ready]
+# The startup packet for user postgres.
+send = '\x00\x00\x00\x17\x00\x03\x00\x00user\x00postgres\x00\x00'
+# An authentication reply, which only a served connection receives.
+matches = '^R'
+
+[initializer]
+module = "psql.wasm"
+args = ["-h", "{host}", "-p", "{port}", "-U", "postgres", "-d", "postgres", "--no-psqlrc"]
