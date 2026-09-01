@@ -4,5 +4,8 @@ for WASIX.
 Copyright (c) 2026 Ethan Jones
 
 It is licensed under the Apache License, Version 2.0 (see LICENSE), the same
-terms as upstream Abseil. Context lines are from upstream and remain the
-copyright of their authors under that licence.
+terms as upstream Abseil. The modified file carries the change notice
+Apache-2.0 requires.
+
+Context lines are from upstream and remain the copyright of their authors
+under upstream's terms.
