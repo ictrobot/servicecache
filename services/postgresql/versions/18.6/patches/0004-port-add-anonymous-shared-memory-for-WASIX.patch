@@ -1,4 +1,4 @@
-Subject: [PATCH 4/8] port: add anonymous shared memory for WASIX
+Subject: [PATCH 4/9] port: add anonymous shared memory for WASIX
 
 WASIX does not provide the System V IPC headers PostgreSQL normally
 uses as a small interlock alongside its mmap region. Introduce a

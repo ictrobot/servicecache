@@ -1,4 +1,4 @@
-Subject: [PATCH 7/8] port: spawn every child directly on WASIX
+Subject: [PATCH 7/9] port: spawn every child directly on WASIX
 
 WASIX has no fork, so refuse it with ENOSYS rather than reference an
 unavailable symbol, and launch every postmaster child by posix_spawn

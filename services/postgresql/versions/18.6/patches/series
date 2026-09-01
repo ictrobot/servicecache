@@ -6,3 +6,4 @@
 0006-build-build-only-static-libpq-on-WASIX.patch
 0007-port-spawn-every-child-directly-on-WASIX.patch
 0008-port-back-shared-memory-with-ictrobot_shm_v1.patch
+0009-port-make-sig_atomic_t-atomic-on-WASIX.patch

@@ -1,4 +1,4 @@
-Subject: [PATCH 5/8] port: disable System V DSM on WASIX
+Subject: [PATCH 5/9] port: disable System V DSM on WASIX
 
 PostgreSQL assumes that every non-Windows platform has System V dynamic
 shared memory, but WASIX does not provide the required headers or calls.

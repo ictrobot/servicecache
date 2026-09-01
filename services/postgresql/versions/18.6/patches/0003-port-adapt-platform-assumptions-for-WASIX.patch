@@ -1,4 +1,4 @@
-Subject: [PATCH 3/8] port: adapt platform assumptions for WASIX
+Subject: [PATCH 3/9] port: adapt platform assumptions for WASIX
 
 The sandbox has no root user to refuse, no host passwd database, no
 `locale -a` to run, no setsid and no dynamic loading, and the

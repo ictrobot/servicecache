@@ -1,0 +1,64 @@
+Subject: [PATCH 9/9] port: make sig_atomic_t atomic on WASIX
+
+PostgreSQL declares its signal and latch flags volatile sig_atomic_t,
+which is enough where one kernel-synchronised address space backs a
+process. This port runs each process as a separate WebAssembly
+instance over shared native pages, and plain volatile loads and
+stores are not atomic between instances: racing SetLatch and
+ResetLatch could lose the set.
+
+The build force-includes this header before every translation unit.
+It renames libc's underlying typedef while signal.h is read, then
+exposes sig_atomic_t as _Atomic of it, asserting size, alignment and
+lock-freedom, so every signal flag compiles to WebAssembly atomic
+accesses without changing the libc or annotating call sites.
+
+diff --git a/src/include/port/wasix_atomic_sigatomic.h b/src/include/port/wasix_atomic_sigatomic.h
+new file mode 100644
+index 0000000..3e44af0
+--- /dev/null
++++ b/src/include/port/wasix_atomic_sigatomic.h
+@@ -0,0 +1,43 @@
++/*-------------------------------------------------------------------------
++ *
++ * wasix_atomic_sigatomic.h
++ *    sig_atomic_t as a WebAssembly atomic, force-included at build time.
++ *
++ * Copyright (c) 2026, Ethan Jones
++ *
++ * IDENTIFICATION
++ *    src/include/port/wasix_atomic_sigatomic.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef WASIX_ATOMIC_SIGATOMIC_H
++#define WASIX_ATOMIC_SIGATOMIC_H
++
++/*
++ * PostgreSQL relies on one kernel-synchronised address space per process
++ * to make volatile sig_atomic_t flags visible across its processes. Here
++ * every process is a separate WebAssembly instance over shared native
++ * pages, so the flags themselves must use WebAssembly atomic accesses.
++ *
++ * Rename libc's underlying typedef while signal.h is read, then expose
++ * sig_atomic_t as an atomic with the same representation.
++ */
++#ifdef __cplusplus
++#error "the atomic sig_atomic_t shim supports C only"
++#endif
++
++#define sig_atomic_t wasix_libc_sig_atomic_t
++#include <signal.h>
++#undef sig_atomic_t
++
++typedef _Atomic(wasix_libc_sig_atomic_t) sig_atomic_t;
++
++_Static_assert(sizeof(sig_atomic_t) == sizeof(wasix_libc_sig_atomic_t),
++			   "atomic sig_atomic_t must preserve the libc ABI size");
++_Static_assert(_Alignof(sig_atomic_t) ==
++			   _Alignof(wasix_libc_sig_atomic_t),
++			   "atomic sig_atomic_t must preserve the libc ABI alignment");
++_Static_assert(__atomic_always_lock_free(sizeof(sig_atomic_t), 0),
++			   "atomic sig_atomic_t must be lock-free in signal handlers");
++
++#endif							/* WASIX_ATOMIC_SIGATOMIC_H */

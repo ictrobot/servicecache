@@ -23,6 +23,10 @@ fi
 
 mkdir -p "$SC_BUILD"
 
+# The patch series adds this shim; force-including it into every translation
+# unit is what makes the port's sig_atomic_t flags WebAssembly atomics.
+atomic_sigatomic_header="$SC_SRC/src/include/port/wasix_atomic_sigatomic.h"
+
 # EXEC_BACKEND launches a fresh module for each postmaster child, avoiding the
 # unavailable fork() symbol and using the exception-enabled sysroot.
 export WASIXCC_AUTOCONF_WORKAROUNDS=yes
@@ -50,7 +54,7 @@ configure_args=(
     CC="$WASIXCC_DIR/bin/wasixcc" \
     AR="$WASIXCC_DIR/bin/wasixar" \
     RANLIB="$WASIXCC_DIR/bin/wasixranlib" \
-    CPPFLAGS="-I$SC_ROOT/extensions/ictrobot_shm_v1" \
+    CPPFLAGS="-I$SC_ROOT/extensions/ictrobot_shm_v1 -include $atomic_sigatomic_header" \
     CFLAGS="-O1 -DNDEBUG -DEXEC_BACKEND -pthread" \
     LDFLAGS="-pthread -Wl,--no-export-dynamic" \
     "$SC_SRC/configure" "${configure_args[@]}"

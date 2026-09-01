@@ -1,4 +1,4 @@
-Subject: [PATCH 2/8] build: do not request PIC in static WASIX build
+Subject: [PATCH 2/9] build: do not request PIC in static WASIX build
 
 WASIX executables are statically linked WebAssembly modules, and the toolchain
 does not provide a usable shared-library target. PostgreSQL's *_shlib archives

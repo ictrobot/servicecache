@@ -1,4 +1,4 @@
-Subject: [PATCH 8/8] port: back shared memory with ictrobot_shm_v1
+Subject: [PATCH 8/9] port: back shared memory with ictrobot_shm_v1
 
 An anonymous mapping is private to its instance: every spawned child
 gets an independent copy, and nothing cooperates. Back the main
