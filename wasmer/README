@@ -24,7 +24,8 @@ not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
   its own, which makes a guest coroutine suspend on a blocking host wait
   instead of parking its OS thread, lets guest threads be resurrected on fresh
   threads in a forked child, rebuilds the selector after a fork, replaces a
-  clone's listening socket, and keeps host I/O from going through a runtime
+  clone's listening socket, snapshots shared memory across the native fork
+  so clones diverge, and keeps host I/O from going through a runtime
   handle captured at construction. Suspension is off unless the host enables
   it; the I/O changes apply always.
 

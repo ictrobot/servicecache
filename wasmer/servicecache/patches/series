@@ -13,3 +13,4 @@
 0013-vm-keep-a-registry-of-linear-memories.patch
 0014-wasix-let-a-runtime-replace-module-compilation.patch
 0015-wasix-let-an-embedder-choose-the-registered-extensio.patch
+0016-wasix-snapshot-shared-memory-across-native-forks.patch

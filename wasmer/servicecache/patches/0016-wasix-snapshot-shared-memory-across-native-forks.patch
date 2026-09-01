@@ -1,0 +1,511 @@
+Subject: wasix: snapshot shared memory across native forks
+
+A host freezes a guest by stopping every thread and forking natively,
+and every clone must diverge from its template. Shared overlays break
+that: a native fork preserves the parent's live mappings, so clones
+would keep sharing the template's objects, and one another's writes.
+Freezing now detaches live mappings into a SharedMemorySnapshot
+holding a private copy of each shared object and its mappings; a
+forked child calls reshare_after_fork to create clone-local backing
+and replay the overlays before any guest thread resumes.
+
+Each object-side registration records the host address its overlay
+occupies, which freeze and replay remap with MAP_FIXED. Recycling an
+execution already clears its registrations, so a snapshot never
+replays a stale mapping over an address a later execution reuses.
+
+diff --git a/lib/wasix/src/fs/shared_memory.rs b/lib/wasix/src/fs/shared_memory.rs
+index 7dfaf8f..137dc7c 100644
+--- a/lib/wasix/src/fs/shared_memory.rs
++++ b/lib/wasix/src/fs/shared_memory.rs
+@@ -3,11 +3,11 @@ use std::{
+     ffi::CString,
+     io,
+     ops::Range,
+-    os::fd::FromRawFd,
++    os::fd::{AsRawFd, FromRawFd},
+     path::{Component, Path, PathBuf},
+     pin::Pin,
+     sync::{
+-        Arc, Mutex, RwLock,
++        Arc, Mutex, OnceLock, RwLock, Weak,
+         atomic::{AtomicU64, Ordering},
+     },
+     task::{Context, Poll},
+@@ -27,27 +27,28 @@ use crate::state::WasiFutexState;
+ 
+ #[derive(Debug)]
+ pub(crate) struct SharedMemoryObject {
+-    file: std::fs::File,
++    file: Mutex<std::fs::File>,
+     created: u64,
+     accessed: AtomicU64,
+     modified: AtomicU64,
+     next_mapping: AtomicU64,
+-    mappings: Mutex<HashMap<u64, Range<u64>>>,
++    mappings: Mutex<HashMap<u64, RegisteredMapping>>,
+     pub(crate) futexs: Mutex<WasiFutexState>,
+     io_lock: Mutex<()>,
+ }
+ 
++#[derive(Clone, Debug)]
++struct RegisteredMapping {
++    file_range: Range<u64>,
++    host_address: Option<usize>,
++}
++
++static MAPPED_OBJECTS: OnceLock<Mutex<Vec<Weak<SharedMemoryObject>>>> = OnceLock::new();
++
+ impl SharedMemoryObject {
+     fn new() -> Result<Self, FsError> {
+         #[cfg(target_os = "linux")]
+-        let file = {
+-            let name = CString::new("ictrobot-shm-v1").unwrap();
+-            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+-            if fd < 0 {
+-                return Err(io::Error::last_os_error().into());
+-            }
+-            unsafe { std::fs::File::from_raw_fd(fd) }
+-        };
++        let file = create_memfd()?;
+ 
+         #[cfg(not(target_os = "linux"))]
+         return Err(FsError::Unsupported);
+@@ -56,7 +57,7 @@ impl SharedMemoryObject {
+         {
+             let now = now_nanos();
+             Ok(Self {
+-                file,
++                file: Mutex::new(file),
+                 created: now,
+                 accessed: AtomicU64::new(now),
+                 modified: AtomicU64::new(now),
+@@ -69,7 +70,7 @@ impl SharedMemoryObject {
+     }
+ 
+     pub(crate) fn try_clone_file(&self) -> Result<std::fs::File, Errno> {
+-        self.file.try_clone().map_err(|_| Errno::Io)
++        self.file.lock().unwrap().try_clone().map_err(|_| Errno::Io)
+     }
+ 
+     pub(crate) fn register_mapping(
+@@ -82,7 +83,14 @@ impl SharedMemoryObject {
+             return Err(Errno::Inval);
+         }
+         let id = self.next_mapping.fetch_add(1, Ordering::Relaxed);
+-        self.mappings.lock().unwrap().insert(id, file_offset..end);
++        self.mappings.lock().unwrap().insert(
++            id,
++            RegisteredMapping {
++                file_range: file_offset..end,
++                host_address: None,
++            },
++        );
++        remember_mapped_object(self);
+         Ok(SharedMemoryMapping {
+             object: self.clone(),
+             id,
+@@ -97,7 +105,12 @@ impl SharedMemoryObject {
+     }
+ 
+     fn size(&self) -> u64 {
+-        self.file.metadata().map(|m| m.len()).unwrap_or(0)
++        self.file
++            .lock()
++            .unwrap()
++            .metadata()
++            .map(|m| m.len())
++            .unwrap_or(0)
+     }
+ 
+     fn set_len(&self, new_size: u64) -> Result<(), FsError> {
+@@ -106,15 +119,105 @@ impl SharedMemoryObject {
+             .lock()
+             .unwrap()
+             .values()
+-            .any(|range| range.end > new_size)
++            .any(|mapping| mapping.file_range.end > new_size)
+         {
+             return Err(FsError::PermissionDenied);
+         }
+-        self.file.set_len(new_size)?;
++        self.file.lock().unwrap().set_len(new_size)?;
+         self.modified.store(now_nanos(), Ordering::Relaxed);
+         Ok(())
+     }
+ 
++    pub(crate) fn set_mapping_host_address(&self, id: u64, host_address: usize) {
++        self.mappings
++            .lock()
++            .unwrap()
++            .get_mut(&id)
++            .expect("a live shared mapping must remain registered")
++            .host_address = Some(host_address);
++    }
++
++    fn snapshot_mappings(&self) -> io::Result<Vec<RegisteredMapping>> {
++        let mappings = self
++            .mappings
++            .lock()
++            .unwrap()
++            .values()
++            .cloned()
++            .collect::<Vec<_>>();
++        if mappings
++            .iter()
++            .any(|mapping| mapping.host_address.is_none())
++        {
++            return Err(io::Error::other(
++                "a shared-memory mapping has no host address",
++            ));
++        }
++        Ok(mappings)
++    }
++
++    #[cfg(target_os = "linux")]
++    fn replace_backing(&self, mappings: &[RegisteredMapping], shared: bool) -> io::Result<()> {
++        use std::os::unix::fs::FileExt;
++
++        let mut file = self.file.lock().unwrap();
++        let len = file.metadata()?.len();
++        let replacement = create_memfd()?;
++        replacement.set_len(len)?;
++
++        let mut buffer = [0_u8; 64 * 1024];
++        let mut offset = 0_u64;
++        while offset < len {
++            let amount = usize::try_from((len - offset).min(buffer.len() as u64)).unwrap();
++            let read = file.read_at(&mut buffer[..amount], offset)?;
++            if read == 0 {
++                return Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "shared-memory object ended while copying it",
++                ));
++            }
++            let mut written = 0;
++            while written < read {
++                let amount =
++                    replacement.write_at(&buffer[written..read], offset + written as u64)?;
++                if amount == 0 {
++                    return Err(io::ErrorKind::WriteZero.into());
++                }
++                written += amount;
++            }
++            offset += read as u64;
++        }
++
++        let sharing = if shared {
++            libc::MAP_SHARED
++        } else {
++            libc::MAP_PRIVATE
++        };
++        for mapping in mappings {
++            let host_address = mapping.host_address.unwrap();
++            let len = usize::try_from(mapping.file_range.end - mapping.file_range.start)
++                .map_err(|_| io::Error::other("shared-memory mapping is too large"))?;
++            let file_offset = libc::off_t::try_from(mapping.file_range.start)
++                .map_err(|_| io::Error::other("shared-memory offset is too large"))?;
++            let result = unsafe {
++                libc::mmap(
++                    host_address as *mut libc::c_void,
++                    len,
++                    libc::PROT_READ | libc::PROT_WRITE,
++                    libc::MAP_FIXED | sharing,
++                    replacement.as_raw_fd(),
++                    file_offset,
++                )
++            };
++            if result == libc::MAP_FAILED {
++                return Err(io::Error::last_os_error());
++            }
++        }
++
++        *file = replacement;
++        Ok(())
++    }
++
+     fn metadata(&self) -> Metadata {
+         Metadata {
+             ft: FileType::new_file(),
+@@ -149,9 +252,15 @@ impl SharedMemoryMapping {
+         mapping
+     }
+ 
+-    pub(crate) fn descriptor(&self) -> (Arc<SharedMemoryObject>, u64, u64, u64) {
++    pub(crate) fn set_address(&mut self, address: u64, host_address: usize) {
++        self.address = address;
++        self.object.set_mapping_host_address(self.id, host_address);
++    }
++
++    pub(crate) fn descriptor(&self) -> (Arc<SharedMemoryObject>, u64, u64, u64, u64) {
+         (
+             self.object.clone(),
++            self.id,
+             self.address,
+             self.len,
+             self.file_offset,
+@@ -159,6 +268,87 @@ impl SharedMemoryMapping {
+     }
+ }
+ 
++fn remember_mapped_object(object: &Arc<SharedMemoryObject>) {
++    let objects = MAPPED_OBJECTS.get_or_init(Default::default);
++    let mut objects = objects.lock().unwrap();
++    objects.retain(|found| found.strong_count() != 0);
++    let object = Arc::downgrade(object);
++    if !objects.iter().any(|found| found.ptr_eq(&object)) {
++        objects.push(object);
++    }
++}
++
++#[cfg(target_os = "linux")]
++fn create_memfd() -> io::Result<std::fs::File> {
++    let name = CString::new("ictrobot-shm-v1").unwrap();
++    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
++    if fd < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
++}
++
++pub(crate) struct SharedMemorySnapshot {
++    objects: Vec<SnapshotObject>,
++}
++
++struct SnapshotObject {
++    object: Arc<SharedMemoryObject>,
++    mappings: Vec<RegisteredMapping>,
++}
++
++pub(crate) fn freeze() -> io::Result<SharedMemorySnapshot> {
++    #[cfg(target_os = "linux")]
++    {
++        let objects = MAPPED_OBJECTS.get_or_init(Default::default);
++        let objects = {
++            let mut objects = objects.lock().unwrap();
++            objects.retain(|object| object.strong_count() != 0);
++            objects.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
++        };
++        let mut snapshot = SharedMemorySnapshot {
++            objects: Vec::new(),
++        };
++        for object in objects {
++            let mappings = object.snapshot_mappings()?;
++            if mappings.is_empty() {
++                continue;
++            }
++            object.replace_backing(&mappings, false)?;
++            snapshot.objects.push(SnapshotObject { object, mappings });
++        }
++        Ok(snapshot)
++    }
++
++    #[cfg(not(target_os = "linux"))]
++    Err(io::Error::new(
++        io::ErrorKind::Unsupported,
++        "shared-memory snapshots are only supported on Linux",
++    ))
++}
++
++impl SharedMemorySnapshot {
++    pub(crate) fn reshare_after_fork(&self) -> io::Result<usize> {
++        #[cfg(target_os = "linux")]
++        {
++            for snapshot in &self.objects {
++                snapshot.object.replace_backing(&snapshot.mappings, true)?;
++            }
++            Ok(self.objects.len())
++        }
++
++        #[cfg(not(target_os = "linux"))]
++        Err(io::Error::new(
++            io::ErrorKind::Unsupported,
++            "shared-memory snapshots are only supported on Linux",
++        ))
++    }
++
++    pub(crate) fn len(&self) -> usize {
++        self.objects.len()
++    }
++}
++
+ impl Drop for SharedMemoryMapping {
+     fn drop(&mut self) {
+         self.object.unregister_mapping(self.id);
+@@ -426,7 +616,13 @@ impl AsyncRead for SharedMemoryFileHandle {
+             return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
+         }
+         let destination = buf.initialize_unfilled();
+-        match self.object.file.read_at(destination, self.cursor) {
++        let result = self
++            .object
++            .file
++            .lock()
++            .unwrap()
++            .read_at(destination, self.cursor);
++        match result {
+             Ok(read) => {
+                 self.cursor += read as u64;
+                 self.object.accessed.store(now_nanos(), Ordering::Relaxed);
+@@ -456,7 +652,7 @@ impl AsyncWrite for SharedMemoryFileHandle {
+         } else {
+             self.cursor
+         };
+-        match object.file.write_at(buf, offset) {
++        match object.file.lock().unwrap().write_at(buf, offset) {
+             Ok(written) => {
+                 drop(_guard);
+                 self.cursor = offset + written as u64;
+@@ -540,6 +736,55 @@ fn now_nanos() -> u64 {
+ mod tests {
+     use super::*;
+ 
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn freeze_and_reshare_preserve_bytes_and_detach_parent_backing() {
++        use std::os::unix::fs::FileExt;
++
++        let object = Arc::new(SharedMemoryObject::new().unwrap());
++        object.set_len(WASM_PAGE_SIZE).unwrap();
++        let inherited_file = object.try_clone_file().unwrap();
++        inherited_file.write_at(b"frozen", 17).unwrap();
++
++        let mapped_file = object.try_clone_file().unwrap();
++        let address = unsafe {
++            libc::mmap(
++                std::ptr::null_mut(),
++                WASM_PAGE_SIZE as usize,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_SHARED,
++                mapped_file.as_raw_fd(),
++                0,
++            )
++        };
++        assert_ne!(address, libc::MAP_FAILED);
++        let mut mapping = object.register_mapping(0, WASM_PAGE_SIZE).unwrap();
++        mapping.set_address(0, address as usize);
++
++        let mappings = object.snapshot_mappings().unwrap();
++        object.replace_backing(&mappings, false).unwrap();
++        object.replace_backing(&mappings, true).unwrap();
++        inherited_file.write_at(b"parent", 17).unwrap();
++        assert_eq!(
++            unsafe { std::slice::from_raw_parts(address.cast::<u8>().add(17), 6) },
++            b"frozen"
++        );
++
++        unsafe {
++            std::ptr::copy_nonoverlapping(b"child".as_ptr(), address.cast::<u8>().add(17), 5)
++        };
++        let current_file = object.try_clone_file().unwrap();
++        let mut current = [0; 6];
++        current_file.read_at(&mut current, 17).unwrap();
++        assert_eq!(&current[..5], b"child");
++        let mut inherited = [0; 6];
++        inherited_file.read_at(&mut inherited, 17).unwrap();
++        assert_eq!(&inherited, b"parent");
++
++        assert_eq!(unsafe { libc::munmap(address, WASM_PAGE_SIZE as usize) }, 0);
++        drop(mapping);
++    }
++
+     #[test]
+     fn unlink_and_mapping_lifetimes_are_independent_of_the_name() {
+         let fs = SharedMemoryFileSystem::new();
+diff --git a/lib/wasix/src/lib.rs b/lib/wasix/src/lib.rs
+index a221498..c30632c 100644
+--- a/lib/wasix/src/lib.rs
++++ b/lib/wasix/src/lib.rs
+@@ -94,6 +94,43 @@ pub use virtual_fs::{DuplexPipe, FsError, Pipe, VirtualFile, WasiBidirectionalSh
+ pub use virtual_net;
+ pub use virtual_net::{UnsupportedVirtualNetworking, VirtualNetworking};
+ 
++/// An opaque snapshot for restoring clone-local sharing after a native fork.
++pub struct SharedMemorySnapshot(fs::shared_memory::SharedMemorySnapshot);
++
++/// Detaches live shared-memory mappings into a frozen snapshot.
++///
++/// # Safety
++///
++/// Every guest thread must be suspended. This replaces live virtual-memory
++/// mappings, and no guest may access them until a forked child has called
++/// [`SharedMemorySnapshot::reshare_after_fork`].
++pub unsafe fn freeze_shared_memory() -> std::io::Result<SharedMemorySnapshot> {
++    fs::shared_memory::freeze().map(SharedMemorySnapshot)
++}
++
++impl SharedMemorySnapshot {
++    /// Replays the recorded mappings with fresh shared backing in a native fork child.
++    ///
++    /// # Safety
++    ///
++    /// This must be called in the child before any guest thread is resumed.
++    pub unsafe fn reshare_after_fork(&self) -> std::io::Result<usize> {
++        self.0.reshare_after_fork()
++    }
++
++    /// The number of distinct shared-memory objects in the snapshot.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        self.0.len()
++    }
++
++    /// Whether this snapshot contains no shared-memory objects.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++}
++
+ #[cfg(feature = "host-vnet")]
+ pub use virtual_net::{
+     host::{LocalNetworking, LocalTcpListener, LocalTcpStream, LocalUdpSocket},
+diff --git a/lib/wasix/src/syscalls/ictrobot_shm.rs b/lib/wasix/src/syscalls/ictrobot_shm.rs
+index 2f1181f..52ad8ed 100644
+--- a/lib/wasix/src/syscalls/ictrobot_shm.rs
++++ b/lib/wasix/src/syscalls/ictrobot_shm.rs
+@@ -114,7 +114,14 @@ fn fd_map(
+             return Errno::Inval;
+         }
+ 
+-        mapping.address = address;
++        let host_address = {
++            let view = unsafe { ctx.data().memory_view(&ctx) };
++            let Ok(address) = usize::try_from(address) else {
++                return Errno::Overflow;
++            };
++            (unsafe { view.data_ptr().add(address) }) as usize
++        };
++        mapping.set_address(address, host_address);
+         mappings.push(mapping);
+         Errno::Success
+     })
+diff --git a/lib/wasix/src/syscalls/wasix/proc_fork.rs b/lib/wasix/src/syscalls/wasix/proc_fork.rs
+index ca2f94e..5ff5bbe 100644
+--- a/lib/wasix/src/syscalls/wasix/proc_fork.rs
++++ b/lib/wasix/src/syscalls/wasix/proc_fork.rs
+@@ -226,7 +226,7 @@ pub fn proc_fork<M: MemorySize>(
+                         warn!("forked child has no memory for shared mappings");
+                         return;
+                     };
+-                    for (object, address, len, file_offset) in descriptors {
++                    for (object, mapping_id, address, len, file_offset) in descriptors {
+                         let Ok(file) = object.try_clone_file() else {
+                             warn!("failed to clone a shared mapping handle for forked child");
+                             return;
+@@ -241,6 +241,15 @@ pub fn proc_fork<M: MemorySize>(
+                             warn!(%error, "failed to restore a shared mapping in forked child");
+                             return;
+                         }
++                        let host_address = {
++                            let view = unsafe { child_ctx.data().memory_view(&child_ctx) };
++                            let Ok(address) = usize::try_from(address) else {
++                                warn!("shared mapping address does not fit the host");
++                                return;
++                            };
++                            (unsafe { view.data_ptr().add(address) }) as usize
++                        };
++                        object.set_mapping_host_address(mapping_id, host_address);
+                     }
+                 }
+ 

@@ -215,6 +215,7 @@ struct Host {
     guests: GuestRuntime,
     events: EventPipe,
     guest: Option<TaskJoinHandle>,
+    shared_memory: Option<wasmer_wasix::SharedMemorySnapshot>,
     phase: Phase,
     /// The zero-page scan of a frozen guest, until it is done.
     compaction: Option<freeze::Compaction>,
@@ -261,6 +262,7 @@ impl Host {
             guests,
             events,
             guest: None,
+            shared_memory: None,
             phase: Phase::Fresh,
             compaction: None,
         })

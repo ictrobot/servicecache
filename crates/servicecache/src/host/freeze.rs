@@ -12,8 +12,10 @@
 //! presence ends with it (`HostNetworking::shut_down_sockets`): the
 //! listener stops accepting and every connection the guest holds is shut
 //! down, so a client of the template is disconnected rather than left
-//! waiting on a guest that never runs again, and a clone inherits no live
-//! connection.
+//! waiting on a guest that never runs again. Finally, every shared-memory
+//! object is copied into private frozen backing and its mappings are
+//! retained. A clone therefore inherits neither live connections nor live
+//! shared mappings.
 //!
 //! After the freeze the template releases the all-zero pages of the
 //! guest's memory (`Compaction`): an idle guest can hold many, and `fork()`
@@ -24,11 +26,12 @@
 //! they were.
 //!
 //! `fork` runs on that one thread. The child rebuilds what the parent
-//! dismantled — a new tokio runtime (a new fork generation, so every timer
-//! re-arms), a new epoll instance for the selector, its own listening socket
-//! in place of the inherited one — and gives every registered coroutine a
-//! fresh OS thread that re-creates its wait and resumes it. The parent
-//! closes its copies of the child's descriptors and stays frozen.
+//! dismantled — clone-local shared backing replayed from the frozen snapshot,
+//! a new tokio runtime (a new fork generation, so every timer re-arms), its
+//! own listening socket installed before a new epoll instance can observe
+//! it, and fresh OS threads that re-create every registered coroutine's wait
+//! and resume it. The parent closes its copies of the child's descriptors
+//! and stays frozen.
 
 use std::{
     net::{SocketAddr, TcpListener},
@@ -149,6 +152,13 @@ pub(super) fn freeze(host: &mut Host) -> Result<usize> {
     }
     tracing::debug!(elapsed = ?started.elapsed(), "host threads ended");
     host.networking.shut_down_sockets()?;
+    // SAFETY: every guest coroutine and host execution thread has ended, and
+    // a frozen host can only fork or stop.
+    let shared_memory =
+        unsafe { wasmer_wasix::freeze_shared_memory() }.context("snapshotting shared memory")?;
+    let shared_objects = shared_memory.len();
+    host.shared_memory = Some(shared_memory);
+    tracing::debug!(shared_objects, "snapshotted shared memory");
     tracing::info!(
         coroutines = quiescence.coroutines,
         elapsed = ?started.elapsed(),
@@ -221,6 +231,16 @@ fn rebuild(host: &mut Host, listener: TcpListener, forked_at: Instant) -> Result
         "rebuilding in the clone"
     );
 
+    let shared_memory = host
+        .shared_memory
+        .as_ref()
+        .context("the frozen host has no shared-memory snapshot")?;
+    // SAFETY: freeze dismantled every guest thread before the native fork, and
+    // none are resurrected until the end of this function.
+    let shared_objects =
+        unsafe { shared_memory.reshare_after_fork() }.context("resharing memory in the clone")?;
+    tracing::debug!(shared_objects, "reshared clone memory");
+
     TOKIO_EXIT.store(false, Ordering::SeqCst);
     let runtime = build_tokio()?;
     host.tasks.replace_runtime(runtime.handle().clone());
@@ -229,13 +249,13 @@ fn rebuild(host: &mut Host, listener: TcpListener, forked_at: Instant) -> Result
     host.tokio = std::mem::ManuallyDrop::new(runtime);
     let tokio_built = started.elapsed();
 
+    host.networking.replace_listener(listener)?;
+    let listener_replaced = started.elapsed();
     host.networking
         .selector()
         .rebuild_after_fork()
         .context("failed to rebuild the selector")?;
     let selector_rebuilt = started.elapsed();
-    host.networking.replace_listener(listener)?;
-    let listener_replaced = started.elapsed();
 
     let resurrected = wasmer_vm::resurrect_all(&mut |body| {
         std::thread::Builder::new()
@@ -249,9 +269,9 @@ fn rebuild(host: &mut Host, listener: TcpListener, forked_at: Instant) -> Result
     let elapsed = started.elapsed();
     tracing::debug!(
         tokio = ?tokio_built,
-        selector = ?selector_rebuilt.saturating_sub(tokio_built),
-        listener = ?listener_replaced.saturating_sub(selector_rebuilt),
-        threads = ?elapsed.saturating_sub(listener_replaced),
+        listener = ?listener_replaced.saturating_sub(tokio_built),
+        selector = ?selector_rebuilt.saturating_sub(listener_replaced),
+        threads = ?elapsed.saturating_sub(selector_rebuilt),
         "clone rebuilt"
     );
     tracing::info!(
@@ -307,6 +327,13 @@ struct MemoryScan {
 /// less resident, `fork()` copies fewer page-table entries, and clones share
 /// less. The scan only ever runs with the guest drained and this the only
 /// thread; between slices the process is exactly as it was for a fork.
+///
+/// A frozen shared-memory overlay inside a memory is not anonymous but a
+/// fresh `MAP_PRIVATE` mapping of the immutable frozen file, which nothing
+/// writes after the snapshot. Its dropped pages therefore refault with the
+/// bytes the scan read, zeros again; dropping their page-table entries is
+/// the same win for `fork()`, and a clone replaces the whole range when it
+/// reshares.
 ///
 /// A 2 MiB-aligned block whose pages are all resident may be one transparent
 /// huge page; dropping part of it would split it into 4 KiB pages, which is
@@ -496,9 +523,11 @@ fn release_pending(memory: &mut MemoryScan, page: usize, totals: &mut ZeroPages)
         return;
     };
     let run = end - start;
-    // SAFETY: a page-aligned subrange of this private anonymous mapping; the
-    // pages are zero, so the guest reads the same after the kernel
-    // zero-fills them again.
+    // SAFETY: a page-aligned subrange of the guest's mapping. An anonymous
+    // page refaults as fresh zeros. A frozen shared-memory overlay is a fresh
+    // MAP_PRIVATE mapping of the immutable frozen file, which nothing writes
+    // after the snapshot, so its pages refault as the bytes the scan read:
+    // zeros either way.
     let rc = unsafe {
         libc::madvise(
             (memory.base + start * page) as *mut libc::c_void,
