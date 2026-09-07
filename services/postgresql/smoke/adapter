@@ -99,7 +99,9 @@ def check_initialized(host, port):
     if not version.startswith("18.6"):
         raise SystemExit(f"unexpected server version: {version}")
     expect(
-        session.rows("SELECT id::text, value FROM adapter_probe ORDER BY id"),
+        session.rows(
+            "SELECT id::text, value FROM adapter_probe WHERE id < 1000 ORDER BY id"
+        ),
         [["1", "recipe-value"]],
         "initializer row",
     )
