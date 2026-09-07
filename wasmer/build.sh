@@ -21,9 +21,16 @@ out="$root/work/wasmer/$WASMER_VARIANT"
 build_dir="$root/work/build/wasmer/$WASMER_VARIANT"
 hash="$(sc_wasmer_sets_hash)"
 
+# The CLI reports its compiled-in backends; only Cranelift should be present
+# (the others are BUSL-1.1, see wasmer/README).
+wasmer_backends_ok() {
+  [[ "$("$1" --version --verbose 2>/dev/null | grep '^runtimes:')" == "runtimes: Cranelift" ]]
+}
+
 if [[ -x "$out/bin/wasmer" &&
       "$("$out/bin/wasmer" --version 2>&1)" == "wasmer $WASMER_VERSION" &&
-      -f "$out/sets-hash" && "$(cat "$out/sets-hash")" == "$hash" ]]; then
+      -f "$out/sets-hash" && "$(cat "$out/sets-hash")" == "$hash" ]] &&
+   wasmer_backends_ok "$out/bin/wasmer"; then
   echo "Wasmer $WASMER_VERSION ($WASMER_VARIANT) is already built"
   exit 0
 fi
@@ -45,5 +52,9 @@ install -D -m 755 "$build_dir/release/wasmer" "$out/bin/wasmer"
 echo "$hash" > "$out/sets-hash"
 [[ "$("$out/bin/wasmer" --version 2>&1)" == "wasmer $WASMER_VERSION" ]] || {
   echo "Wasmer verification failed after building the CLI ($WASMER_VARIANT)" >&2
+  exit 1
+}
+wasmer_backends_ok "$out/bin/wasmer" || {
+  echo "the Wasmer CLI ($WASMER_VARIANT) carries a backend other than Cranelift" >&2
   exit 1
 }

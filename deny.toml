@@ -1,0 +1,44 @@
+# Keep the host's Rust dependencies under permissive licences. The allow-list
+# is the set the dependency graph actually uses, drawn from Wasmer's own list
+# without its BUSL-1.1 exceptions and without MPL-2.0; a dependency under any
+# other licence is flagged rather than pulled in silently.
+[licenses]
+include-dev = true
+allow = [
+  "0BSD",
+  "Apache-2.0 WITH LLVM-exception",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+[[licenses.clarify]]
+crate = "saffron"
+expression = "BSD-3-Clause"
+license-files = [{ path = "LICENSE", hash = 0x0bcebb0f }]
+
+# MPL-2.0 is a file-level copyleft licence, accepted per crate so new
+# dependencies are flagged.
+[[licenses.exceptions]]
+crate = "colored"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "cooked-waker"
+allow = ["MPL-2.0"]
+
+[bans]
+multiple-versions = "allow"
+# Singlepass and LLVM are the two backends Wasmer keeps under BUSL-1.1. They
+# are never built or linked, but deny them by name so an accidental feature
+# that pulled one into the graph would fail the check outright.
+deny = [
+  { crate = "wasmer-compiler-singlepass", reason = "BUSL-1.1: production use requires Wasmer sponsorship" },
+  { crate = "wasmer-compiler-llvm", reason = "BUSL-1.1: production use requires Wasmer sponsorship" },
+]

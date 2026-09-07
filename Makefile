@@ -81,6 +81,7 @@ test: setup-wasmer
 lint: setup-wasmer
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	cargo deny -L error --config deny.toml check licenses bans
 	! grep -rniE 'mysql|mariadb|postgres|valkey|beanstalkd' crates/servicecache
 
 check: lint test smoke-toolchain
