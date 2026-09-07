@@ -26,7 +26,11 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use nix::{
     poll::{PollFd, PollFlags, PollTimeout, poll},
-    sys::wait::{WaitPidFlag, WaitStatus, waitpid},
+    sys::{
+        signal::{SigSet, SigmaskHow, Signal, pthread_sigmask},
+        signalfd::{SfdFlags, SignalFd},
+        wait::{WaitPidFlag, WaitStatus, waitpid},
+    },
     unistd::Pid,
 };
 use wasmer_wasix::os::task::TaskJoinHandle;
@@ -43,7 +47,8 @@ use crate::{cache::ModuleCache, manifest::Manifest, runtime::ReadOnlyMount};
 /// sized for the deepest syscall path rather than for Wasm alone.
 const WASM_STACK_SIZE: usize = 16 << 20;
 
-/// How often the control loop checks the guest and reaps children.
+/// How often the control loop checks the guest and reaps children. A clone
+/// exiting wakes the loop through `SIGCHLD` rather than waiting for this.
 const TICK: Duration = Duration::from_millis(100);
 
 /// How long one slice of a frozen guest's zero-page scan runs: the most a
@@ -84,6 +89,17 @@ pub fn run(args: &HostArgs) -> Result<()> {
     let channel = Channel::from_fd(unsafe { OwnedFd::from_raw_fd(args.control_fd) });
     let host = Host::new(manifest, ModuleCache::new(args.cache_dir.clone()))?;
     host.serve(channel)
+}
+
+/// `SIGCHLD` as a descriptor the control loop can poll, the signal blocked
+/// so that it goes there and nothing is lost between polls. The mask and the
+/// descriptor both survive `fork()`, so a clone inherits the arrangement.
+fn child_signal() -> Result<SignalFd> {
+    let mut mask = SigSet::empty();
+    mask.add(Signal::SIGCHLD);
+    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), None).context("failed to block SIGCHLD")?;
+    SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
+        .context("failed to open a descriptor for SIGCHLD")
 }
 
 /// Makes the kernel kill this process when the thread that spawned it dies.
@@ -231,10 +247,16 @@ struct Host {
     phase: Phase,
     /// The zero-page scan of a frozen guest, until it is done.
     compaction: Option<freeze::Compaction>,
+    /// `SIGCHLD` as a descriptor: a clone exiting wakes the control loop at
+    /// once instead of waiting for the next tick. Inherited across the fork
+    /// with the blocked signal, so a clone that becomes a template of its
+    /// own reaps its own children the same way.
+    children: SignalFd,
 }
 
 impl Host {
     fn new(manifest: Manifest, cache: ModuleCache) -> Result<Self> {
+        let children = child_signal()?;
         let tokio = freeze::build_tokio()?;
         let tasks = HostTaskManager::new(tokio.handle().clone());
         tasks.install_as_sleep_source();
@@ -278,6 +300,7 @@ impl Host {
             shared_memory: None,
             phase: Phase::Fresh,
             compaction: None,
+            children,
         })
     }
 
@@ -332,6 +355,7 @@ impl Host {
         let mut fds = [
             PollFd::new(channel.as_fd(), PollFlags::POLLIN),
             PollFd::new(self.events.read.as_fd(), PollFlags::POLLIN),
+            PollFd::new(self.children.as_fd(), PollFlags::POLLIN),
         ];
         let timeout = PollTimeout::try_from(timeout).context("poll timeout")?;
         match poll(&mut fds, timeout) {
@@ -361,6 +385,14 @@ impl Host {
     /// exiting. Returns `true` when the host should end.
     fn tick(&mut self, channel: &Channel) -> Result<bool> {
         self.events.drain()?;
+        // Drain the signals so the descriptor stops being readable; what
+        // they announce is read from `waitpid` below, which runs anyway.
+        while self
+            .children
+            .read_signal()
+            .context("failed to read SIGCHLD")?
+            .is_some()
+        {}
         if self.phase != Phase::Frozen
             && let Some(status) = self.guest.as_ref().and_then(exit_status)
         {
