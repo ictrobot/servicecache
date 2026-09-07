@@ -1,0 +1,163 @@
+Subject: wasix: suspend finite clock-only polls directly
+
+A poll_oneoff with one finite clock subscription and nothing else is a
+sleep, and the commonest wait in a guest whose threads pace themselves
+with short timeouts. It went through the general polling path: a batch
+of descriptor guards, a Tokio timer, the future selecting between them
+and a waker, built and torn down for every sleep.
+
+Suspend such a call directly instead, as the wait a futex takes but
+with no guest word: the coroutine yields it to its host loop, which
+blocks in the embedder's hook on the WASI thread's interrupt
+generation and the freeze-gate generation until the absolute deadline.
+Reaching the deadline completes the poll with its clock event. An
+interrupt, or a host that turns out not to support the wait, falls
+through to the general path with the time remaining, so the full
+signal and termination processing still runs there.
+
+Journaled calls keep the general path: a replayed poll_oneoff must
+first consume its recorded result through handle_rewind. Polls that
+mix a clock with descriptors, immediate polls and infinite waits are
+unchanged.
+
+diff --git a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
+index 73a96d6..d82bd0d 100644
+--- a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
++++ b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
+@@ -237,6 +237,10 @@ pub(crate) fn poll_oneoff_internal<'a, M: MemorySize, After>(
+ where
+     After: FnOnce(&FunctionEnvMut<'a, WasiEnv>, Vec<Event>) -> Errno,
+ {
++    // Capture before the final signal check. A notification already queued is
++    // processed by the check; one arriving afterwards changes this generation
++    // and interrupts a direct host deadline wait without a lost-wake window.
++    let wait_interrupt = ctx.data().thread.wait_interrupt();
+     wasi_try_ok!(WasiEnv::process_signals_and_exit(&mut ctx)?);
+     let subs_len = subs.len();
+     wasi_try_ok!(validate_poll_subscriptions_count(ctx.data(), subs_len));
+@@ -335,37 +339,6 @@ where
+ 
+     let mut events_seen: u32 = 0;
+ 
+-    let batch = {
+-        // Build the batch of things we are going to poll
+-        let state = ctx.data().state.clone();
+-        let tasks = ctx.data().tasks().clone();
+-        let mut guards = {
+-            // We start by building a list of files we are going to poll
+-            // and open a read lock on them all
+-            let mut fd_guards = Vec::with_capacity(subs.len());
+-
+-            #[allow(clippy::significant_drop_in_scrutinee)]
+-            for (fd, peb, s) in subs {
+-                if let Some(fd) = fd {
+-                    let wasi_file_ref = wasi_try_ok!(poll_fd_guard(&state, peb, fd, s));
+-                    fd_guards.push(wasi_file_ref);
+-                }
+-            }
+-
+-            if fd_guards.len() > 10 {
+-                let small_list: Vec<_> = fd_guards.iter().take(10).collect();
+-                tracing::Span::current().record("fd_guards", format!("{small_list:?}..."));
+-            } else {
+-                tracing::Span::current().record("fd_guards", format!("{fd_guards:?}"));
+-            }
+-
+-            fd_guards
+-        };
+-
+-        // Block polling the file descriptors
+-        PollBatch::new(pid, tid, guards)
+-    };
+-
+     // If the time is infinite then we omit the time_to_sleep parameter
+     let timeout = match time_to_sleep {
+         Duration::ZERO => {
+@@ -381,6 +354,7 @@ where
+             Some(time)
+         }
+     };
++    let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+ 
+     // Function to process a timeout
+     let process_timeout = {
+@@ -411,6 +385,79 @@ where
+         }
+     };
+ 
++    // A single finite clock subscription has no I/O readiness to combine
++    // with its timeout. Suspend it directly in the outer host loop, as a
++    // futex wait with no guest word, so the guest thread can remain in an
++    // interruptible kernel wait without a Tokio timer, future graph, waker,
++    // or repeated polling. Mixed clock/FD polls retain the existing async
++    // path below, as do journaled calls which must first consume their
++    // serialized result through `handle_rewind`.
++    #[cfg(feature = "host-futex")]
++    if !ctx.data().enable_journal
++        && clock_cnt == 1
++        && subs_len == 1
++        && timeout.is_some_and(|timeout| !timeout.is_zero())
++        && let Some(deadline) = deadline
++    {
++        let result = unsafe {
++            wasmer_vm::try_suspend_on_futex(
++                None,
++                wait_interrupt.0,
++                wait_interrupt.1,
++                Some(deadline),
++            )
++        };
++        match result {
++            Some(wasmer_vm::HostFutexResult::TimedOut) => {
++                process_events(&ctx, process_timeout(&ctx));
++                return Ok(Errno::Success);
++            }
++            // The normal Asyncify path below performs the full signal,
++            // termination and link-operation processing. It is also the safe
++            // fallback if host support disappears after the initial probe.
++            Some(wasmer_vm::HostFutexResult::Interrupted)
++            | Some(wasmer_vm::HostFutexResult::Unavailable)
++            | Some(wasmer_vm::HostFutexResult::Woken)
++            | None => {}
++        }
++    }
++
++    let batch = {
++        // Build the batch of things we are going to poll
++        let state = ctx.data().state.clone();
++        let guards = {
++            // We start by building a list of files we are going to poll
++            // and open a read lock on them all
++            let mut fd_guards = Vec::with_capacity(subs.len());
++
++            #[allow(clippy::significant_drop_in_scrutinee)]
++            for (fd, peb, s) in subs {
++                if let Some(fd) = fd {
++                    let wasi_file_ref = wasi_try_ok!(poll_fd_guard(&state, peb, fd, s));
++                    fd_guards.push(wasi_file_ref);
++                }
++            }
++
++            if fd_guards.len() > 10 {
++                let small_list: Vec<_> = fd_guards.iter().take(10).collect();
++                tracing::Span::current().record("fd_guards", format!("{small_list:?}..."));
++            } else {
++                tracing::Span::current().record("fd_guards", format!("{fd_guards:?}"));
++            }
++
++            fd_guards
++        };
++
++        // Block polling the file descriptors
++        PollBatch::new(pid, tid, guards)
++    };
++
++    // A direct wait can be interrupted after spending part of the requested
++    // interval asleep. Preserve its absolute deadline when falling back.
++    let timeout = deadline
++        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
++        .or(timeout);
++
+     #[cfg(feature = "sys")]
+     if env.capabilities.threading.enable_blocking_sleep && subs_len == 1 {
+         // Here, `poll_oneoff` is merely in a sleeping state

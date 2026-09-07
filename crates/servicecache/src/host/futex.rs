@@ -66,15 +66,21 @@ mod linux {
     }
 
     fn wait(request: HostFutexWait) -> HostFutexResult {
+        // The generations first, so a wake index below `futex` is an
+        // interrupt whether or not the wait has a guest word. The third slot
+        // is passed to the kernel only when there is a word for it.
+        let (futex_address, futex_expected) = request.futex.unwrap_or((std::ptr::null(), 0));
         let waiters = [
-            Waiter::new(request.address, request.expected),
             Waiter::new(request.interrupt, request.interrupt_expected),
             Waiter::new(request.gate, request.gate_expected),
+            Waiter::new(futex_address, futex_expected),
         ];
+        let waiters = &waiters[..if request.futex.is_some() { 3 } else { 2 }];
+        let futex = request.futex.map(|_| 2);
         loop {
-            match call_waitv(&waiters, request.deadline) {
-                Ok(0) => return HostFutexResult::Woken,
-                Ok(1 | 2) => return HostFutexResult::Interrupted,
+            match call_waitv(waiters, request.deadline) {
+                Ok(index) if Some(index) == futex => return HostFutexResult::Woken,
+                Ok(0 | 1) => return HostFutexResult::Interrupted,
                 Err(libc::ETIMEDOUT) => return HostFutexResult::TimedOut,
                 Err(libc::EAGAIN) => {
                     if load(request.gate) != request.gate_expected
@@ -82,7 +88,9 @@ mod linux {
                     {
                         return HostFutexResult::Interrupted;
                     }
-                    if load(request.address) != request.expected {
+                    if let Some((address, expected)) = request.futex
+                        && load(address) != expected
+                    {
                         return HostFutexResult::Woken;
                     }
                     if request
@@ -93,7 +101,7 @@ mod linux {
                     }
                 }
                 // A Unix signal can interrupt the host syscall independently
-                // of a WASIX signal. Retry after rechecking all generations.
+                // of a WASIX signal. Retry after rechecking the generations.
                 Err(libc::EINTR) => {
                     if load(request.gate) != request.gate_expected
                         || load(request.interrupt) != request.interrupt_expected
@@ -221,10 +229,9 @@ mod linux {
             gate: AtomicU32,
         }
 
-        fn request(words: &Words, deadline: Option<Instant>) -> HostFutexWait {
+        fn request(words: &Words, futex: bool, deadline: Option<Instant>) -> HostFutexWait {
             HostFutexWait {
-                address: (&raw const words.guest).cast(),
-                expected: 0,
+                futex: futex.then(|| ((&raw const words.guest).cast(), 0)),
                 interrupt: (&raw const words.interrupt).cast(),
                 interrupt_expected: 0,
                 gate: (&raw const words.gate).cast(),
@@ -257,6 +264,7 @@ mod linux {
                 let waiter = thread::spawn(move || {
                     wait(request(
                         &waiter_words,
+                        true,
                         Some(Instant::now() + Duration::from_secs(2)),
                     ))
                 });
@@ -275,6 +283,48 @@ mod linux {
             assert_eq!(
                 wait(request(
                     &words,
+                    true,
+                    Some(Instant::now() + Duration::from_millis(10)),
+                )),
+                HostFutexResult::TimedOut
+            );
+        }
+
+        #[test]
+        fn wait_without_a_guest_word_observes_each_generation_and_timeout() {
+            if !probe_futex_waitv() {
+                return;
+            }
+            for index in 0..2 {
+                let words = Arc::new(Words {
+                    guest: AtomicU32::new(0),
+                    interrupt: AtomicU32::new(0),
+                    gate: AtomicU32::new(0),
+                });
+                let waiter_words = words.clone();
+                let waiter = thread::spawn(move || {
+                    wait(request(
+                        &waiter_words,
+                        false,
+                        Some(Instant::now() + Duration::from_secs(2)),
+                    ))
+                });
+                thread::sleep(Duration::from_millis(10));
+                let word = [&words.interrupt, &words.gate][index];
+                word.fetch_add(1, Ordering::Release);
+                wake(std::ptr::from_ref(word).cast(), 1);
+                assert_eq!(waiter.join().unwrap(), HostFutexResult::Interrupted);
+            }
+
+            let words = Words {
+                guest: AtomicU32::new(0),
+                interrupt: AtomicU32::new(0),
+                gate: AtomicU32::new(0),
+            };
+            assert_eq!(
+                wait(request(
+                    &words,
+                    false,
                     Some(Instant::now() + Duration::from_millis(10)),
                 )),
                 HostFutexResult::TimedOut
