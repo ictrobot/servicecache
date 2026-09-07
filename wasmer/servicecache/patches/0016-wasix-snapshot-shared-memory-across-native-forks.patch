@@ -413,7 +413,7 @@ index 7dfaf8f..137dc7c 100644
      fn unlink_and_mapping_lifetimes_are_independent_of_the_name() {
          let fs = SharedMemoryFileSystem::new();
 diff --git a/lib/wasix/src/lib.rs b/lib/wasix/src/lib.rs
-index a221498..c30632c 100644
+index 66cd8c3..52b1008 100644
 --- a/lib/wasix/src/lib.rs
 +++ b/lib/wasix/src/lib.rs
 @@ -94,6 +94,43 @@ pub use virtual_fs::{DuplexPipe, FsError, Pipe, VirtualFile, WasiBidirectionalSh
@@ -461,7 +461,7 @@ index a221498..c30632c 100644
  pub use virtual_net::{
      host::{LocalNetworking, LocalTcpListener, LocalTcpStream, LocalUdpSocket},
 diff --git a/lib/wasix/src/syscalls/ictrobot_shm.rs b/lib/wasix/src/syscalls/ictrobot_shm.rs
-index 2f1181f..52ad8ed 100644
+index 086af06..baca648 100644
 --- a/lib/wasix/src/syscalls/ictrobot_shm.rs
 +++ b/lib/wasix/src/syscalls/ictrobot_shm.rs
 @@ -114,7 +114,14 @@ fn fd_map(
@@ -481,10 +481,10 @@ index 2f1181f..52ad8ed 100644
          Errno::Success
      })
 diff --git a/lib/wasix/src/syscalls/wasix/proc_fork.rs b/lib/wasix/src/syscalls/wasix/proc_fork.rs
-index ca2f94e..5ff5bbe 100644
+index 1b4611e..1e9499a 100644
 --- a/lib/wasix/src/syscalls/wasix/proc_fork.rs
 +++ b/lib/wasix/src/syscalls/wasix/proc_fork.rs
-@@ -226,7 +226,7 @@ pub fn proc_fork<M: MemorySize>(
+@@ -228,7 +228,7 @@ pub fn proc_fork<M: MemorySize>(
                          warn!("forked child has no memory for shared mappings");
                          return;
                      };
@@ -493,7 +493,7 @@ index ca2f94e..5ff5bbe 100644
                          let Ok(file) = object.try_clone_file() else {
                              warn!("failed to clone a shared mapping handle for forked child");
                              return;
-@@ -241,6 +241,15 @@ pub fn proc_fork<M: MemorySize>(
+@@ -243,6 +243,15 @@ pub fn proc_fork<M: MemorySize>(
                              warn!(%error, "failed to restore a shared mapping in forked child");
                              return;
                          }

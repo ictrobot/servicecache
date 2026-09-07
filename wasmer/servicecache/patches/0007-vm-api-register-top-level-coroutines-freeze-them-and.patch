@@ -122,7 +122,7 @@ index 5a50aaf..83cd32f 100644
  pub use trap::{Trap, UnwindReason};
  #[cfg(feature = "baremetal")]
 diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
-index 3356548..a0b7803 100644
+index 3356548..adc2d60 100644
 --- a/lib/vm/src/trap/suspend.rs
 +++ b/lib/vm/src/trap/suspend.rs
 @@ -28,13 +28,16 @@
@@ -175,12 +175,16 @@ index 3356548..a0b7803 100644
          let ready = unsafe { fut.poll(&mut cx) }.is_ready();
          leave();
          if ready {
-@@ -211,13 +220,14 @@ pub fn try_suspend_on_block(fut: Pin<&mut (dyn Future<Output = ()> + '_)>) -> bo
+@@ -211,13 +220,18 @@ pub fn try_suspend_on_block(fut: Pin<&mut (dyn Future<Output = ()> + '_)>) -> bo
      // live; suspending from within it is the operation it exists for.
      #[cfg(feature = "tracing")]
      let (started, thread) = (Instant::now(), std::thread::current().id());
 -    log!(trace, "suspending on a wait");
-+    log!(trace, coroutine = current_coroutine(), "suspending on a wait");
++    log!(
++        trace,
++        coroutine = current_coroutine(),
++        "suspending on a wait"
++    );
      unsafe { yielder.as_ref().suspend(WasmYield::Blocked(blocked)) };
      // Resumed, possibly on another thread: this thread's view of the
      // coroutine is re-established through the non-inlined accessor.
@@ -191,7 +195,7 @@ index 3356548..a0b7803 100644
          waited = ?started.elapsed(),
          migrated = std::thread::current().id() != thread,
          "resumed"
-@@ -284,6 +294,7 @@ pub(crate) fn block_on<F: Future>(fut: F, deadline: Option<Instant>) -> F::Outpu
+@@ -284,6 +298,7 @@ pub(crate) fn block_on<F: Future>(fut: F, deadline: Option<Instant>) -> F::Outpu
  
  /// One coroutine and what its loop needs to resume it.
  struct GuestCoro<T> {
@@ -199,7 +203,7 @@ index 3356548..a0b7803 100644
      coro: Coroutine<(), WasmYield, Result<T, UnwindReason>, DefaultStack>,
      /// The custom trap handler installed around each resume, for coroutines
      /// that run Wasm.
-@@ -294,8 +305,16 @@ struct GuestCoro<T> {
+@@ -294,8 +309,16 @@ struct GuestCoro<T> {
      with_trap_context: bool,
      /// The wait the coroutine is suspended in, if any.
      pending: Option<BlockedFuture>,
@@ -216,7 +220,7 @@ index 3356548..a0b7803 100644
  impl<T: 'static> GuestCoro<T> {
      /// Resumes the coroutine on the calling thread, recording the wait it
      /// suspends in.
-@@ -337,10 +356,13 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+@@ -337,10 +360,13 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
          Ok(f())
      });
      let mut handle = GuestCoro {
@@ -230,7 +234,7 @@ index 3356548..a0b7803 100644
      };
  
      // Restore the enclosing yielder however the loop ends, including by a
-@@ -366,7 +388,7 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+@@ -366,7 +392,7 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
                      unsafe { outer.as_ref().suspend(WasmYield::Blocked(fut)) };
                      yielder_set(Some(outer));
                  }
@@ -239,7 +243,7 @@ index 3356548..a0b7803 100644
              },
              CoroutineResult::Return(result) => break result,
          }
-@@ -379,3 +401,402 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+@@ -379,3 +405,410 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
      release_stack(coro.into_stack());
      result
  }
@@ -617,7 +621,11 @@ index 3356548..a0b7803 100644
 +        // shared reference cannot alias a `&mut` from `host_loop`.
 +        let coro = unsafe { entry.0.as_ref() };
 +        if coro.started() && coro.pending().is_none() {
-+            log!(error, id = coro.id(), "coroutine is not suspended in a wait");
++            log!(
++                error,
++                id = coro.id(),
++                "coroutine is not suspended in a wait"
++            );
 +            return Err(FreezeError::NotSuspended(coro.id()));
 +        }
 +    }
@@ -632,7 +640,11 @@ index 3356548..a0b7803 100644
 +            // see `host_loop`.
 +            let coro = unsafe { &mut *entry.0.as_ptr() };
 +            coro.restore_thread_state();
-+            log!(trace, id = coro.id(), "coroutine resurrected on a fresh thread");
++            log!(
++                trace,
++                id = coro.id(),
++                "coroutine resurrected on a fresh thread"
++            );
 +            let pending = coro.pending();
 +            host_loop(entry.0, pending);
 +        }))

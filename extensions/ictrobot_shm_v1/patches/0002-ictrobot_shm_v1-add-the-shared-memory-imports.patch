@@ -796,10 +796,10 @@ index 4deeb12..eb62e37 100644
  
 diff --git a/lib/wasix/src/syscalls/ictrobot_shm.rs b/lib/wasix/src/syscalls/ictrobot_shm.rs
 new file mode 100644
-index 0000000..2f1181f
+index 0000000..086af06
 --- /dev/null
 +++ b/lib/wasix/src/syscalls/ictrobot_shm.rs
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,156 @@
 +use super::*;
 +use crate::fs::shared_memory::SharedMemoryObject;
 +
@@ -926,7 +926,6 @@ index 0000000..2f1181f
 +    fd_unmap(ctx, u64::from(address), u64::from(len))
 +}
 +
-+
 +fn fd_unmap(mut ctx: FunctionEnvMut<'_, WasiEnv>, address: u64, len: u64) -> Errno {
 +    if len == 0 || address % WASM_PAGE_SIZE != 0 || len % WASM_PAGE_SIZE != 0 {
 +        return Errno::Inval;
@@ -958,7 +957,7 @@ index 0000000..2f1181f
 +    })
 +}
 diff --git a/lib/wasix/src/syscalls/mod.rs b/lib/wasix/src/syscalls/mod.rs
-index 90bdb31..1ae91f2 100644
+index a80e76e..a46f96f 100644
 --- a/lib/wasix/src/syscalls/mod.rs
 +++ b/lib/wasix/src/syscalls/mod.rs
 @@ -21,6 +21,7 @@ pub mod wasm;
@@ -1184,19 +1183,20 @@ index 8a74714..c074546 100644
  
      let woken = match woken {
 diff --git a/lib/wasix/src/syscalls/wasix/proc_fork.rs b/lib/wasix/src/syscalls/wasix/proc_fork.rs
-index 1c392c5..ca2f94e 100644
+index 1c392c5..1b4611e 100644
 --- a/lib/wasix/src/syscalls/wasix/proc_fork.rs
 +++ b/lib/wasix/src/syscalls/wasix/proc_fork.rs
-@@ -75,6 +75,17 @@ pub fn proc_fork<M: MemorySize>(
+@@ -75,6 +75,18 @@ pub fn proc_fork<M: MemorySize>(
              return Ok(Errno::Perm);
          }
      };
 +    {
-+        let mappings: Vec<_> = ctx
-+            .data()
-+            .process
-+            .shared_memory_mappings
-+            .read(|mappings| mappings.iter().map(|mapping| mapping.fork_clone()).collect());
++        let mappings: Vec<_> = ctx.data().process.shared_memory_mappings.read(|mappings| {
++            mappings
++                .iter()
++                .map(|mapping| mapping.fork_clone())
++                .collect()
++        });
 +        child_env
 +            .process
 +            .shared_memory_mappings
@@ -1205,7 +1205,7 @@ index 1c392c5..ca2f94e 100644
      let child_pid = child_env.process.pid();
      let child_finished = child_env.process.finished.clone();
  
-@@ -197,6 +208,42 @@ pub fn proc_fork<M: MemorySize>(
+@@ -197,6 +209,43 @@ pub fn proc_fork<M: MemorySize>(
                  let ctx = props.ctx;
                  let mut store = props.store;
  
@@ -1213,16 +1213,17 @@ index 1c392c5..ca2f94e 100644
 +                // file overlay before the child executes guest code.
 +                {
 +                    let mut child_ctx = ctx.env.clone().into_mut(&mut store);
-+                    let descriptors = child_ctx
-+                        .data()
-+                        .process
-+                        .shared_memory_mappings
-+                        .read(|mappings| {
-+                            mappings
-+                                .iter()
-+                                .map(|mapping| mapping.descriptor())
-+                                .collect::<Vec<_>>()
-+                        });
++                    let descriptors =
++                        child_ctx
++                            .data()
++                            .process
++                            .shared_memory_mappings
++                            .read(|mappings| {
++                                mappings
++                                    .iter()
++                                    .map(|mapping| mapping.descriptor())
++                                    .collect::<Vec<_>>()
++                            });
 +                    let Some(memory) = child_ctx.data().try_memory_clone() else {
 +                        warn!("forked child has no memory for shared mappings");
 +                        return;

@@ -18,10 +18,10 @@ after the handlers run and schedule another poll when it is not empty,
 so the stragglers are processed before the wait can sleep.
 
 diff --git a/lib/wasix/src/syscalls/mod.rs b/lib/wasix/src/syscalls/mod.rs
-index 66689e8..90bdb31 100644
+index 66689e8..a80e76e 100644
 --- a/lib/wasix/src/syscalls/mod.rs
 +++ b/lib/wasix/src/syscalls/mod.rs
-@@ -423,6 +423,13 @@ where
+@@ -423,6 +423,22 @@ where
                          if let Err(err) = WasiEnv::do_pending_link_operations(self.ctx, false) {
                              return Poll::Ready(Err(err));
                          }
@@ -29,7 +29,16 @@ index 66689e8..90bdb31 100644
 +                        // pushed to a queue with no subscribed waker and woke
 +                        // nobody; sleeping now would strand it until an
 +                        // unrelated wake. Schedule another poll to process it.
-+                        if !self.ctx.data().thread.signals().lock().unwrap().0.is_empty() {
++                        if !self
++                            .ctx
++                            .data()
++                            .thread
++                            .signals()
++                            .lock()
++                            .unwrap()
++                            .0
++                            .is_empty()
++                        {
 +                            cx.waker().wake_by_ref();
 +                        }
                          Poll::Pending
