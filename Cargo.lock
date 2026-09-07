@@ -4475,6 +4475,7 @@ dependencies = [
  "wasmer-journal",
  "wasmer-package",
  "wasmer-types",
+ "wasmer-vm",
  "wasmer-wasix-types",
  "wasmparser 0.256.0",
  "webc",

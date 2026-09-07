@@ -25,9 +25,10 @@ not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
   instead of parking its OS thread, lets guest threads be resurrected on fresh
   threads in a forked child, rebuilds the selector after a fork, replaces a
   clone's listening socket, snapshots shared memory across the native fork
-  so clones diverge, and keeps host I/O from going through a runtime
-  handle captured at construction. Suspension is off unless the host enables
-  it; the I/O changes apply always.
+  so clones diverge, keeps host I/O from going through a runtime handle
+  captured at construction, and lets the host wait on a guest futex in the
+  kernel. Suspension is off unless the host enables it; the I/O changes
+  apply always.
 
 build.sh <variant> builds and installs a variant's CLI; setup.sh <variant>
 only prepares its checkout; test.sh <variant> runs the unit tests of the

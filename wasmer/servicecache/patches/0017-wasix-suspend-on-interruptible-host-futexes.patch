@@ -1,0 +1,878 @@
+Subject: wasix: suspend on interruptible host futexes
+
+A guest futex wait went through the async path: a logical waiter in
+the futex table, a Tokio timer for the timeout, and the coroutine
+suspended on a future for the host loop to poll. For a guest whose
+idle threads wait on futexes with short timeouts, that machinery was
+most of the host's remaining CPU.
+
+Let an embedder wait on the guest word directly. A process-local futex
+in a linear memory whose base cannot move is handed to host hooks as a
+three-word wait with an absolute deadline: the guest futex and its
+expected value, the WASI thread's interrupt generation, and the
+freeze-gate generation. The kernel checks the values and enqueues the
+waiter atomically, so no logical waiter is registered. A signal or a
+termination bumps and wakes the thread's generation, and closing the
+freeze gate bumps and wakes the gate's; either returns the wait as
+interrupted, and the syscall falls through to the existing path for
+the full signal and termination processing. A wake goes to direct
+waiters first and to a logical waiter only when none woke.
+
+Shared-file futexes and dynamic memories keep the async path, since a
+direct wait needs a word whose address cannot change. A coroutine
+frozen in a direct wait retains it, so a resurrected child resumes the
+same wait against its own gate generation. The hooks live behind
+wasix's host-futex feature, which every native configuration enables,
+and nothing changes until an embedder installs them and enables
+suspension.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 7a39208..ce1d729 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -8012,6 +8012,7 @@ dependencies = [
+  "wasmer-journal",
+  "wasmer-package",
+  "wasmer-types",
++ "wasmer-vm",
+  "wasmer-wasix-types",
+  "wasmparser 0.256.0",
+  "wcgi",
+diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
+index ff6c15b..b2be3cd 100644
+--- a/lib/vm/src/memory.rs
++++ b/lib/vm/src/memory.rs
+@@ -48,6 +48,9 @@ pub struct LinearMemoryInfo {
+ struct RegisteredMemory {
+     definition: NonNull<VMMemoryDefinition>,
+     private_anonymous: bool,
++    /// A base and usable reservation that cannot move while this memory
++    /// lives. Dynamic memories have no such range.
++    stable_range: Option<(usize, usize)>,
+ }
+ 
+ // SAFETY: the pointer is only dereferenced by `linear_memories`, under its
+@@ -56,13 +59,18 @@ unsafe impl Send for RegisteredMemory {}
+ 
+ static LINEAR_MEMORIES: Mutex<Vec<RegisteredMemory>> = Mutex::new(Vec::new());
+ 
+-fn register_memory(definition: NonNull<VMMemoryDefinition>, private_anonymous: bool) {
++fn register_memory(
++    definition: NonNull<VMMemoryDefinition>,
++    private_anonymous: bool,
++    stable_range: Option<(*mut u8, usize)>,
++) {
+     LINEAR_MEMORIES
+         .lock()
+         .unwrap_or_else(|e| e.into_inner())
+         .push(RegisteredMemory {
+             definition,
+             private_anonymous,
++            stable_range: stable_range.map(|(base, len)| (base as usize, len)),
+         });
+ }
+ 
+@@ -101,6 +109,28 @@ pub unsafe fn linear_memories() -> Vec<LinearMemoryInfo> {
+         .collect()
+ }
+ 
++/// Whether `address` belongs to a linear-memory reservation whose base can
++/// never move. The caller separately validates that the word is currently
++/// accessible and aligned.
++pub(crate) fn stable_futex_address(address: *const u32) -> bool {
++    let start = address as usize;
++    if start % std::mem::align_of::<u32>() != 0 {
++        return false;
++    }
++    let Some(end) = start.checked_add(size_of::<u32>()) else {
++        return false;
++    };
++    LINEAR_MEMORIES
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .iter()
++        .filter_map(|entry| entry.stable_range)
++        .any(|(base, len)| {
++            base.checked_add(len)
++                .is_some_and(|memory_end| base <= start && end <= memory_end)
++        })
++}
++
+ // The memory mapped area
+ #[derive(Debug)]
+ struct WasmMmap {
+@@ -110,6 +140,8 @@ struct WasmMmap {
+     size: Pages,
+     /// The owned memory definition used by the generated code
+     vm_memory_definition: MaybeInstanceOwned<VMMemoryDefinition>,
++    /// Usable bytes reserved at a base that cannot move, for static memories.
++    stable_capacity: Option<usize>,
+ }
+ 
+ /// # SAFETY: Not safe by rust standards, since guest code may do weird things
+@@ -301,9 +333,15 @@ impl WasmMmap {
+             ))),
+             alloc,
+             size: self.size,
++            stable_capacity: self.stable_capacity,
+         };
+         // `Mmap::copy` always makes a private anonymous mapping.
+-        register_memory(copy.get_vm_memory_definition(), true);
++        register_memory(
++            copy.get_vm_memory_definition(),
++            true,
++            copy.stable_capacity
++                .map(|len| (copy.alloc.as_ptr() as *mut u8, len)),
++        );
+         Ok(copy)
+     }
+ }
+@@ -502,8 +540,17 @@ impl VMOwnedMemory {
+                 },
+                 alloc,
+                 size: Bytes::from(mem_length).try_into().unwrap(),
++                stable_capacity: match style {
++                    MemoryStyle::Static { .. } => Some(minimum_bytes),
++                    MemoryStyle::Dynamic { .. } => None,
++                },
+             };
+-            register_memory(mmap.get_vm_memory_definition(), private_anonymous);
++            register_memory(
++                mmap.get_vm_memory_definition(),
++                private_anonymous,
++                mmap.stable_capacity
++                    .map(|len| (mmap.alloc.as_ptr() as *mut u8, len)),
++            );
+ 
+             Ok(Self {
+                 mmap,
+diff --git a/lib/vm/src/trap/mod.rs b/lib/vm/src/trap/mod.rs
+index 83cd32f..a220418 100644
+--- a/lib/vm/src/trap/mod.rs
++++ b/lib/vm/src/trap/mod.rs
+@@ -22,9 +22,11 @@ mod traphandlers;
+ 
+ #[cfg(not(feature = "baremetal"))]
+ pub use suspend::{
+-    BlockedFuture, FreezeError, Quiescence, Resurrected, SleepHook, ThreadStateHooks, WasmYield,
++    BlockedFuture, FreezeError, HostFutexHooks, HostFutexResult, HostFutexWait, Quiescence,
++    Resurrected, SleepHook, SuspendedFutex, ThreadStateHooks, WasmYield, can_suspend_on_futex,
+     exit_current_thread, on_host_stack_for_import, resurrect_all, run_guest_thread,
+-    set_thread_state_hooks, try_suspend_on_block,
++    set_host_futex_hooks, set_thread_state_hooks, try_suspend_on_block, try_suspend_on_futex,
++    wake_host_futex,
+ };
+ pub use trap::{Trap, UnwindReason};
+ #[cfg(feature = "baremetal")]
+diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
+index adc2d60..6791508 100644
+--- a/lib/vm/src/trap/suspend.rs
++++ b/lib/vm/src/trap/suspend.rs
+@@ -34,7 +34,7 @@ use std::future::Future;
+ use std::mem;
+ use std::pin::Pin;
+ use std::ptr::NonNull;
+-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex, OnceLock};
+ use std::task::{Context, Poll, Wake, Waker};
+ use std::thread::Thread;
+@@ -56,8 +56,76 @@ pub enum WasmYield {
+     /// The guest is blocked in a host wait. The loop polls the future to
+     /// completion, parking between polls, and then resumes the coroutine.
+     Blocked(BlockedFuture),
++    /// The guest is blocked on a 32-bit futex that the host can wait on
++    /// directly, together with the thread and freeze interrupt words.
++    Futex(SuspendedFutex),
+ }
+ 
++/// The result of a host futex wait.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[repr(u8)]
++pub enum HostFutexResult {
++    /// The guest futex was woken or no longer held its expected value.
++    Woken = 1,
++    /// The deadline elapsed.
++    TimedOut = 2,
++    /// The guest thread's interrupt generation changed.
++    Interrupted = 3,
++    /// This host cannot perform the wait; the guest must use its fallback.
++    Unavailable = 4,
++}
++
++const FUTEX_PENDING: u8 = 0;
++
++/// One direct futex wait as presented to an embedder.
++///
++/// All three addresses point to aligned, live 32-bit words for the duration
++/// of `HostFutexHooks::wait`. The wait must atomically wait for all three to
++/// retain their expected values, or return `Unavailable` without blocking.
++#[derive(Clone, Copy, Debug)]
++pub struct HostFutexWait {
++    /// The guest futex word.
++    pub address: *const u32,
++    /// Expected value of the guest futex.
++    pub expected: u32,
++    /// Per-guest-thread interrupt generation.
++    pub interrupt: *const u32,
++    /// Expected interrupt generation.
++    pub interrupt_expected: u32,
++    /// Process-wide freeze-gate generation.
++    pub gate: *const u32,
++    /// Expected freeze-gate generation.
++    pub gate_expected: u32,
++    /// Absolute monotonic deadline, if any.
++    pub deadline: Option<Instant>,
++}
++
++/// Host operations for direct, interruptible futex waits.
++#[derive(Clone, Copy)]
++pub struct HostFutexHooks {
++    /// Whether a direct wait can currently be attempted.
++    pub supported: fn() -> bool,
++    /// Waits atomically on the guest, thread-interrupt and freeze-gate words.
++    pub wait: fn(HostFutexWait) -> HostFutexResult,
++    /// Wakes at most `count` waiters on one word, returning how many woke.
++    pub wake: fn(*const u32, u32) -> u32,
++}
++
++/// A direct futex wait retained while its coroutine is suspended.
++#[derive(Clone, Copy, Debug)]
++pub struct SuspendedFutex {
++    address: NonNull<u32>,
++    expected: u32,
++    interrupt: NonNull<AtomicU32>,
++    interrupt_expected: u32,
++    deadline: Option<Instant>,
++    result: NonNull<AtomicU8>,
++}
++
++// SAFETY: every pointer remains owned by the suspended coroutine, or refers
++// to process-global state. Only the host loop driving that coroutine uses it.
++unsafe impl Send for SuspendedFutex {}
++
+ /// A fused, `()`-returning future pinned on a suspended coroutine's stack.
+ ///
+ /// The pointer stays valid until the coroutine is resumed: the frame holding
+@@ -90,6 +158,7 @@ pub type SleepHook = fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send + Sy
+ 
+ static ENABLED: AtomicBool = AtomicBool::new(false);
+ static SLEEP_HOOK: OnceLock<SleepHook> = OnceLock::new();
++static FUTEX_HOOKS: OnceLock<HostFutexHooks> = OnceLock::new();
+ 
+ /// Enables suspension process-wide: host imports run on the coroutine stack
+ /// and blocking waits suspend the coroutine. `sleep` supplies timers for the
+@@ -104,6 +173,78 @@ pub fn enabled() -> bool {
+     ENABLED.load(Ordering::Relaxed)
+ }
+ 
++/// Installs direct host-futex operations. Only the first installation takes
++/// effect, and no direct wait is attempted until suspension is enabled too.
++pub fn set_host_futex_hooks(hooks: HostFutexHooks) {
++    let _ = FUTEX_HOOKS.set(hooks);
++}
++
++/// Wakes direct host-futex waiters on `address`, if hooks are installed.
++///
++/// This is deliberately also callable when `supported` is false: a host can
++/// use a widely available single-futex wake while a vector wait is absent.
++pub fn wake_host_futex(address: *const u32, count: u32) -> Option<u32> {
++    FUTEX_HOOKS.get().map(|hooks| (hooks.wake)(address, count))
++}
++
++/// Whether the current coroutine can directly wait on this guest word.
++pub fn can_suspend_on_futex(address: *const u32) -> bool {
++    enabled()
++        && yielder_get().is_some()
++        && FUTEX_HOOKS.get().is_some_and(|hooks| (hooks.supported)())
++        && crate::memory::stable_futex_address(address)
++}
++
++/// Suspends this coroutine in a direct host-futex wait when it is safe and
++/// supported. Returns `None` without yielding when the caller should use its
++/// existing wait implementation.
++///
++/// `interrupt` must remain alive and aligned until this call returns. Its
++/// value must have been captured before the caller's final check for pending
++/// signals or termination, preventing a notification in between from being
++/// lost.
++///
++/// # Safety
++///
++/// `address` must point to a live, aligned `u32` in the guest linear memory,
++/// and `interrupt` must point to a live, aligned `AtomicU32`. Neither may be
++/// freed while the coroutine is suspended.
++pub unsafe fn try_suspend_on_futex(
++    address: *const u32,
++    expected: u32,
++    interrupt: *const AtomicU32,
++    interrupt_expected: u32,
++    deadline: Option<Instant>,
++) -> Option<HostFutexResult> {
++    if !can_suspend_on_futex(address) {
++        return None;
++    }
++    FUTEX_HOOKS.get()?;
++    let yielder = yielder_get()?;
++    let address = NonNull::new(address.cast_mut())?;
++    let interrupt = NonNull::new(interrupt.cast_mut())?;
++    let result = AtomicU8::new(FUTEX_PENDING);
++    let wait = SuspendedFutex {
++        address,
++        expected,
++        interrupt,
++        interrupt_expected,
++        deadline,
++        result: NonNull::from(&result),
++    };
++    // SAFETY: the yielder belongs to the currently running coroutine. The
++    // local result and caller-owned words remain live on its suspended stack.
++    unsafe { yielder.as_ref().suspend(WasmYield::Futex(wait)) };
++    yielder_set(Some(yielder));
++    match result.load(Ordering::Acquire) {
++        value if value == HostFutexResult::Woken as u8 => Some(HostFutexResult::Woken),
++        value if value == HostFutexResult::TimedOut as u8 => Some(HostFutexResult::TimedOut),
++        value if value == HostFutexResult::Interrupted as u8 => Some(HostFutexResult::Interrupted),
++        value if value == HostFutexResult::Unavailable as u8 => Some(HostFutexResult::Unavailable),
++        value => panic!("host resumed a futex wait with invalid result {value}"),
++    }
++}
++
+ /// Runs a host import: on the coroutine stack when suspension is enabled, so
+ /// that a wait inside it can suspend the coroutine; on the OS thread's stack
+ /// (stock behaviour, `on_host_stack`) otherwise.
+@@ -140,6 +281,10 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+ /// Closed: no coroutine that has already started may be resumed or polled.
+ static GATE_CLOSED: AtomicBool = AtomicBool::new(false);
+ 
++/// Changed and woken whenever the freeze gate closes, interrupting direct
++/// futex waits without leaving their host loops active.
++static GATE_EPOCH: AtomicU32 = AtomicU32::new(0);
++
+ /// Registers the caller as active unless the gate is closed and `started`.
+ ///
+ /// With sequentially consistent ordering either this thread sees the closed
+@@ -192,6 +337,69 @@ fn wait_ready(fut: BlockedFuture, gate: Option<&mut dyn TopLevelCoro>) {
+     }
+ }
+ 
++/// Waits on a direct host futex without remaining active while blocked. A
++/// gated top-level coroutine retires instead of completing the wait when a
++/// freeze starts.
++fn wait_futex(wait: SuspendedFutex, gate: Option<&mut dyn TopLevelCoro>) {
++    if wait.result().is_some() {
++        return;
++    }
++    loop {
++        if !try_enter(gate.is_some()) {
++            retire(gate.expect("only gated loops are refused"));
++        }
++        let gate_expected = GATE_EPOCH.load(Ordering::SeqCst);
++        if gate.is_some() && GATE_CLOSED.load(Ordering::SeqCst) {
++            leave();
++            retire(gate.expect("a closed gate only retires a gated loop"));
++        }
++        let hooks = FUTEX_HOOKS
++            .get()
++            .expect("a futex wait was yielded without host hooks");
++        let request = HostFutexWait {
++            address: wait.address.as_ptr(),
++            expected: wait.expected,
++            interrupt: wait.interrupt.as_ptr().cast(),
++            interrupt_expected: wait.interrupt_expected,
++            gate: (&GATE_EPOCH as *const AtomicU32).cast(),
++            gate_expected,
++            deadline: wait.deadline,
++        };
++        // The atomic vector wait itself must not count as active: the gate
++        // generation makes closing the gate race-free while it is asleep.
++        leave();
++        let result = (hooks.wait)(request);
++        if gate.is_some() && GATE_CLOSED.load(Ordering::SeqCst) {
++            retire(gate.expect("a closed gate only retires a gated loop"));
++        }
++        wait.complete(result);
++        return;
++    }
++}
++
++impl SuspendedFutex {
++    fn result(self) -> Option<HostFutexResult> {
++        match unsafe { self.result.as_ref() }.load(Ordering::Acquire) {
++            FUTEX_PENDING => None,
++            value if value == HostFutexResult::Woken as u8 => Some(HostFutexResult::Woken),
++            value if value == HostFutexResult::TimedOut as u8 => Some(HostFutexResult::TimedOut),
++            value if value == HostFutexResult::Interrupted as u8 => {
++                Some(HostFutexResult::Interrupted)
++            }
++            value if value == HostFutexResult::Unavailable as u8 => {
++                Some(HostFutexResult::Unavailable)
++            }
++            value => panic!("invalid stored futex result {value}"),
++        }
++    }
++
++    fn complete(self, result: HostFutexResult) {
++        // SAFETY: the result belongs to the suspended coroutine and this host
++        // loop is its only driver.
++        unsafe { self.result.as_ref() }.store(result as u8, Ordering::Release);
++    }
++}
++
+ /// Suspends the calling coroutine until the host loop has polled `fut` to
+ /// completion, possibly on another OS thread. Returns `false`, without
+ /// polling, when suspension is disabled or the caller is not on a coroutine.
+@@ -247,6 +455,13 @@ struct Fused<'a, F: Future> {
+     done: bool,
+ }
+ 
++/// The operation a coroutine is suspended in.
++#[derive(Clone, Copy, Debug)]
++enum PendingWait {
++    Future(BlockedFuture),
++    Futex(SuspendedFutex),
++}
++
+ impl<F: Future> Future for Fused<'_, F> {
+     type Output = ();
+ 
+@@ -308,7 +523,7 @@ struct GuestCoro<T> {
+     /// one crashes the process as it would anywhere else.
+     with_trap_context: bool,
+     /// The wait the coroutine is suspended in, if any.
+-    pending: Option<BlockedFuture>,
++    pending: Option<PendingWait>,
+     /// The OS thread currently driving a registered coroutine, for unparking.
+     thread: Mutex<Option<Thread>>,
+     /// Per-thread state captured by the last driving thread when it retired.
+@@ -332,8 +547,14 @@ impl<T: 'static> GuestCoro<T> {
+         } else {
+             self.coro.resume(())
+         };
+-        if let CoroutineResult::Yield(WasmYield::Blocked(fut)) = &result {
+-            self.pending = Some(*fut);
++        match &result {
++            CoroutineResult::Yield(WasmYield::Blocked(fut)) => {
++                self.pending = Some(PendingWait::Future(*fut));
++            }
++            CoroutineResult::Yield(WasmYield::Futex(wait)) => {
++                self.pending = Some(PendingWait::Futex(*wait));
++            }
++            _ => {}
+         }
+         result
+     }
+@@ -394,6 +615,15 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+                 }
+                 None => wait_ready(fut, None),
+             },
++            CoroutineResult::Yield(WasmYield::Futex(wait)) => match outer {
++                Some(outer) => {
++                    // SAFETY: as for the future wait above, this propagates the
++                    // inner coroutine's suspension to its live outer owner.
++                    unsafe { outer.as_ref().suspend(WasmYield::Futex(wait)) };
++                    yielder_set(Some(outer));
++                }
++                None => wait_futex(wait, None),
++            },
+             CoroutineResult::Return(result) => break result,
+         }
+     };
+@@ -434,7 +664,7 @@ pub fn set_thread_state_hooks(hooks: ThreadStateHooks) {
+ }
+ 
+ enum Step {
+-    Blocked(BlockedFuture),
++    Blocked(PendingWait),
+     Done,
+ }
+ 
+@@ -442,7 +672,7 @@ enum Step {
+ trait TopLevelCoro: Send {
+     fn id(&self) -> u64;
+     fn started(&self) -> bool;
+-    fn pending(&self) -> Option<BlockedFuture>;
++    fn pending(&self) -> Option<PendingWait>;
+     fn step(&mut self) -> Step;
+     fn set_thread(&self, thread: Thread);
+     fn unpark(&self);
+@@ -459,13 +689,18 @@ impl<T: 'static> TopLevelCoro for GuestCoro<T> {
+         self.coro.started()
+     }
+ 
+-    fn pending(&self) -> Option<BlockedFuture> {
++    fn pending(&self) -> Option<PendingWait> {
+         self.pending
+     }
+ 
+     fn step(&mut self) -> Step {
+         match self.resume_here() {
+-            CoroutineResult::Yield(WasmYield::Blocked(fut)) => Step::Blocked(fut),
++            CoroutineResult::Yield(WasmYield::Blocked(fut)) => {
++                Step::Blocked(PendingWait::Future(fut))
++            }
++            CoroutineResult::Yield(WasmYield::Futex(wait)) => {
++                Step::Blocked(PendingWait::Futex(wait))
++            }
+             CoroutineResult::Yield(WasmYield::Unwind(_)) => {
+                 // SAFETY: as in `run_wasm_call`: `unwind_with` guarantees only
+                 // Wasm frames on the stack.
+@@ -565,7 +800,7 @@ pub fn run_guest_thread<F: FnOnce() + Send + 'static>(stack_size: usize, f: F) {
+ }
+ 
+ /// Drives a registered coroutine to completion on the calling thread.
+-fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<BlockedFuture>) {
++fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<PendingWait>) {
+     HOST_LOOPS.fetch_add(1, Ordering::SeqCst);
+     // SAFETY: the registry owns the box behind `ptr` and only this loop drives
+     // it; the freezer touches it through `&self` methods only while no loop
+@@ -574,8 +809,11 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<BlockedFuture>)
+     coro.set_thread(std::thread::current());
+     CURRENT_COROUTINE.with(|current| current.set(coro.id()));
+     loop {
+-        if let Some(fut) = pending.take() {
+-            wait_ready(fut, Some(coro));
++        if let Some(wait) = pending.take() {
++            match wait {
++                PendingWait::Future(fut) => wait_ready(fut, Some(coro)),
++                PendingWait::Futex(wait) => wait_futex(wait, Some(coro)),
++            }
+         }
+         if !try_enter(coro.started()) {
+             retire(coro);
+@@ -629,6 +867,8 @@ pub fn exit_current_thread() -> ! {
+ /// thread spawn in flight completes and the spawner drains to its own wait.
+ pub fn close_gate() {
+     GATE_CLOSED.store(true, Ordering::SeqCst);
++    GATE_EPOCH.fetch_add(1, Ordering::SeqCst);
++    let _ = wake_host_futex((&GATE_EPOCH as *const AtomicU32).cast(), u32::MAX);
+     log!(debug, "gate closed");
+ }
+ 
+diff --git a/lib/wasix/Cargo.toml b/lib/wasix/Cargo.toml
+index 33725f6..674456d 100644
+--- a/lib/wasix/Cargo.toml
++++ b/lib/wasix/Cargo.toml
+@@ -162,6 +162,7 @@ windows-sys = { workspace = true, features = [
+ [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ terminal_size.workspace = true
+ zstd.workspace = true
++wasmer-vm = { path = "../vm", version = "=7.3.0", optional = true }
+ 
+ [dev-dependencies]
+ wasmer = { path = "../api", version = "=7.3.0", default-features = false, features = [
+@@ -215,7 +216,7 @@ default = ["sys-default"]
+ time = ["tokio/time"]
+ ctrlc = ["tokio/signal"]
+ # the minimal sys implementation
+-sys-minimal = ["wasmer/sys", "sys-thread", "tokio/fs"]
++sys-minimal = ["wasmer/sys", "sys-thread", "tokio/fs", "host-futex"]
+ sys = [
+   "webc/mmap",
+   "time",
+@@ -234,6 +235,7 @@ sys = [
+   "wasmer/sys",
+   # We must ensure at least one compiler backend (or `headless`) is enabled for `wasmer/sys`.
+   "wasmer/headless",
++  "host-futex",
+ ]
+ sys-default = ["sys"]
+ sys-poll = []
+@@ -265,6 +267,9 @@ js-default = ["js"]
+ test-js = ["js", "wasmer/wat"]
+ 
+ host-vnet = ["virtual-net/host-net"]
++# Direct, interruptible kernel waits through hooks an embedder installs in
++# wasmer-vm; every native configuration has it.
++host-futex = ["dep:wasmer-vm"]
+ host-threads = []
+ host-reqwest = ["reqwest"]
+ host-fs = ["virtual-fs/host-fs"]
+diff --git a/lib/wasix/src/os/task/thread.rs b/lib/wasix/src/os/task/thread.rs
+index 6180c63..8c0175a 100644
+--- a/lib/wasix/src/os/task/thread.rs
++++ b/lib/wasix/src/os/task/thread.rs
+@@ -10,7 +10,7 @@ use crate::{
+ };
+ use bytes::{Bytes, BytesMut};
+ use serde::{Deserialize, Serialize};
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ use std::{
+     collections::HashMap,
+     ops::{Deref, DerefMut},
+@@ -239,6 +239,8 @@ struct WasiThreadState {
+     pid: WasiProcessId,
+     id: WasiThreadId,
+     signals: Mutex<(Vec<Signal>, Vec<Waker>)>,
++    /// Changed whenever a signal or termination must interrupt a host futex.
++    wait_interrupt: AtomicU32,
+     stack: Mutex<ThreadStack>,
+     status: Arc<OwnedTaskStatus>,
+     #[cfg(feature = "journal")]
+@@ -269,6 +271,7 @@ impl WasiThread {
+                 id,
+                 status,
+                 signals: Mutex::new((Vec::new(), Vec::new())),
++                wait_interrupt: AtomicU32::new(0),
+                 stack: Mutex::new(ThreadStack::default()),
+                 #[cfg(feature = "journal")]
+                 check_pointing: AtomicBool::new(false),
+@@ -332,6 +335,7 @@ impl WasiThread {
+     /// joined on it to wake up)
+     pub fn set_status_finished(&self, res: Result<ExitCode, WasiRuntimeError>) {
+         self.state.status.set_finished(res.map_err(Arc::new));
++        self.interrupt_waits();
+     }
+ 
+     /// Waits until the thread is finished or the timeout is reached
+@@ -354,6 +358,24 @@ impl WasiThread {
+             guard.0.push(signal);
+         }
+         guard.1.drain(..).for_each(|w| w.wake());
++        drop(guard);
++        self.interrupt_waits();
++    }
++
++    /// The interrupt word and its current generation. A futex waiter captures
++    /// this before its final pending-operation check.
++    pub(crate) fn wait_interrupt(&self) -> (*const AtomicU32, u32) {
++        let word = &self.state.wait_interrupt;
++        (word, word.load(Ordering::SeqCst))
++    }
++
++    fn interrupt_waits(&self) {
++        self.state.wait_interrupt.fetch_add(1, Ordering::SeqCst);
++        #[cfg(feature = "host-futex")]
++        let _ = wasmer_vm::wake_host_futex(
++            (&self.state.wait_interrupt as *const AtomicU32).cast(),
++            u32::MAX,
++        );
+     }
+ 
+     /// Returns all the signals that are waiting to be processed
+diff --git a/lib/wasix/src/syscalls/ictrobot_shm.rs b/lib/wasix/src/syscalls/ictrobot_shm.rs
+index baca648..0cbf189 100644
+--- a/lib/wasix/src/syscalls/ictrobot_shm.rs
++++ b/lib/wasix/src/syscalls/ictrobot_shm.rs
+@@ -16,6 +16,12 @@ impl FutexOwner {
+             Self::Shared(object) => f(&mut object.futexs.lock().unwrap()),
+         }
+     }
++
++    /// Direct host futexes are process-private. Shared-file futexes retain
++    /// the logical owner/waker implementation so they work across mappings.
++    pub(crate) fn supports_host_futex(&self) -> bool {
++        matches!(self, Self::Process(_))
++    }
+ }
+ 
+ pub(crate) fn futex_owner(env: &WasiEnv, address: u64) -> (FutexOwner, u64) {
+diff --git a/lib/wasix/src/syscalls/wasix/futex_wait.rs b/lib/wasix/src/syscalls/wasix/futex_wait.rs
+index b60a2e5..2baacaf 100644
+--- a/lib/wasix/src/syscalls/wasix/futex_wait.rs
++++ b/lib/wasix/src/syscalls/wasix/futex_wait.rs
+@@ -77,9 +77,13 @@ pub fn futex_wait<M: MemorySize + 'static>(
+     timeout: WasmPtr<OptionTimestamp, M>,
+     ret_woken: WasmPtr<Bool, M>,
+ ) -> Result<Errno, WasiError> {
++    // Capture before the final pending-operation check. A signal that was
++    // already queued is processed by that check; one arriving afterwards
++    // changes this generation and interrupts the atomic host wait.
++    let wait_interrupt = ctx.data().thread.wait_interrupt();
+     WasiEnv::do_pending_operations(&mut ctx)?;
+ 
+-    futex_wait_internal(ctx, futex_ptr, expected, timeout, ret_woken)
++    futex_wait_internal(ctx, futex_ptr, expected, timeout, ret_woken, wait_interrupt)
+ }
+ 
+ pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
+@@ -88,6 +92,7 @@ pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
+     expected: u32,
+     timeout: WasmPtr<OptionTimestamp, M>,
+     ret_woken: WasmPtr<Bool, M>,
++    wait_interrupt: (*const AtomicU32, u32),
+ ) -> Result<Errno, WasiError> {
+     ctx = wasi_try_ok!(maybe_backoff::<M>(ctx)?);
+     ctx = wasi_try_ok!(maybe_snapshot::<M>(ctx)?);
+@@ -113,11 +118,60 @@ pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
+         _ => None,
+     };
+     Span::current().record("timeout", format!("{timeout:?}"));
++    let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+ 
+     let pointer: u64 = futex_ptr.offset().into();
+     let (owner, futex_idx) = futex_owner(env, pointer);
+     Span::current().record("futex_idx", futex_idx);
+ 
++    // A stable, process-local linear-memory word can be handed directly to
++    // ServiceCache's host wait. The kernel checks the value and enqueues the
++    // waiter atomically, so this path needs no logical waker registration.
++    #[cfg(feature = "host-futex")]
++    if owner.supports_host_futex()
++        && (timeout.is_none() || deadline.is_some())
++        && let Ok(pointer) = usize::try_from(pointer)
++    {
++        let memory = unsafe { env.memory_view(&ctx) };
++        let address = unsafe { memory.data_ptr().add(pointer) }.cast::<u32>();
++        if wasmer_vm::can_suspend_on_futex(address) {
++            let val = wasi_try_mem_ok!(futex_ptr.read(&memory));
++            if val != expected {
++                wasi_try_mem_ok!(ret_woken.write(&memory, Bool::True));
++                return Ok(Errno::Success);
++            }
++            wasi_try_mem_ok!(ret_woken.write(&memory, Bool::False));
++            let result = unsafe {
++                wasmer_vm::try_suspend_on_futex(
++                    address,
++                    expected,
++                    wait_interrupt.0,
++                    wait_interrupt.1,
++                    deadline,
++                )
++            };
++            match result {
++                Some(wasmer_vm::HostFutexResult::Woken) => {
++                    let env = ctx.data();
++                    let memory = unsafe { env.memory_view(&ctx) };
++                    wasi_try_mem_ok!(ret_woken.write(&memory, Bool::True));
++                    return Ok(Errno::Success);
++                }
++                Some(wasmer_vm::HostFutexResult::TimedOut) => {
++                    let env = ctx.data();
++                    let memory = unsafe { env.memory_view(&ctx) };
++                    wasi_try_mem_ok!(ret_woken.write(&memory, Bool::False));
++                    return Ok(Errno::Success);
++                }
++                // Preserve the full Asyncify signal/termination semantics,
++                // and a safe runtime fallback if host support disappears.
++                Some(wasmer_vm::HostFutexResult::Interrupted)
++                | Some(wasmer_vm::HostFutexResult::Unavailable)
++                | None => {}
++            }
++        }
++    }
++
+     // We generate a new poller which also registers in the
+     // shared state futex lookup. When this object is dropped
+     // it will remove itself from the lookup. It can also be
+@@ -133,7 +187,10 @@ pub(super) fn futex_wait_internal<M: MemorySize + 'static>(
+         });
+ 
+         // Create the timeout if one exists
+-        let timeout = timeout.map(|timeout| env.tasks().sleep_now(timeout));
++        let remaining = deadline
++            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
++            .or(timeout);
++        let timeout = remaining.map(|timeout| env.tasks().sleep_now(timeout));
+ 
+         Span::current().record("poller_idx", poller_idx);
+         FutexPoller {
+diff --git a/lib/wasix/src/syscalls/wasix/futex_wake.rs b/lib/wasix/src/syscalls/wasix/futex_wake.rs
+index 2c150d1..fb61849 100644
+--- a/lib/wasix/src/syscalls/wasix/futex_wake.rs
++++ b/lib/wasix/src/syscalls/wasix/futex_wake.rs
+@@ -22,25 +22,42 @@ pub fn futex_wake<M: MemorySize>(
+     let (owner, futex_idx) = futex_owner(env, pointer);
+     Span::current().record("futex_idx", futex_idx);
+ 
+-    let mut woken = false;
+-    let woken = owner.with_state(|guard| {
+-        if let Some(futex) = guard.futexes.get_mut(&futex_idx) {
+-            let first = futex.wakers.keys().copied().next();
+-            if let Some(id) = first
+-                && let Some(Some(w)) = futex.wakers.remove(&id)
+-            {
+-                w.wake();
+-            }
+-            if futex.wakers.is_empty() {
+-                guard.futexes.remove(&futex_idx);
++    #[cfg(feature = "host-futex")]
++    let native_woken = if owner.supports_host_futex() && pointer % 4 == 0 {
++        usize::try_from(pointer)
++            .ok()
++            .map(|pointer| unsafe { memory.data_ptr().add(pointer) }.cast::<u32>())
++            .and_then(|address| wasmer_vm::wake_host_futex(address, 1))
++            .unwrap_or(0)
++    } else {
++        0
++    };
++    #[cfg(not(feature = "host-futex"))]
++    let native_woken = 0;
++
++    // Do not wake a logical fallback waiter as well when the one requested
++    // wake was already consumed by a direct kernel waiter.
++    if native_woken == 0 {
++        owner.with_state(|guard| {
++            if let Some(futex) = guard.futexes.get_mut(&futex_idx) {
++                let first = futex.wakers.keys().copied().next();
++                if let Some(id) = first
++                    && let Some(Some(w)) = futex.wakers.remove(&id)
++                {
++                    w.wake();
++                }
++                if futex.wakers.is_empty() {
++                    guard.futexes.remove(&futex_idx);
++                }
++                tracing::trace!("wake(hit) on {futex_idx}");
++            } else {
++                tracing::trace!("wake(miss) on {futex_idx}");
+             }
+-            tracing::trace!("wake(hit) on {futex_idx}");
+-            true
+-        } else {
+-            tracing::trace!("wake(miss) on {futex_idx}");
+-            true
+-        }
+-    });
++        });
++    }
++    // Preserve WASIX's established return value: the operation reports that
++    // the wake was accepted, including when no waiter was present.
++    let woken = true;
+     Span::current().record("woken", woken);
+ 
+     let woken = match woken {
+diff --git a/lib/wasix/src/syscalls/wasix/futex_wake_all.rs b/lib/wasix/src/syscalls/wasix/futex_wake_all.rs
+index c074546..7f3fd72 100644
+--- a/lib/wasix/src/syscalls/wasix/futex_wake_all.rs
++++ b/lib/wasix/src/syscalls/wasix/futex_wake_all.rs
+@@ -20,8 +20,16 @@ pub fn futex_wake_all<M: MemorySize>(
+     let (owner, futex_idx) = futex_owner(env, pointer);
+     //Span::current().record("futex_idx", pointer);
+ 
+-    let mut woken = false;
+-    let woken = owner.with_state(|guard| {
++    #[cfg(feature = "host-futex")]
++    if owner.supports_host_futex()
++        && pointer % 4 == 0
++        && let Ok(pointer) = usize::try_from(pointer)
++    {
++        let address = unsafe { memory.data_ptr().add(pointer) }.cast::<u32>();
++        let _ = wasmer_vm::wake_host_futex(address, u32::MAX);
++    }
++
++    owner.with_state(|guard| {
+         if let Some(futex) = guard.futexes.remove(&futex_idx) {
+             for waker in futex.wakers {
+                 if let Some(waker) = waker.1 {
+@@ -29,18 +37,12 @@ pub fn futex_wake_all<M: MemorySize>(
+                 }
+             }
+             tracing::trace!("wake_all (hit) on {futex_idx}");
+-            true
+         } else {
+             tracing::trace!("wake_all (miss) on {futex_idx}");
+-            true
+         }
+     });
+     //Span::current().record("woken", woken);
+ 
+-    let woken = match woken {
+-        false => Bool::False,
+-        true => Bool::True,
+-    };
+-    wasi_try_mem_ok!(ret_woken.write(&memory, woken));
++    wasi_try_mem_ok!(ret_woken.write(&memory, Bool::True));
+     Ok(Errno::Success)
+ }

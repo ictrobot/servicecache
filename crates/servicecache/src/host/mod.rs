@@ -8,6 +8,7 @@
 //! only serves timers and the few async tasks wasmer-wasix spawns.
 
 mod freeze;
+mod futex;
 pub mod guest;
 pub mod net;
 mod probe;
@@ -99,6 +100,7 @@ fn enable_suspension() {
     wasmer_vm::set_stack_size(WASM_STACK_SIZE);
     virtual_mio::set_suspend_hook(wasmer_vm::try_suspend_on_block);
     wasmer::install_suspend_thread_state_hooks();
+    futex::install();
     wasmer_vm::suspend::enable(HostTaskManager::sleep_hook);
 }
 
