@@ -182,15 +182,16 @@ impl VirtualTaskManager for HostTaskManager {
     }
 }
 
-/// A sleep whose timer task lives on the runtime current at each poll: when
-/// the fork generation changes, the old task (which belongs to the parent's
+/// A sleep registered with the runtime current at each poll. When the fork
+/// generation changes, the old timer (which belongs to the parent's
 /// abandoned runtime) is forgotten and a new one is armed for the remaining
-/// time.
+/// time. Polling the timer directly avoids making a Tokio task and scheduling
+/// it twice for every guest timeout.
 struct ForkAwareSleep {
     tasks: HostTaskManager,
     deadline: Instant,
     generation: u64,
-    timer: Option<tokio::task::JoinHandle<()>>,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl Future for ForkAwareSleep {
@@ -205,16 +206,66 @@ impl Future for ForkAwareSleep {
             }
             self.generation = generation;
             let deadline = tokio::time::Instant::from_std(self.deadline);
-            self.timer = Some(
-                self.tasks
-                    .handle()
-                    .spawn(async move { tokio::time::sleep_until(deadline).await }),
-            );
+            // `Sleep::new_timeout` finds its timer driver through the current
+            // runtime context. Polling after construction does not need the
+            // guest thread to remain entered on the runtime.
+            let timer = {
+                let handle = self.tasks.handle();
+                let _entered = handle.enter();
+                Box::pin(tokio::time::sleep_until(deadline))
+            };
+            self.timer = Some(timer);
         }
         let timer = self.timer.as_mut().expect("armed above");
-        match Pin::new(timer).poll(cx) {
-            Poll::Ready(_) => Poll::Ready(()),
-            Poll::Pending => Poll::Pending,
+        timer.as_mut().poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Arc,
+        task::{Wake, Waker},
+    };
+
+    use super::*;
+
+    struct Unpark(std::thread::Thread);
+
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    /// A guest thread polls its sleep from outside the Tokio runtime, so the
+    /// timer must be constructable there (it finds its driver through the
+    /// runtime the sleep enters briefly) and must wake that thread's waker
+    /// when it fires, rather than a task of the runtime's own. Polls from a
+    /// plain thread with a waker that unparks it; a lost wake fails through
+    /// the deadline rather than hanging.
+    #[test]
+    fn a_timer_is_polled_outside_the_tokio_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let tasks = HostTaskManager::new(runtime.handle().clone());
+        let mut sleep = tasks.sleep_now(Duration::from_millis(5));
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            if sleep.as_mut().poll(&mut context).is_ready() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timer did not wake its guest thread"
+            );
+            std::thread::park_timeout(Duration::from_millis(20));
         }
     }
 }
