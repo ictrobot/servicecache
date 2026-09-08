@@ -6,3 +6,4 @@
 0007-build-batch-only-mysql-client.patch
 0008-cmake-define-have-unistd-h-for-bundled-zlib.patch
 0009-innodb-use-fsync-instead-of-fdatasync-under-wasmer.patch
+0010-mysys-derive-the-fopen-mode-from-the-access-bits.patch

@@ -109,5 +109,9 @@ mkdir -p "$share_dir/english"
 cp "$SC_BUILD/share/english/errmsg.sys" "$share_dir/english/errmsg.sys"
 cp -a "$SC_SRC/share/charsets" "$share_dir/charsets"
 
+# Run by the prepare step's --init-file, after the bootstrap SQL: an instance
+# is disposable, so its redo log is never read back.
+printf 'ALTER INSTANCE DISABLE INNODB REDO_LOG;\n' > "$share_dir/servicecache-init.sql"
+
 sc_assemble "$SC_BUILD/mysqld.wasm" "$SC_BUILD/mysql.wasm" "$share_dir"
 sc_write_build_info

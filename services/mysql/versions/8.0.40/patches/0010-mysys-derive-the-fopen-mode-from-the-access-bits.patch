@@ -1,0 +1,51 @@
+Subject: [PATCH] mysys: derive the fopen mode from the access bits
+
+my_fopen turns open()-style flags into an fopen() mode string, and
+make_ftype chose the read-only mode by falling through two bit tests
+written for Linux, where O_RDONLY is 0. On WASIX O_RDONLY is a flag of
+its own and O_RDWR is O_RDONLY | O_WRONLY, so a plain O_RDONLY passed
+the O_RDWR test and every my_fopen(..., O_RDONLY) opened its file
+read-write. That succeeds silently on a writable filesystem and fails
+with EPERM on a read-only one, which is how mysqld reports its
+--init-file as not found when the file lives on a read-only mount.
+
+Mask the access mode out of the flags and test it as a value: read
+and write first, then write, then read. Every input maps to the mode
+it did on Linux, and the assertion on invalid combinations now states
+what it meant, that the mode is one of the three.
+
+diff --git a/mysys/my_fopen.cc b/mysys/my_fopen.cc
+--- a/mysys/my_fopen.cc
++++ b/mysys/my_fopen.cc
+@@ -71,13 +71,16 @@
+ */
+ 
+ void make_ftype(char *to, int flag) {
++  /* The access mode is a value, not a set of bits: O_RDONLY is 0 on Linux
++     but not everywhere, and O_RDWR may be O_RDONLY | O_WRONLY. */
++  const int access_mode = flag & (O_RDONLY | O_WRONLY | O_RDWR);
++
+   /* check some possible invalid combinations */
+   assert((flag & (O_TRUNC | O_APPEND)) != (O_TRUNC | O_APPEND));
+-  assert((flag & (O_WRONLY | O_RDWR)) != (O_WRONLY | O_RDWR));
++  assert(access_mode == O_RDONLY || access_mode == O_WRONLY ||
++         access_mode == O_RDWR);
+ 
+-  if ((flag & (O_RDONLY | O_WRONLY)) == O_WRONLY)
+-    *to++ = (flag & O_APPEND) ? 'a' : 'w';
+-  else if (flag & O_RDWR) {
++  if (access_mode == O_RDWR) {
+     /* Add '+' after these */
+     if (flag & (O_TRUNC | O_CREAT))
+       *to++ = 'w';
+@@ -86,7 +89,9 @@
+     else
+       *to++ = 'r';
+     *to++ = '+';
+-  } else
++  } else if (access_mode & O_WRONLY)
++    *to++ = (flag & O_APPEND) ? 'a' : 'w';
++  else
+     *to++ = 'r';
+ 
+   if (flag & MY_FOPEN_BINARY) *to++ = 'b';
