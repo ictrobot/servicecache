@@ -4,3 +4,4 @@
 0004-adapt-innodb-to-wasix-filesystems.patch
 0005-build-batch-only-mariadb-client.patch
 0006-build-the-client-library-against-the-bundled-wolfssl.patch
+0007-vio-generate-the-automatic-certificate-s-key-on-p-256.patch
