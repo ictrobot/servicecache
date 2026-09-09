@@ -249,7 +249,9 @@ fn rebuild(host: &mut Host, listener: TcpListener, forked_at: Instant) -> Result
     host.tokio = std::mem::ManuallyDrop::new(runtime);
     let tokio_built = started.elapsed();
 
+    let endpoint = listener.local_addr()?;
     host.networking.replace_listener(listener)?;
+    host.set_title(super::title::State::Serving(endpoint));
     let listener_replaced = started.elapsed();
     host.networking
         .selector()

@@ -128,6 +128,10 @@ enum Command {
         /// The descriptor of the control channel.
         #[arg(long, value_name = "FD")]
         control_fd: i32,
+        /// Padding the host overwrites with its process title; the value
+        /// is never read.
+        #[arg(long, value_name = "PADDING", hide = true)]
+        internal_name_buffer: Option<String>,
     },
 }
 
@@ -241,6 +245,7 @@ fn run_with(
         Command::Host {
             manifest,
             control_fd,
+            internal_name_buffer: _,
         } => crate::host::run(&crate::host::HostArgs {
             manifest,
             control_fd,

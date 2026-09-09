@@ -5,6 +5,8 @@
 //! trial per built service and case, discovered at run time
 //! (`libtest-mimic`); services without an adapter get none.
 
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/service_adapter.rs"]
 mod service_adapter;
 
@@ -53,11 +55,23 @@ fn run_through_host(manifest_path: &Path) {
         assert_eq!(host.prepare().expect("prepare"), 0, "{name}: prepare");
     }
     let endpoint = host.start().expect("start");
+    let expected = format!("servicecache instance {name}@{}", manifest.service.version);
+    assert_eq!(
+        process::title(host.pid()),
+        format!("{expected} listening on {endpoint}"),
+        "{name}: the host's title after start"
+    );
     if manifest.initializer.is_some() {
         assert_eq!(
             host.initialize(&adapter.recipe()).expect("initialize"),
             0,
             "{name}: initializer"
+        );
+        let titled = process::title(host.pid());
+        assert!(
+            titled.starts_with(&format!("{expected} recipe "))
+                && titled.ends_with(&format!(" listening on {endpoint}")),
+            "{name}: the host's title after initialize: {titled:?}"
         );
     }
     adapter.check_initialized(endpoint);

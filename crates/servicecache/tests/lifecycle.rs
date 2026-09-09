@@ -13,6 +13,8 @@
 //! divergence are checked through the service's own adapter
 //! (`services/<name>/smoke/adapter`); memory sharing from `smaps_rollup`.
 
+#[path = "support/process.rs"]
+mod process;
 #[path = "support/service_adapter.rs"]
 mod service_adapter;
 
@@ -152,6 +154,13 @@ impl Subject {
             );
         }
         self.adapter.check_initialized(endpoint);
+        let titled = process::title(host.pid());
+        assert!(
+            titled.starts_with("servicecache instance ")
+                && titled.ends_with(&format!(" listening on {endpoint}")),
+            "{}: the host's title while serving: {titled:?}",
+            self.name
+        );
         host
     }
 
@@ -160,6 +169,12 @@ impl Subject {
         let mut host = self.bring_up();
         let coroutines = self.freeze(&mut host);
         assert!(coroutines >= 1, "{}: no coroutines were frozen", self.name);
+        let titled = process::title(host.pid());
+        assert!(
+            titled.starts_with("servicecache template ") && !titled.contains("listening"),
+            "{}: the host's title once frozen: {titled:?}",
+            self.name
+        );
         assert_eq!(
             thread_count(host.pid()),
             1,
@@ -202,6 +217,13 @@ impl Subject {
             thread_count(template.pid()),
             1,
             "{}: the template grew threads after a fork",
+            self.name
+        );
+        let titled = process::title(child.pid());
+        assert!(
+            titled.starts_with("servicecache instance ")
+                && titled.ends_with(&format!(" listening on {endpoint}")),
+            "{}: the clone's title: {titled:?}",
             self.name
         );
         (child, endpoint)

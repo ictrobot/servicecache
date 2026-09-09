@@ -14,6 +14,7 @@ pub mod net;
 mod probe;
 pub mod protocol;
 pub mod tasks;
+pub mod title;
 
 use std::{
     net::TcpListener,
@@ -33,6 +34,7 @@ use nix::{
     },
     unistd::Pid,
 };
+use sha2::{Digest as _, Sha256};
 use wasmer_wasix::os::task::TaskJoinHandle;
 
 use self::{
@@ -75,6 +77,9 @@ pub struct HostArgs {
 /// Returns an error when the manifest cannot be loaded or the control
 /// channel fails; a guest failure is reported over the channel instead.
 pub fn run(args: &HostArgs) -> Result<()> {
+    // From here on the process's argv is the title, not the arguments:
+    // everything the host needs from the command line is in `args`.
+    title::write("servicecache host starting");
     die_with_parent()?;
     enable_suspension();
     let manifest = Manifest::load(&args.manifest)?;
@@ -245,6 +250,9 @@ struct Host {
     probe: Option<Arc<std::sync::OnceLock<Result<(), String>>>>,
     shared_memory: Option<wasmer_wasix::SharedMemorySnapshot>,
     phase: Phase,
+    /// The SHA-256 of the recipe the guest was initialized with, for the
+    /// process title; inherited by the clones of a recipe template.
+    recipe: Option<[u8; 32]>,
     /// The zero-page scan of a frozen guest, until it is done.
     compaction: Option<freeze::Compaction>,
     /// `SIGCHLD` as a descriptor: a clone exiting wakes the control loop at
@@ -288,7 +296,7 @@ impl Host {
             manifest.service.extensions.iter().cloned(),
         )?;
 
-        Ok(Self {
+        let host = Self {
             manifest,
             tokio: std::mem::ManuallyDrop::new(tokio),
             tasks,
@@ -299,9 +307,18 @@ impl Host {
             probe: None,
             shared_memory: None,
             phase: Phase::Fresh,
+            recipe: None,
             compaction: None,
             children,
-        })
+        };
+        host.set_title(title::State::Starting);
+        Ok(host)
+    }
+
+    /// Sets the process title from what the host is doing.
+    fn set_title(&self, state: title::State) {
+        let service = &self.manifest.service;
+        title::set(&service.name, &service.version, self.recipe.as_ref(), state);
     }
 
     fn serve(mut self, mut channel: Channel) -> Result<()> {
@@ -443,6 +460,7 @@ impl Host {
     fn ready_reply(&self) -> Result<Reply> {
         let endpoint = self.networking.endpoint()?;
         tracing::info!(%endpoint, "guest ready");
+        self.set_title(title::State::Serving(endpoint));
         Ok(Reply::Ready {
             endpoint: endpoint.to_string(),
         })
@@ -645,6 +663,10 @@ impl Host {
         match self.wait_run(channel, &handle, Run::Initializer)? {
             Some(status) => {
                 tracing::info!(status, "initializer finished");
+                if status == 0 {
+                    self.recipe = Some(Sha256::digest(recipe).into());
+                    self.set_title(title::State::Serving(endpoint));
+                }
                 Ok(Some(Reply::Exited {
                     run: Run::Initializer,
                     status,
@@ -664,6 +686,7 @@ impl Host {
         }
         // Terminal from here, whatever happens.
         self.phase = Phase::Frozen;
+        self.set_title(title::State::Frozen);
         match freeze::freeze(self) {
             Ok(coroutines) => {
                 channel.send(&Reply::Frozen { coroutines }, &[], &[])?;

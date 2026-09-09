@@ -14,7 +14,10 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::host::protocol::{Channel, Frame, Reply, Request, Run};
+use crate::host::{
+    protocol::{Channel, Frame, Reply, Request, Run},
+    title,
+};
 
 /// The descriptor number the host finds its control channel on.
 const HOST_CONTROL_FD: i32 = 3;
@@ -66,6 +69,8 @@ impl HostProcess {
             .arg(HOST_CONTROL_FD.to_string())
             .arg("--cache-dir")
             .arg(cache_dir)
+            // Room for the host to write its title over these arguments.
+            .arg(title::BUFFER_ARG)
             .stdin(Stdio::null());
         if let Some(directives) = crate::logging::directives() {
             command.arg("--log").arg(directives);
