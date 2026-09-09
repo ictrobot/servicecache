@@ -666,10 +666,11 @@ impl Host {
         self.phase = Phase::Frozen;
         match freeze::freeze(self) {
             Ok(coroutines) => {
+                channel.send(&Reply::Frozen { coroutines }, &[], &[])?;
+                // After the reply, which preparing the scan would hold up.
                 // The guest never runs again in this process: its memory is
                 // quiescent, which the scan requires.
                 self.compaction = Some(freeze::Compaction::start());
-                channel.send(&Reply::Frozen { coroutines }, &[], &[])?;
                 Ok(Outcome::Continue)
             }
             Err(error) => {

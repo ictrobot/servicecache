@@ -311,10 +311,10 @@ struct ZeroPages {
 struct MemoryScan {
     base: usize,
     pages: usize,
-    /// The mapping holds huge pages: a fully resident 2 MiB block is then
-    /// released only when it is zero throughout. Read from `smaps` by the
-    /// first slice (it costs milliseconds for a large process).
-    spare_full_blocks: Option<bool>,
+    /// The mappings (`smaps`) the memory spans, as page index ranges with
+    /// whether the mapping holds huge pages: a fully resident 2 MiB block
+    /// of one that does is released only when it is zero throughout.
+    mappings: Vec<(usize, usize, bool)>,
     /// The anonymous page ranges of the memory, in order: everything but
     /// its shared file overlays. Only these ranges are scanned.
     extents: Vec<(usize, usize)>,
@@ -347,7 +347,11 @@ struct MemoryScan {
 /// huge page, such a block is dropped only when it is zero throughout, and
 /// its zero pages are counted as kept otherwise; a mapping without huge
 /// pages (`AnonHugePages` in `smaps`) has nothing to split and every zero
-/// page goes.
+/// page goes. A memory can span several mappings (its overlays split it,
+/// and only some of the rest may have been given huge pages), so `smaps`
+/// is read once, when the scan is prepared, and the answer kept for each
+/// of them; a page in no known mapping counts as possibly huge, keeping a
+/// few pages being the safe error.
 #[derive(Debug)]
 pub(super) struct Compaction {
     page: usize,
@@ -360,9 +364,11 @@ pub(super) struct Compaction {
 
 impl Compaction {
     /// Prepares the scan of every private anonymous linear memory. For a
-    /// drained, single-threaded process only: right after `freeze`.
+    /// drained, single-threaded process only: right after `freeze`. Reading
+    /// `smaps` costs milliseconds for a large guest.
     pub(super) fn start() -> Self {
         let page = page_size();
+        let mappings = mapping_huge_pages().unwrap_or_default();
         // SAFETY: the process is single-threaded and the guest is drained:
         // nothing runs guest code, grows a memory or drops a store.
         let memories = unsafe { wasmer_vm::linear_memories() };
@@ -372,6 +378,18 @@ impl Compaction {
             .map(|memory| {
                 let base = memory.base as usize;
                 let pages = memory.len.div_ceil(page);
+                let end = base + pages * page;
+                let mappings = mappings
+                    .iter()
+                    .filter(|&&(start, stop, _)| start < end && stop > base)
+                    .map(|&(start, stop, huge)| {
+                        (
+                            (start.max(base) - base) / page,
+                            (stop.min(end) - base).div_ceil(page),
+                            huge,
+                        )
+                    })
+                    .collect();
                 let mut overlays: Vec<(usize, usize)> = memory
                     .overlays
                     .iter()
@@ -393,7 +411,7 @@ impl Compaction {
                 MemoryScan {
                     base,
                     pages,
-                    spare_full_blocks: None,
+                    mappings,
                     extents,
                     next: 0,
                     pending: None,
@@ -501,10 +519,11 @@ fn scan_block(memory: &mut MemoryScan, page: usize, huge_page: usize, totals: &m
     let first = memory.next;
     let last = (block_end - base) / page;
     let count = last - first;
-    // Unknown counts as present: keeping a few pages is the safe error.
-    let spare_full_blocks = *memory
-        .spare_full_blocks
-        .get_or_insert_with(|| mapping_has_huge_pages(base).unwrap_or(true));
+    let spare_full_blocks = memory
+        .mappings
+        .iter()
+        .find(|&&(start, stop, _)| (start..stop).contains(&first))
+        .is_none_or(|&(_, _, huge)| huge);
 
     let mut resident = vec![0_u8; count];
     // SAFETY: a page-aligned subrange of a mapping of at least `len` bytes,
@@ -612,17 +631,17 @@ fn huge_page_size() -> usize {
         .unwrap_or(2 << 20)
 }
 
-/// Whether the mapping containing `addr` holds any transparent huge page,
-/// from `AnonHugePages` in `/proc/self/smaps`. `None` when that cannot be
-/// read, or the mapping is not found.
-fn mapping_has_huge_pages(addr: usize) -> Option<bool> {
+/// Every mapping of this process as `(start, end, has_huge_pages)`, from
+/// `AnonHugePages` in `/proc/self/smaps`. `None` when that cannot be read.
+fn mapping_huge_pages() -> Option<Vec<(usize, usize, bool)>> {
     let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
-    let mut inside = false;
+    let mut mappings = Vec::new();
+    let mut current = None;
     for line in smaps.lines() {
         if let Some(rest) = line.strip_prefix("AnonHugePages:") {
-            if inside {
+            if let Some((start, end)) = current.take() {
                 let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
-                return Some(kb > 0);
+                mappings.push((start, end, kb > 0));
             }
             continue;
         }
@@ -634,10 +653,10 @@ fn mapping_has_huge_pages(addr: usize) -> Option<bool> {
                 usize::from_str_radix(end, 16),
             )
         {
-            inside = (start..end).contains(&addr);
+            current = Some((start, end));
         }
     }
-    None
+    Some(mappings)
 }
 
 /// Whether the `len` bytes at `addr` are all zero.
