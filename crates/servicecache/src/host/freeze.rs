@@ -299,9 +299,10 @@ struct ZeroPages {
     zero: usize,
     /// Zero pages released with `MADV_DONTNEED`.
     released: usize,
-    /// Zero pages kept because they sit in a fully resident 2 MiB block
-    /// that is not zero throughout (it may be one huge page).
-    kept: usize,
+    /// Fully resident 2 MiB blocks kept whole because they are not zero
+    /// throughout (each may be one huge page); their pages are not counted
+    /// one by one.
+    kept_blocks: usize,
     /// `madvise` calls made, one per run of released pages.
     runs: usize,
 }
@@ -344,10 +345,10 @@ struct MemoryScan {
 /// A 2 MiB-aligned block whose pages are all resident may be one transparent
 /// huge page; dropping part of it would split it into 4 KiB pages, which is
 /// more page-table entries for a fork, not fewer. While the mapping holds any
-/// huge page, such a block is dropped only when it is zero throughout, and
-/// its zero pages are counted as kept otherwise; a mapping without huge
-/// pages (`AnonHugePages` in `smaps`) has nothing to split and every zero
-/// page goes. A memory can span several mappings (its overlays split it,
+/// huge page, such a block is read once and dropped only when it is zero
+/// throughout, and kept whole otherwise; a mapping without huge pages
+/// (`AnonHugePages` in `smaps`) has nothing to split and every zero page
+/// goes. A memory can span several mappings (its overlays split it,
 /// and only some of the rest may have been given huge pages), so `smaps`
 /// is read once, when the scan is prepared, and the answer kept for each
 /// of them; a page in no known mapping counts as possibly huge, keeping a
@@ -360,6 +361,10 @@ pub(super) struct Compaction {
     totals: ZeroPages,
     started: Instant,
     busy: Duration,
+    /// Scratch for one block, reused: `mincore`'s byte per page, and which
+    /// pages to drop. The template's heap stays as it was between slices.
+    resident: Vec<u8>,
+    drop: Vec<bool>,
 }
 
 impl Compaction {
@@ -368,6 +373,7 @@ impl Compaction {
     /// `smaps` costs milliseconds for a large guest.
     pub(super) fn start() -> Self {
         let page = page_size();
+        let huge_page = huge_page_size();
         let mappings = mapping_huge_pages().unwrap_or_default();
         // SAFETY: the process is single-threaded and the guest is drained:
         // nothing runs guest code, grows a memory or drops a store.
@@ -437,11 +443,13 @@ impl Compaction {
         );
         Self {
             page,
-            huge_page: huge_page_size(),
+            huge_page,
             memories,
             totals,
             started: Instant::now(),
             busy: Duration::ZERO,
+            resident: vec![0; huge_page / page],
+            drop: vec![false; huge_page / page],
         }
     }
 
@@ -454,7 +462,14 @@ impl Compaction {
             .iter_mut()
             .find(|memory| memory.next < memory.pages)
         {
-            scan_block(memory, self.page, self.huge_page, &mut self.totals);
+            scan_block(
+                memory,
+                self.page,
+                self.huge_page,
+                &mut self.totals,
+                &mut self.resident,
+                &mut self.drop,
+            );
             if started.elapsed() >= budget {
                 break;
             }
@@ -480,7 +495,7 @@ impl Compaction {
                 resident = totals.resident,
                 zero = totals.zero,
                 released = totals.released,
-                kept = totals.kept,
+                kept_blocks = totals.kept_blocks,
                 runs = totals.runs,
                 released_mb = (totals.released * self.page) >> 20,
                 scan = ?self.busy,
@@ -496,8 +511,16 @@ impl Compaction {
 /// extent it is in): marks its zero pages, keeps a fully resident block
 /// that is not zero throughout when the mapping may hold huge pages, and
 /// releases runs of zero pages, merging with the run left pending by the
-/// previous block. Between extents it skips to the next one.
-fn scan_block(memory: &mut MemoryScan, page: usize, huge_page: usize, totals: &mut ZeroPages) {
+/// previous block. Between extents it skips to the next one. `resident`
+/// and `drop` are scratch of at least a block's pages.
+fn scan_block(
+    memory: &mut MemoryScan,
+    page: usize,
+    huge_page: usize,
+    totals: &mut ZeroPages,
+    resident: &mut [u8],
+    drop: &mut [bool],
+) {
     let Some(&(start, extent_end)) = memory
         .extents
         .iter()
@@ -525,7 +548,8 @@ fn scan_block(memory: &mut MemoryScan, page: usize, huge_page: usize, totals: &m
         .find(|&&(start, stop, _)| (start..stop).contains(&first))
         .is_none_or(|&(_, _, huge)| huge);
 
-    let mut resident = vec![0_u8; count];
+    let resident = &mut resident[..count];
+    let drop = &mut drop[..count];
     // SAFETY: a page-aligned subrange of a mapping of at least `len` bytes,
     // and `resident` has one byte per page of it.
     let rc = unsafe {
@@ -548,24 +572,31 @@ fn scan_block(memory: &mut MemoryScan, page: usize, huge_page: usize, totals: &m
         && block_end - addr == huge_page
         && resident.iter().all(|&byte| byte & 1 != 0);
 
-    let mut drop = vec![false; count];
-    let mut zero_in_block = 0;
-    for (offset, &byte) in resident.iter().enumerate() {
-        if byte & 1 == 0 {
-            continue;
+    if full {
+        // The block goes whole or not at all: one read decides.
+        totals.resident += count;
+        // SAFETY: a resident block of the accessible range; nothing writes
+        // it (the guest is drained and this is the only thread).
+        let zero = unsafe { is_zero(addr, count * page) };
+        if zero {
+            totals.zero += count;
+        } else {
+            totals.kept_blocks += 1;
         }
-        totals.resident += 1;
-        // SAFETY: a resident page of the accessible range; nothing writes it
-        // (the guest is drained and this is the only thread).
-        if unsafe { is_zero(addr + offset * page, page) } {
-            totals.zero += 1;
-            zero_in_block += 1;
-            drop[offset] = true;
+        drop.fill(zero);
+    } else {
+        for (offset, &byte) in resident.iter().enumerate() {
+            let mut zero = false;
+            if byte & 1 != 0 {
+                totals.resident += 1;
+                // SAFETY: a resident page of the accessible range; nothing
+                // writes it (the guest is drained and this is the only
+                // thread).
+                zero = unsafe { is_zero(addr + offset * page, page) };
+                totals.zero += usize::from(zero);
+            }
+            drop[offset] = zero;
         }
-    }
-    if full && zero_in_block != count {
-        drop.fill(false);
-        totals.kept += zero_in_block;
     }
 
     for (offset, &dropped) in drop.iter().enumerate() {
