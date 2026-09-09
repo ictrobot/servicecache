@@ -239,7 +239,7 @@ fn rebuild(host: &mut Host, listener: TcpListener, forked_at: Instant) -> Result
     // none are resurrected until the end of this function.
     let shared_objects =
         unsafe { shared_memory.reshare_after_fork() }.context("resharing memory in the clone")?;
-    tracing::debug!(shared_objects, "reshared clone memory");
+    tracing::debug!(shared_objects, elapsed = ?started.elapsed(), "reshared clone memory");
 
     TOKIO_EXIT.store(false, Ordering::SeqCst);
     let runtime = build_tokio()?;

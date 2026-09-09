@@ -9,6 +9,14 @@ holding a private copy of each shared object and its mappings; a
 forked child calls reshare_after_fork to create clone-local backing
 and replay the overlays before any guest thread resumes.
 
+Each copy is sparse: it walks the source's extents with SEEK_DATA and
+SEEK_HOLE and writes only the chunks that are not all zero, so the
+snapshot and each clone's backing keep holes wherever the source held
+zeros, whether never written or written as zeros. A guest has touched
+little of a shared object it has just created, and every clone copies
+it; a hole costs nothing until written. A filesystem that cannot
+report holes gets a plain copy.
+
 Each object-side registration records the host address its overlay
 occupies, which freeze and replay remap with MAP_FIXED. The frozen
 mapping only keeps the range mapped until a child replaces it, so it
@@ -17,7 +25,7 @@ execution already clears its registrations, so a snapshot never
 replays a stale mapping over an address a later execution reuses.
 
 diff --git a/lib/wasix/src/fs/shared_memory.rs b/lib/wasix/src/fs/shared_memory.rs
-index 7dfaf8f..1154dc5 100644
+index 7dfaf8f..997ffa4 100644
 --- a/lib/wasix/src/fs/shared_memory.rs
 +++ b/lib/wasix/src/fs/shared_memory.rs
 @@ -3,11 +3,11 @@ use std::{
@@ -121,7 +129,7 @@ index 7dfaf8f..1154dc5 100644
      }
  
      fn set_len(&self, new_size: u64) -> Result<(), FsError> {
-@@ -106,15 +119,116 @@ impl SharedMemoryObject {
+@@ -106,15 +119,92 @@ impl SharedMemoryObject {
              .lock()
              .unwrap()
              .values()
@@ -166,35 +174,11 @@ index 7dfaf8f..1154dc5 100644
 +
 +    #[cfg(target_os = "linux")]
 +    fn replace_backing(&self, mappings: &[RegisteredMapping], shared: bool) -> io::Result<()> {
-+        use std::os::unix::fs::FileExt;
-+
 +        let mut file = self.file.lock().unwrap();
 +        let len = file.metadata()?.len();
 +        let replacement = create_memfd()?;
 +        replacement.set_len(len)?;
-+
-+        let mut buffer = [0_u8; 64 * 1024];
-+        let mut offset = 0_u64;
-+        while offset < len {
-+            let amount = usize::try_from((len - offset).min(buffer.len() as u64)).unwrap();
-+            let read = file.read_at(&mut buffer[..amount], offset)?;
-+            if read == 0 {
-+                return Err(io::Error::new(
-+                    io::ErrorKind::UnexpectedEof,
-+                    "shared-memory object ended while copying it",
-+                ));
-+            }
-+            let mut written = 0;
-+            while written < read {
-+                let amount =
-+                    replacement.write_at(&buffer[written..read], offset + written as u64)?;
-+                if amount == 0 {
-+                    return Err(io::ErrorKind::WriteZero.into());
-+                }
-+                written += amount;
-+            }
-+            offset += read as u64;
-+        }
++        copy_data(&file, &replacement, len)?;
 +
 +        let sharing = if shared {
 +            libc::MAP_SHARED
@@ -240,7 +224,7 @@ index 7dfaf8f..1154dc5 100644
      fn metadata(&self) -> Metadata {
          Metadata {
              ft: FileType::new_file(),
-@@ -149,9 +263,15 @@ impl SharedMemoryMapping {
+@@ -149,9 +239,15 @@ impl SharedMemoryMapping {
          mapping
      }
  
@@ -257,7 +241,7 @@ index 7dfaf8f..1154dc5 100644
              self.address,
              self.len,
              self.file_offset,
-@@ -159,6 +279,87 @@ impl SharedMemoryMapping {
+@@ -159,6 +255,179 @@ impl SharedMemoryMapping {
      }
  }
  
@@ -269,6 +253,98 @@ index 7dfaf8f..1154dc5 100644
 +    if !objects.iter().any(|found| found.ptr_eq(&object)) {
 +        objects.push(object);
 +    }
++}
++
++/// Copies the data of `from` (`len` bytes) into `to`, which is `len` bytes
++/// of holes: only the extents that hold data are read, and an extent's
++/// all-zero 64 KiB chunks are not written, so the copy is as sparse as the
++/// source's contents allow. A shared object is mostly zero in a guest that
++/// has not touched most of it, and every clone copies it. Falls back to a
++/// plain copy where the filesystem cannot report holes.
++#[cfg(target_os = "linux")]
++fn copy_data(from: &std::fs::File, to: &std::fs::File, len: u64) -> io::Result<()> {
++    use std::os::unix::fs::FileExt;
++
++    const CHUNK: usize = 64 * 1024;
++    let mut buffer = vec![0_u8; CHUNK];
++    let mut offset = 0_u64;
++    while offset < len {
++        // The next data extent from `offset`: SEEK_DATA finds its start (or
++        // ENXIO past the last one), SEEK_HOLE its end.
++        let data = unsafe { libc::lseek(from.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
++        if data < 0 {
++            let error = io::Error::last_os_error();
++            if error.raw_os_error() == Some(libc::ENXIO) {
++                break;
++            }
++            return copy_plain(from, to, offset, len, &mut buffer);
++        }
++        let data = data as u64;
++        let hole = unsafe { libc::lseek(from.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
++        if hole < 0 || hole as u64 <= data {
++            // No hole reported, or a filesystem that does not see extents:
++            // the rest is data.
++            return copy_plain(from, to, data, len, &mut buffer);
++        }
++        let hole = (hole as u64).min(len);
++        let mut at = data;
++        while at < hole {
++            let amount = usize::try_from((hole - at).min(CHUNK as u64)).unwrap();
++            let read = from.read_at(&mut buffer[..amount], at)?;
++            if read == 0 {
++                return Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "shared-memory object ended while copying it",
++                ));
++            }
++            if buffer[..read].iter().any(|&byte| byte != 0) {
++                let mut written = 0;
++                while written < read {
++                    let n = to.write_at(&buffer[written..read], at + written as u64)?;
++                    if n == 0 {
++                        return Err(io::ErrorKind::WriteZero.into());
++                    }
++                    written += n;
++                }
++            }
++            at += read as u64;
++        }
++        offset = hole;
++    }
++    Ok(())
++}
++
++/// The plain copy of `[offset, len)` from `from` to `to`.
++#[cfg(target_os = "linux")]
++fn copy_plain(
++    from: &std::fs::File,
++    to: &std::fs::File,
++    mut offset: u64,
++    len: u64,
++    buffer: &mut [u8],
++) -> io::Result<()> {
++    use std::os::unix::fs::FileExt;
++
++    while offset < len {
++        let amount = usize::try_from((len - offset).min(buffer.len() as u64)).unwrap();
++        let read = from.read_at(&mut buffer[..amount], offset)?;
++        if read == 0 {
++            return Err(io::Error::new(
++                io::ErrorKind::UnexpectedEof,
++                "shared-memory object ended while copying it",
++            ));
++        }
++        let mut written = 0;
++        while written < read {
++            let n = to.write_at(&buffer[written..read], offset + written as u64)?;
++            if n == 0 {
++                return Err(io::ErrorKind::WriteZero.into());
++            }
++            written += n;
++        }
++        offset += read as u64;
++    }
++    Ok(())
 +}
 +
 +#[cfg(target_os = "linux")]
@@ -345,7 +421,7 @@ index 7dfaf8f..1154dc5 100644
  impl Drop for SharedMemoryMapping {
      fn drop(&mut self) {
          self.object.unregister_mapping(self.id);
-@@ -426,7 +627,13 @@ impl AsyncRead for SharedMemoryFileHandle {
+@@ -426,7 +695,13 @@ impl AsyncRead for SharedMemoryFileHandle {
              return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
          }
          let destination = buf.initialize_unfilled();
@@ -360,7 +436,7 @@ index 7dfaf8f..1154dc5 100644
              Ok(read) => {
                  self.cursor += read as u64;
                  self.object.accessed.store(now_nanos(), Ordering::Relaxed);
-@@ -456,7 +663,7 @@ impl AsyncWrite for SharedMemoryFileHandle {
+@@ -456,7 +731,7 @@ impl AsyncWrite for SharedMemoryFileHandle {
          } else {
              self.cursor
          };
@@ -369,7 +445,7 @@ index 7dfaf8f..1154dc5 100644
              Ok(written) => {
                  drop(_guard);
                  self.cursor = offset + written as u64;
-@@ -540,6 +747,55 @@ fn now_nanos() -> u64 {
+@@ -540,6 +815,86 @@ fn now_nanos() -> u64 {
  mod tests {
      use super::*;
  
@@ -420,6 +496,37 @@ index 7dfaf8f..1154dc5 100644
 +
 +        assert_eq!(unsafe { libc::munmap(address, WASM_PAGE_SIZE as usize) }, 0);
 +        drop(mapping);
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn copy_data_preserves_bytes_and_leaves_zero_chunks_as_holes() {
++        use std::os::unix::fs::{FileExt, MetadataExt};
++
++        let len = 8 * 64 * 1024;
++        let from = create_memfd().unwrap();
++        from.set_len(len).unwrap();
++        // Data in the second chunk and at the very end; the rest stays zero,
++        // partly as holes, partly written zeros.
++        from.write_at(b"second", 64 * 1024 + 5).unwrap();
++        from.write_at(&[0; 64 * 1024], 3 * 64 * 1024).unwrap();
++        from.write_at(b"last", len - 4).unwrap();
++        let to = create_memfd().unwrap();
++        to.set_len(len).unwrap();
++
++        copy_data(&from, &to, len).unwrap();
++
++        let mut expected = vec![0; len as usize];
++        let mut actual = vec![0; len as usize];
++        from.read_exact_at(&mut expected, 0).unwrap();
++        to.read_exact_at(&mut actual, 0).unwrap();
++        assert!(expected == actual);
++        assert_eq!(&actual[64 * 1024 + 5..64 * 1024 + 11], b"second");
++        assert!(
++            to.metadata().unwrap().blocks() * 512 < from.metadata().unwrap().blocks() * 512,
++            "the copy holds fewer blocks than a source with written zeros"
++        );
++        assert!(to.metadata().unwrap().blocks() * 512 <= 3 * 64 * 1024);
 +    }
 +
      #[test]
