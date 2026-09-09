@@ -289,9 +289,11 @@ fn rebuild(host: &mut Host, listener: TcpListener, forked_at: Instant) -> Result
 struct ZeroPages {
     /// Private anonymous linear memories scanned.
     memories: usize,
-    /// Pages of those memories within their current length.
+    /// Anonymous pages of those memories within their current length.
     scanned: usize,
-    /// Of which resident (`mincore`).
+    /// Pages of those memories inside shared file overlays, left alone.
+    overlay: usize,
+    /// Of the scanned pages, resident (`mincore`).
     resident: usize,
     /// Of which resident and entirely zero.
     zero: usize,
@@ -313,6 +315,9 @@ struct MemoryScan {
     /// released only when it is zero throughout. Read from `smaps` by the
     /// first slice (it costs milliseconds for a large process).
     spare_full_blocks: Option<bool>,
+    /// The anonymous page ranges of the memory, in order: everything but
+    /// its shared file overlays. Only these ranges are scanned.
+    extents: Vec<(usize, usize)>,
     /// The next page to scan.
     next: usize,
     /// A run of zero pages found but not yet released, as page indices.
@@ -328,12 +333,13 @@ struct MemoryScan {
 /// less. The scan only ever runs with the guest drained and this the only
 /// thread; between slices the process is exactly as it was for a fork.
 ///
-/// A frozen shared-memory overlay inside a memory is not anonymous but a
-/// fresh `MAP_PRIVATE` mapping of the immutable frozen file, which nothing
-/// writes after the snapshot. Its dropped pages therefore refault with the
-/// bytes the scan read, zeros again; dropping their page-table entries is
-/// the same win for `fork()`, and a clone replaces the whole range when it
-/// reshares.
+/// A shared file overlay inside a memory is not the guest's anonymous
+/// memory: after the freeze it is a private mapping of the frozen file,
+/// with no page in the template's page tables, which the runtime keeps out
+/// of every fork and a clone replaces wholesale. The scan skips it. It
+/// cannot even look: `mincore` reports the page cache for a file mapping,
+/// so reading its "resident" pages would fault the frozen file into the
+/// template's page tables, more for every fork to copy rather than less.
 ///
 /// A 2 MiB-aligned block whose pages are all resident may be one transparent
 /// huge page; dropping part of it would split it into 4 KiB pages, which is
@@ -363,22 +369,52 @@ impl Compaction {
         let memories: Vec<MemoryScan> = memories
             .into_iter()
             .filter(|memory| memory.private_anonymous && memory.len > 0)
-            .map(|memory| MemoryScan {
-                base: memory.base as usize,
-                pages: memory.len.div_ceil(page),
-                spare_full_blocks: None,
-                next: 0,
-                pending: None,
+            .map(|memory| {
+                let base = memory.base as usize;
+                let pages = memory.len.div_ceil(page);
+                let mut overlays: Vec<(usize, usize)> = memory
+                    .overlays
+                    .iter()
+                    .map(|&(addr, len)| ((addr - base) / page, (addr - base + len).div_ceil(page)))
+                    .filter(|&(start, end)| start < end.min(pages))
+                    .collect();
+                overlays.sort_unstable();
+                let mut extents = Vec::new();
+                let mut from = 0;
+                for (start, end) in overlays {
+                    if from < start {
+                        extents.push((from, start));
+                    }
+                    from = from.max(end);
+                }
+                if from < pages {
+                    extents.push((from, pages));
+                }
+                MemoryScan {
+                    base,
+                    pages,
+                    spare_full_blocks: None,
+                    extents,
+                    next: 0,
+                    pending: None,
+                }
             })
             .collect();
+        let scanned = memories
+            .iter()
+            .flat_map(|memory| memory.extents.iter())
+            .map(|(start, end)| end - start)
+            .sum();
         let totals = ZeroPages {
             memories: memories.len(),
-            scanned: memories.iter().map(|memory| memory.pages).sum(),
+            scanned,
+            overlay: memories.iter().map(|memory| memory.pages).sum::<usize>() - scanned,
             ..ZeroPages::default()
         };
         tracing::debug!(
             memories = totals.memories,
             pages = totals.scanned,
+            overlay = totals.overlay,
             "releasing zero pages in slices"
         );
         Self {
@@ -422,6 +458,7 @@ impl Compaction {
             tracing::debug!(
                 memories = totals.memories,
                 scanned = totals.scanned,
+                overlay = totals.overlay,
                 resident = totals.resident,
                 zero = totals.zero,
                 released = totals.released,
@@ -437,13 +474,28 @@ impl Compaction {
     }
 }
 
-/// Scans the 2 MiB-aligned block at `memory.next` (clipped to the memory):
-/// marks its zero pages, keeps a fully resident block that is not zero
-/// throughout when the mapping may hold huge pages, and releases runs of
-/// zero pages, merging with the run left pending by the previous block.
+/// Scans the 2 MiB-aligned block at `memory.next` (clipped to the anonymous
+/// extent it is in): marks its zero pages, keeps a fully resident block
+/// that is not zero throughout when the mapping may hold huge pages, and
+/// releases runs of zero pages, merging with the run left pending by the
+/// previous block. Between extents it skips to the next one.
 fn scan_block(memory: &mut MemoryScan, page: usize, huge_page: usize, totals: &mut ZeroPages) {
+    let Some(&(start, extent_end)) = memory
+        .extents
+        .iter()
+        .find(|&&(_, extent_end)| memory.next < extent_end)
+    else {
+        memory.next = memory.pages;
+        release_pending(memory, page, totals);
+        return;
+    };
+    if memory.next < start {
+        // Past an overlay: a run never spans one.
+        release_pending(memory, page, totals);
+        memory.next = start;
+    }
     let base = memory.base;
-    let end = base + memory.pages * page;
+    let end = base + extent_end * page;
     let addr = base + memory.next * page;
     let block_end = ((addr / huge_page) + 1).saturating_mul(huge_page).min(end);
     let first = memory.next;
@@ -523,11 +575,8 @@ fn release_pending(memory: &mut MemoryScan, page: usize, totals: &mut ZeroPages)
         return;
     };
     let run = end - start;
-    // SAFETY: a page-aligned subrange of the guest's mapping. An anonymous
-    // page refaults as fresh zeros. A frozen shared-memory overlay is a fresh
-    // MAP_PRIVATE mapping of the immutable frozen file, which nothing writes
-    // after the snapshot, so its pages refault as the bytes the scan read:
-    // zeros either way.
+    // SAFETY: a page-aligned subrange of the guest's private anonymous
+    // mapping, within one anonymous extent; a page refaults as fresh zeros.
     let rc = unsafe {
         libc::madvise(
             (memory.base + start * page) as *mut libc::c_void,

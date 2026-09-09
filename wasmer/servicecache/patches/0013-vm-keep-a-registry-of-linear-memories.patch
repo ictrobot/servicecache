@@ -5,9 +5,12 @@ guest's linear memory: the `Memory` handle needs its store, which lives
 on the guest's thread. Every `WasmMmap` now registers the address of its
 memory definition while it lives and `linear_memories` reads the base
 and current length from each, with whether the mapping is private and
-anonymous. Reading is unsynchronised, so the function is unsafe: it is
-for a process that has stopped every guest thread, such as a host about
-to fork a frozen guest, which drops the memory's all-zero pages first.
+anonymous and where its shared file overlays are: a private anonymous
+memory can hold file mappings, which are not the guest's own pages. The
+overlays are recorded as they are made and undone. Reading is
+unsynchronised, so the function is unsafe: it is for a process that has
+stopped every guest thread, such as a host about to fork a frozen guest,
+which drops the memory's all-zero pages first.
 
 diff --git a/lib/vm/src/lib.rs b/lib/vm/src/lib.rs
 index 52770bf..6054d8f 100644
@@ -25,7 +28,7 @@ index 52770bf..6054d8f 100644
  pub use crate::mmap::{Mmap, MmapType};
  pub use crate::probestack::PROBESTACK;
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index 2a9d1b8..ff6c15b 100644
+index 2a9d1b8..e638de0 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
 @@ -2,6 +2,10 @@
@@ -33,13 +36,13 @@ index 2a9d1b8..ff6c15b 100644
  //
  // Modified to add the ictrobot_shm_v1 extension for shared memory.
 +//
-+// Modified for ServiceCache: every linear memory is
-+// registered while it lives, so that an embedder can find its mapping
-+// (`linear_memories`).
++// Modified for ServiceCache: every linear memory is registered while it
++// lives, with its shared file overlays, so that an embedder can find its
++// mapping (`linear_memories`).
  
  //! Memory management for linear memories.
  //!
-@@ -21,10 +25,82 @@ use std::cell::UnsafeCell;
+@@ -21,10 +25,109 @@ use std::cell::UnsafeCell;
  use std::convert::TryInto;
  use std::ptr::NonNull;
  use std::slice;
@@ -49,7 +52,7 @@ index 2a9d1b8..ff6c15b 100644
  use wasmer_types::{Bytes, MemoryError, MemoryStyle, MemoryType, Pages, WASM_PAGE_SIZE};
  
 +/// A linear memory alive in this process, as [`linear_memories`] reports it.
-+#[derive(Debug, Clone, Copy)]
++#[derive(Debug, Clone)]
 +pub struct LinearMemoryInfo {
 +    /// Start of the accessible bytes.
 +    pub base: *mut u8,
@@ -60,6 +63,10 @@ index 2a9d1b8..ff6c15b 100644
 +    /// `madvise(MADV_DONTNEED)` affects this process alone and the page reads
 +    /// as zeros afterwards.
 +    pub private_anonymous: bool,
++    /// The shared file overlays inside the memory, as `(address, len)` in
++    /// host memory: ranges that are file mappings, whatever the memory as a
++    /// whole is.
++    pub overlays: Vec<(usize, usize)>,
 +}
 +
 +/// A registry entry: where the memory's definition lives, which compiled
@@ -67,6 +74,8 @@ index 2a9d1b8..ff6c15b 100644
 +struct RegisteredMemory {
 +    definition: NonNull<VMMemoryDefinition>,
 +    private_anonymous: bool,
++    /// Live shared file overlays as `(offset, len)` within the memory.
++    overlays: Vec<(usize, usize)>,
 +}
 +
 +// SAFETY: the pointer is only dereferenced by `linear_memories`, under its
@@ -82,7 +91,23 @@ index 2a9d1b8..ff6c15b 100644
 +        .push(RegisteredMemory {
 +            definition,
 +            private_anonymous,
++            overlays: Vec::new(),
 +        });
++}
++
++/// Records that `(start, len)` of the memory is a shared file overlay, or
++/// (`live` false) no longer is.
++fn set_overlay(definition: NonNull<VMMemoryDefinition>, start: usize, len: usize, live: bool) {
++    let mut memories = LINEAR_MEMORIES.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(entry) = memories
++        .iter_mut()
++        .find(|entry| entry.definition == definition)
++    {
++        entry.overlays.retain(|&range| range != (start, len));
++        if live {
++            entry.overlays.push((start, len));
++        }
++    }
 +}
 +
 +fn unregister_memory(definition: NonNull<VMMemoryDefinition>) {
@@ -115,6 +140,11 @@ index 2a9d1b8..ff6c15b 100644
 +                base: definition.base,
 +                len: definition.current_length,
 +                private_anonymous: entry.private_anonymous,
++                overlays: entry
++                    .overlays
++                    .iter()
++                    .map(|&(start, len)| (definition.base as usize + start, len))
++                    .collect(),
 +            }
 +        })
 +        .collect()
@@ -123,7 +153,29 @@ index 2a9d1b8..ff6c15b 100644
  // The memory mapped area
  #[derive(Debug)]
  struct WasmMmap {
-@@ -216,7 +292,7 @@ impl WasmMmap {
+@@ -186,7 +289,9 @@ impl WasmMmap {
+         }
+         self.alloc
+             .overlay_shared_file(start, len, file, file_offset)
+-            .map_err(MemoryError::Region)
++            .map_err(MemoryError::Region)?;
++        set_overlay(self.get_vm_memory_definition(), start, len, true);
++        Ok(())
+     }
+ 
+     fn restore_private_anonymous(&mut self, start: u64, len: u64) -> Result<(), MemoryError> {
+@@ -204,7 +309,9 @@ impl WasmMmap {
+         }
+         self.alloc
+             .restore_private_anonymous(start, len)
+-            .map_err(MemoryError::Region)
++            .map_err(MemoryError::Region)?;
++        set_overlay(self.get_vm_memory_definition(), start, len, false);
++        Ok(())
+     }
+ 
+     /// Copies the memory
+@@ -216,7 +323,7 @@ impl WasmMmap {
              .copy(Some(mem_length))
              .map_err(MemoryError::Generic)?;
          let base_ptr = alloc.as_mut_ptr();
@@ -132,7 +184,7 @@ index 2a9d1b8..ff6c15b 100644
              vm_memory_definition: MaybeInstanceOwned::Host(Box::new(UnsafeCell::new(
                  VMMemoryDefinition {
                      base: base_ptr,
-@@ -225,7 +301,16 @@ impl WasmMmap {
+@@ -225,7 +332,16 @@ impl WasmMmap {
              ))),
              alloc,
              size: self.size,
@@ -150,7 +202,7 @@ index 2a9d1b8..ff6c15b 100644
      }
  }
  
-@@ -389,6 +474,7 @@ impl VMOwnedMemory {
+@@ -389,6 +505,7 @@ impl VMOwnedMemory {
              let mapped_pages = memory.minimum;
              let mapped_bytes = mapped_pages.bytes();
  
@@ -158,7 +210,7 @@ index 2a9d1b8..ff6c15b 100644
              let mut alloc =
                  Mmap::accessible_reserved(mapped_bytes.0, request_bytes, backing_file, memory_type)
                      .map_err(MemoryError::Region)?;
-@@ -417,6 +503,7 @@ impl VMOwnedMemory {
+@@ -417,6 +534,7 @@ impl VMOwnedMemory {
                  alloc,
                  size: Bytes::from(mem_length).try_into().unwrap(),
              };

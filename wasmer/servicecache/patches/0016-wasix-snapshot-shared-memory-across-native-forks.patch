@@ -10,12 +10,14 @@ forked child calls reshare_after_fork to create clone-local backing
 and replay the overlays before any guest thread resumes.
 
 Each object-side registration records the host address its overlay
-occupies, which freeze and replay remap with MAP_FIXED. Recycling an
+occupies, which freeze and replay remap with MAP_FIXED. The frozen
+mapping only keeps the range mapped until a child replaces it, so it
+is marked MADV_DONTFORK: a child inherits nothing of it. Recycling an
 execution already clears its registrations, so a snapshot never
 replays a stale mapping over an address a later execution reuses.
 
 diff --git a/lib/wasix/src/fs/shared_memory.rs b/lib/wasix/src/fs/shared_memory.rs
-index 7dfaf8f..137dc7c 100644
+index 7dfaf8f..1154dc5 100644
 --- a/lib/wasix/src/fs/shared_memory.rs
 +++ b/lib/wasix/src/fs/shared_memory.rs
 @@ -3,11 +3,11 @@ use std::{
@@ -119,7 +121,7 @@ index 7dfaf8f..137dc7c 100644
      }
  
      fn set_len(&self, new_size: u64) -> Result<(), FsError> {
-@@ -106,15 +119,105 @@ impl SharedMemoryObject {
+@@ -106,15 +119,116 @@ impl SharedMemoryObject {
              .lock()
              .unwrap()
              .values()
@@ -218,6 +220,17 @@ index 7dfaf8f..137dc7c 100644
 +            if result == libc::MAP_FAILED {
 +                return Err(io::Error::last_os_error());
 +            }
++            if !shared {
++                // The frozen mapping is for keeping the range mapped, not
++                // for reading: a forked child replaces it wholesale before
++                // any guest thread runs, so leave it out of every fork.
++                let result = unsafe {
++                    libc::madvise(host_address as *mut libc::c_void, len, libc::MADV_DONTFORK)
++                };
++                if result != 0 {
++                    return Err(io::Error::last_os_error());
++                }
++            }
 +        }
 +
 +        *file = replacement;
@@ -227,7 +240,7 @@ index 7dfaf8f..137dc7c 100644
      fn metadata(&self) -> Metadata {
          Metadata {
              ft: FileType::new_file(),
-@@ -149,9 +252,15 @@ impl SharedMemoryMapping {
+@@ -149,9 +263,15 @@ impl SharedMemoryMapping {
          mapping
      }
  
@@ -244,7 +257,7 @@ index 7dfaf8f..137dc7c 100644
              self.address,
              self.len,
              self.file_offset,
-@@ -159,6 +268,87 @@ impl SharedMemoryMapping {
+@@ -159,6 +279,87 @@ impl SharedMemoryMapping {
      }
  }
  
@@ -332,7 +345,7 @@ index 7dfaf8f..137dc7c 100644
  impl Drop for SharedMemoryMapping {
      fn drop(&mut self) {
          self.object.unregister_mapping(self.id);
-@@ -426,7 +616,13 @@ impl AsyncRead for SharedMemoryFileHandle {
+@@ -426,7 +627,13 @@ impl AsyncRead for SharedMemoryFileHandle {
              return Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()));
          }
          let destination = buf.initialize_unfilled();
@@ -347,7 +360,7 @@ index 7dfaf8f..137dc7c 100644
              Ok(read) => {
                  self.cursor += read as u64;
                  self.object.accessed.store(now_nanos(), Ordering::Relaxed);
-@@ -456,7 +652,7 @@ impl AsyncWrite for SharedMemoryFileHandle {
+@@ -456,7 +663,7 @@ impl AsyncWrite for SharedMemoryFileHandle {
          } else {
              self.cursor
          };
@@ -356,7 +369,7 @@ index 7dfaf8f..137dc7c 100644
              Ok(written) => {
                  drop(_guard);
                  self.cursor = offset + written as u64;
-@@ -540,6 +736,55 @@ fn now_nanos() -> u64 {
+@@ -540,6 +747,55 @@ fn now_nanos() -> u64 {
  mod tests {
      use super::*;
  

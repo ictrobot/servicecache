@@ -40,20 +40,20 @@ index 7a39208..ce1d729 100644
   "wasmparser 0.256.0",
   "wcgi",
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index ff6c15b..b2be3cd 100644
+index e638de0..59dc506 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
-@@ -48,6 +48,9 @@ pub struct LinearMemoryInfo {
- struct RegisteredMemory {
-     definition: NonNull<VMMemoryDefinition>,
+@@ -54,6 +54,9 @@ struct RegisteredMemory {
      private_anonymous: bool,
+     /// Live shared file overlays as `(offset, len)` within the memory.
+     overlays: Vec<(usize, usize)>,
 +    /// A base and usable reservation that cannot move while this memory
 +    /// lives. Dynamic memories have no such range.
 +    stable_range: Option<(usize, usize)>,
  }
  
  // SAFETY: the pointer is only dereferenced by `linear_memories`, under its
-@@ -56,13 +59,18 @@ unsafe impl Send for RegisteredMemory {}
+@@ -62,7 +65,11 @@ unsafe impl Send for RegisteredMemory {}
  
  static LINEAR_MEMORIES: Mutex<Vec<RegisteredMemory>> = Mutex::new(Vec::new());
  
@@ -66,14 +66,15 @@ index ff6c15b..b2be3cd 100644
      LINEAR_MEMORIES
          .lock()
          .unwrap_or_else(|e| e.into_inner())
-         .push(RegisteredMemory {
+@@ -70,6 +77,7 @@ fn register_memory(definition: NonNull<VMMemoryDefinition>, private_anonymous: b
              definition,
              private_anonymous,
+             overlays: Vec::new(),
 +            stable_range: stable_range.map(|(base, len)| (base as usize, len)),
          });
  }
  
-@@ -101,6 +109,28 @@ pub unsafe fn linear_memories() -> Vec<LinearMemoryInfo> {
+@@ -128,6 +136,28 @@ pub unsafe fn linear_memories() -> Vec<LinearMemoryInfo> {
          .collect()
  }
  
@@ -102,7 +103,7 @@ index ff6c15b..b2be3cd 100644
  // The memory mapped area
  #[derive(Debug)]
  struct WasmMmap {
-@@ -110,6 +140,8 @@ struct WasmMmap {
+@@ -137,6 +167,8 @@ struct WasmMmap {
      size: Pages,
      /// The owned memory definition used by the generated code
      vm_memory_definition: MaybeInstanceOwned<VMMemoryDefinition>,
@@ -111,7 +112,7 @@ index ff6c15b..b2be3cd 100644
  }
  
  /// # SAFETY: Not safe by rust standards, since guest code may do weird things
-@@ -301,9 +333,15 @@ impl WasmMmap {
+@@ -332,9 +364,15 @@ impl WasmMmap {
              ))),
              alloc,
              size: self.size,
@@ -128,7 +129,7 @@ index ff6c15b..b2be3cd 100644
          Ok(copy)
      }
  }
-@@ -502,8 +540,17 @@ impl VMOwnedMemory {
+@@ -533,8 +571,17 @@ impl VMOwnedMemory {
                  },
                  alloc,
                  size: Bytes::from(mem_length).try_into().unwrap(),
