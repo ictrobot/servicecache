@@ -24,4 +24,5 @@ matches = '^R'
 
 [initializer]
 module = "psql.wasm"
-args = ["-h", "{host}", "-p", "{port}", "-U", "postgres", "-d", "postgres", "--no-psqlrc"]
+# Wasmer reports stdin as a terminal, so it is read as a script file, where ON_ERROR_STOP exits nonzero at the first error.
+args = ["-h", "{host}", "-p", "{port}", "-U", "postgres", "-d", "postgres", "--no-psqlrc", "-f", "/dev/stdin", "-v", "ON_ERROR_STOP=1"]
