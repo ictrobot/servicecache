@@ -1,0 +1,297 @@
+Subject: wasix: refresh a socket future's waker on every poll
+
+The five socket futures - accept, send, send_to, recv and recv_from -
+registered an interest handler only on the poll that first found the
+socket blocked, and every later poll returned Pending without touching
+it. A future may be polled by a different task each time, and the
+handler then names whoever polled it first: the task now waiting is
+never woken, and the wait ends only when something else disturbs it, or
+never.
+
+The window is easy to open. A guest whose blocking accept() is suspended
+and later resumed on another thread - a different runtime, a different
+task - leaves a handler naming the thread that is gone; the next
+connection arrives, the handler wakes nobody, and the accept stands
+until its own timeout expires seconds later.
+
+Register on every WouldBlock poll instead, which is what the Future
+contract asks for. The first registration still goes round the loop
+once, so an event that arrived between the attempt and the handler is
+not missed; later polls replace the handler and return Pending.
+
+The test polls a pending accept twice with two different wakers and
+fires the handler the listener kept: the second waker is the one woken.
+
+diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
+index 204434e..1b827a6 100644
+--- a/lib/wasix/src/net/socket.rs
++++ b/lib/wasix/src/net/socket.rs
+@@ -638,16 +638,31 @@ impl InodeSocket {
+                             Err(NetworkError::WouldBlock) if self.nonblocking => {
+                                 Poll::Ready(Err(Errno::Again))
+                             }
+-                            Err(NetworkError::WouldBlock) if !self.handler_registered => {
++                            Err(NetworkError::WouldBlock) => {
++                                // Registered on every poll, not only the
++                                // first: a future may be polled by a
++                                // different task than the one that polled it
++                                // last, and the handler recorded earlier then
++                                // wakes a task that is no longer waiting for
++                                // this socket while the one that is waits for
++                                // ever. Refreshing it is what the Future
++                                // contract asks for.
+                                 let res = socket.set_handler(cx.waker().into());
+                                 if let Err(err) = res {
+                                     return Poll::Ready(Err(net_error_into_wasi_err(err)));
+                                 }
+-                                drop(inner);
+-                                self.handler_registered = true;
+-                                continue;
++                                if self.handler_registered {
++                                    Poll::Pending
++                                } else {
++                                    // The first registration goes round
++                                    // again: an event that arrived between
++                                    // the attempt above and the handler
++                                    // would otherwise never be noticed.
++                                    drop(inner);
++                                    self.handler_registered = true;
++                                    continue;
++                                }
+                             }
+-                            Err(NetworkError::WouldBlock) => Poll::Pending,
+                             Err(err) => Poll::Ready(Err(net_error_into_wasi_err(err))),
+                         },
+                         InodeSocketKind::PreSocket { .. } => Poll::Ready(Err(Errno::Notconn)),
+@@ -1356,15 +1371,20 @@ impl InodeSocket {
+                         Err(NetworkError::WouldBlock) if self.nonblocking => {
+                             Poll::Ready(Err(Errno::Again))
+                         }
+-                        Err(NetworkError::WouldBlock) if !self.handler_registered => {
++                        Err(NetworkError::WouldBlock) => {
++                            // Registered on every poll, not only the first.
+                             inner
+                                 .set_handler(cx.waker().into())
+                                 .map_err(net_error_into_wasi_err)?;
+-                            drop(inner);
+-                            self.handler_registered = true;
+-                            continue;
++                            if self.handler_registered {
++                                Poll::Pending
++                            } else {
++                                // The first registration goes round again.
++                                drop(inner);
++                                self.handler_registered = true;
++                                continue;
++                            }
+                         }
+-                        Err(NetworkError::WouldBlock) => Poll::Pending,
+                         Err(err) => Poll::Ready(Err(net_error_into_wasi_err(err))),
+                     };
+                 }
+@@ -1440,15 +1460,20 @@ impl InodeSocket {
+                         Err(NetworkError::WouldBlock) if self.nonblocking => {
+                             Poll::Ready(Err(Errno::Again))
+                         }
+-                        Err(NetworkError::WouldBlock) if !self.handler_registered => {
++                        Err(NetworkError::WouldBlock) => {
++                            // Registered on every poll, not only the first.
+                             inner
+                                 .set_handler(cx.waker().into())
+                                 .map_err(net_error_into_wasi_err)?;
+-                            self.handler_registered = true;
+-                            drop(inner);
+-                            continue;
++                            if self.handler_registered {
++                                Poll::Pending
++                            } else {
++                                // The first registration goes round again.
++                                self.handler_registered = true;
++                                drop(inner);
++                                continue;
++                            }
+                         }
+-                        Err(NetworkError::WouldBlock) => Poll::Pending,
+                         Err(err) => Poll::Ready(Err(net_error_into_wasi_err(err))),
+                     };
+                 }
+@@ -1532,16 +1557,20 @@ impl InodeSocket {
+                         Err(NetworkError::WouldBlock) if self.nonblocking => {
+                             Poll::Ready(Err(Errno::Again))
+                         }
+-                        Err(NetworkError::WouldBlock) if !self.handler_registered => {
++                        Err(NetworkError::WouldBlock) => {
++                            // Registered on every poll, not only the first.
+                             inner
+                                 .set_handler(cx.waker().into())
+                                 .map_err(net_error_into_wasi_err)?;
+-                            self.handler_registered = true;
+-                            drop(inner);
+-                            continue;
++                            if self.handler_registered {
++                                Poll::Pending
++                            } else {
++                                // The first registration goes round again.
++                                self.handler_registered = true;
++                                drop(inner);
++                                continue;
++                            }
+                         }
+-
+-                        Err(NetworkError::WouldBlock) => Poll::Pending,
+                         Err(err) => Poll::Ready(Err(net_error_into_wasi_err(err))),
+                     };
+                 }
+@@ -1623,14 +1652,19 @@ impl InodeSocket {
+                         Err(NetworkError::WouldBlock) if self.nonblocking => {
+                             Poll::Ready(Err(Errno::Again))
+                         }
+-                        Err(NetworkError::WouldBlock) if !self.handler_registered => {
++                        Err(NetworkError::WouldBlock) => {
++                            // Registered on every poll, not only the first.
+                             inner
+                                 .set_handler(cx.waker().into())
+                                 .map_err(net_error_into_wasi_err)?;
+-                            self.handler_registered = true;
+-                            continue;
++                            if self.handler_registered {
++                                Poll::Pending
++                            } else {
++                                // The first registration goes round again.
++                                self.handler_registered = true;
++                                continue;
++                            }
+                         }
+-                        Err(NetworkError::WouldBlock) => Poll::Pending,
+                         Err(err) => Poll::Ready(Err(net_error_into_wasi_err(err))),
+                     };
+                 }
+@@ -2188,4 +2222,128 @@ pub(crate) mod tests {
+             .unwrap_err();
+         assert_eq!(err, Errno::Timedout);
+     }
++
++    /// A listener that never has a connection, and keeps whatever handler
++    /// it was last given so a test can fire it.
++    #[derive(Debug)]
++    struct BlockedListener {
++        handler: Arc<std::sync::Mutex<Option<Box<dyn InterestHandler + Send + Sync>>>>,
++        registrations: Arc<AtomicUsize>,
++    }
++
++    impl VirtualIoSource for BlockedListener {
++        fn remove_handler(&mut self) {
++            *self.handler.lock().unwrap() = None;
++        }
++
++        fn poll_read_ready(&mut self, _cx: &mut Context<'_>) -> Poll<NetResult<usize>> {
++            Poll::Pending
++        }
++
++        fn poll_write_ready(&mut self, _cx: &mut Context<'_>) -> Poll<NetResult<usize>> {
++            Poll::Pending
++        }
++    }
++
++    impl virtual_net::VirtualTcpListener for BlockedListener {
++        fn try_accept(&mut self) -> NetResult<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
++            Err(NetworkError::WouldBlock)
++        }
++
++        fn set_handler(
++            &mut self,
++            handler: Box<dyn InterestHandler + Send + Sync>,
++        ) -> NetResult<()> {
++            self.registrations.fetch_add(1, Ordering::Relaxed);
++            *self.handler.lock().unwrap() = Some(handler);
++            Ok(())
++        }
++
++        fn addr_local(&self) -> NetResult<SocketAddr> {
++            Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++        }
++
++        fn set_ttl(&mut self, _ttl: u8) -> NetResult<()> {
++            Ok(())
++        }
++
++        fn ttl(&self) -> NetResult<u8> {
++            Ok(64)
++        }
++    }
++
++    /// A waker that records that it was woken.
++    #[derive(Debug, Default)]
++    struct Flag(std::sync::atomic::AtomicBool);
++
++    impl Flag {
++        fn woken(&self) -> bool {
++            self.0.load(Ordering::SeqCst)
++        }
++    }
++
++    impl std::task::Wake for Flag {
++        fn wake(self: Arc<Self>) {
++            self.wake_by_ref();
++        }
++
++        fn wake_by_ref(self: &Arc<Self>) {
++            self.0.store(true, Ordering::SeqCst);
++        }
++    }
++
++    /// A pending accept must register the waker of the poll it is pending
++    /// on, not the waker of the poll that first found the socket empty.
++    /// Whoever polls it last is who is waiting: a future is not promised to
++    /// the task that polled it first, and a handler left naming an earlier
++    /// task wakes nobody who cares.
++    #[cfg(feature = "sys")]
++    #[tokio::test(flavor = "current_thread")]
++    async fn accept_registers_the_waker_of_every_poll() {
++        use std::future::Future;
++
++        let handler = Arc::new(std::sync::Mutex::new(None));
++        let registrations = Arc::new(AtomicUsize::new(0));
++        let inode = InodeSocket::new(InodeSocketKind::TcpListener {
++            socket: Box::new(BlockedListener {
++                handler: handler.clone(),
++                registrations: registrations.clone(),
++            }),
++            accept_timeout: None,
++        });
++        let tasks = crate::runtime::task_manager::tokio::TokioTaskManager::default();
++
++        let first = Arc::new(Flag::default());
++        let second = Arc::new(Flag::default());
++        let mut accept = Box::pin(inode.accept(&tasks, false, None));
++        assert!(
++            accept
++                .as_mut()
++                .poll(&mut Context::from_waker(&std::task::Waker::from(
++                    first.clone()
++                )))
++                .is_pending()
++        );
++        assert!(registrations.load(Ordering::Relaxed) >= 1);
++        // The second poll stands for a poll made by another task, such as
++        // a coroutine resumed on a thread of its own after the thread that
++        // polled first has gone.
++        assert!(
++            accept
++                .as_mut()
++                .poll(&mut Context::from_waker(&std::task::Waker::from(
++                    second.clone()
++                )))
++                .is_pending()
++        );
++
++        handler
++            .lock()
++            .unwrap()
++            .as_mut()
++            .expect("a pending accept registers a handler")
++            .push_interest(virtual_mio::InterestType::Readable);
++        assert!(second.woken(), "the latest poll's waker was not registered");
++        assert!(!first.woken(), "the stale waker was woken instead");
++    }
+ }

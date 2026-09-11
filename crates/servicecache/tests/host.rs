@@ -254,21 +254,22 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
     }
 }
 
-/// A guest reads ports back the way it bound and the client connected
-/// (wasix-libc probes the port byte order with a throwaway bind, which the
-/// host must answer). Uses the toolchain smoke fixture `netprobe.wasm`.
-fn guest_sees_correct_ports() {
-    use std::io::Read as _;
-
+/// The toolchain smoke fixture `netprobe.wasm` as a package of its own, in a
+/// fresh directory named for `tag`: its manifest, or None when the fixture
+/// is not built and the test is skipped.
+fn netprobe_package(tag: &str) -> Option<PathBuf> {
     let fixture = repo_root().join("work/build/toolchain-smoke/netprobe.wasm");
     if !fixture.is_file() {
         eprintln!(
             "skipped: {} is not built (run `make smoke-toolchain`)",
             fixture.display()
         );
-        return;
+        return None;
     }
-    let dir = std::env::temp_dir().join(format!("servicecache-netprobe-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "servicecache-netprobe-{tag}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
     // Copied, not symlinked: a manifest path must resolve inside the
@@ -279,13 +280,29 @@ fn guest_sees_correct_ports() {
         "[service]\nname = \"netprobe\"\nversion = \"0\"\n\n[guest]\nmodule = \"netprobe.wasm\"\nargs = [\"4000\"]\nlisten_port = 4000\n",
     )
     .expect("write the manifest");
+    Some(dir.join("service.toml"))
+}
 
+/// Spawns a host for `manifest` from the binary under test.
+fn spawn_host(manifest: &Path) -> HostProcess {
     let binary = Path::new(env!("CARGO_BIN_EXE_servicecache"));
     let cache_dir =
         servicecache::cache::directory(None, std::env::var_os("SERVICECACHE_CACHE_DIR").as_deref())
             .expect("a cache directory");
-    let mut host = HostProcess::spawn_with_binary(binary, &dir.join("service.toml"), &cache_dir)
-        .expect("spawn the host");
+    HostProcess::spawn_with_binary(binary, manifest, &cache_dir).expect("spawn the host")
+}
+
+/// A guest reads ports back the way it bound and the client connected
+/// (wasix-libc probes the port byte order with a throwaway bind, which the
+/// host must answer). Uses the toolchain smoke fixture `netprobe.wasm`.
+fn guest_sees_correct_ports() {
+    use std::io::Read as _;
+
+    let Some(manifest) = netprobe_package("ports") else {
+        return;
+    };
+    let dir = manifest.parent().expect("the package directory").to_owned();
+    let mut host = spawn_host(&manifest);
     let endpoint = host.start().expect("start");
 
     let mut stream = std::net::TcpStream::connect(endpoint).expect("connect");
@@ -300,6 +317,56 @@ fn guest_sees_correct_ports() {
         "the guest's view of the ports"
     );
     assert_eq!(host.wait_exit().expect("the guest exits"), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A clone forked from a guest frozen in a blocking `accept()` answers its
+/// first connection at once. The clone resumes that accept on a thread and
+/// a task of its own, so the listening socket has to wake whoever polled it
+/// last rather than the template's task, which is gone. Uses `netprobe.wasm`,
+/// which blocks in `accept()` as soon as it listens.
+fn clone_answers_from_a_frozen_accept() {
+    use std::io::Read as _;
+    use std::time::{Duration, Instant};
+
+    let Some(manifest) = netprobe_package("clone") else {
+        return;
+    };
+    let dir = manifest.parent().expect("the package directory").to_owned();
+    let mut template = spawn_host(&manifest);
+    template.start().expect("start");
+    // The guest is serving once start returns; give it the moment it needs
+    // to get from listen() into accept(), so that the freeze finds it there.
+    std::thread::sleep(Duration::from_millis(200));
+    template.freeze().expect("freeze");
+    let (mut clone, endpoint) = template.fork().expect("fork a clone");
+
+    let asked = Instant::now();
+    let mut stream = std::net::TcpStream::connect(endpoint).expect("connect to the clone");
+    // A lost wakeup leaves the accept waiting for a timeout, or for ever;
+    // the read gives up first, so the test fails rather than hangs.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let client_port = stream.local_addr().expect("local addr").port();
+    let mut line = String::new();
+    if let Err(error) = stream.read_to_string(&mut line) {
+        panic!(
+            "the clone did not answer its first connection in {:?}: {error}",
+            asked.elapsed()
+        );
+    }
+    let waited = asked.elapsed();
+    assert_eq!(
+        line.trim(),
+        format!("local={} peer={client_port}", endpoint.port()),
+        "the clone's report"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "the clone answered its first connection after {waited:?}"
+    );
+    assert_eq!(clone.wait_exit().expect("the clone's guest exits"), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -405,6 +472,13 @@ fn main() {
         "guest_sees_correct_ports",
         || {
             guest_sees_correct_ports();
+            Ok(())
+        },
+    ));
+    trials.push(libtest_mimic::Trial::test(
+        "clone_answers_from_a_frozen_accept",
+        || {
+            clone_answers_from_a_frozen_accept();
             Ok(())
         },
     ));
