@@ -1,0 +1,449 @@
+Subject: vm: read a shared memory's definition without its lock
+
+Every host call that reaches into guest memory builds a MemoryView, and
+building one asked the memory for its size and then for its definition.
+For a shared memory, which is what a threaded guest runs on, each of
+those took the read lock over the mapping: two lock acquisitions and two
+lookups through the store per host call. In a profile of a guest under
+load, those two accessors were 4.7% of the runtime's user-mode cycles,
+the largest cost outside the guest and the syscalls themselves.
+
+The lock protects the mapping. It does not protect what the two
+accessors read. The definition is a fixed allocation made with the
+mapping, either owned by the mapping or living in the instance, and
+nothing replaces it while the mapping lives: grow, grow_at_least and
+reset write the base and the length through it in place, and copy
+builds a new mapping with a new one. So keep that pointer beside the
+Arc, filled in where a shared memory is made and where one is copied,
+and answer vmmemory, size and ty from it.
+
+Reading the definition's contents without the lock is what already
+happens. The compiled guest code holds no lock when it loads the base
+from the definition, and for a static memory it does not load the bound
+at all. Every caller of vmmemory here dereferences the pointer after the
+guard has been dropped, MemoryView included: the pair of values it
+bounds-checks against was already read outside the lock, and only the
+size beside them was read inside it. A shared memory reserves all it can
+grow to when it is made, which the patch before this one makes sure of,
+so it never moves: a grow writes back the base that was already there
+and only raises the length, which leaves a reader that races one with
+the bound it would have had an instant earlier.
+
+LinearMemory gains vmmemory_and_size, which answers with both at once
+and defaults to the two accessors in turn, so that a caller that needs
+both, which is every host call into guest memory, finds the memory in
+the store once rather than twice. MemoryView::new uses it.
+
+The same treatment goes to the file-descriptor backed memories in
+sys-utils, which are the same code over a different mapping.
+
+Unit tests cover the definition and the size agreeing with the mapping
+before and after a grow, a clone reading what another handle grew, and a
+copy having its own.
+
+diff --git a/lib/api/src/backend/sys/entities/memory/view.rs b/lib/api/src/backend/sys/entities/memory/view.rs
+index 8ccf7bb..017c0ac 100644
+--- a/lib/api/src/backend/sys/entities/memory/view.rs
++++ b/lib/api/src/backend/sys/entities/memory/view.rs
+@@ -23,15 +23,15 @@ pub struct MemoryView<'a> {
+ 
+ impl<'a> MemoryView<'a> {
+     pub(crate) fn new(memory: &Memory, store: &'a (impl AsStoreRef + ?Sized)) -> Self {
+-        let size = memory
++        // Ask the memory for the definition and the size together: every host
++        // call into the guest builds a view, and a shared memory answers with
++        // both from the pointer it keeps beside its mapping, so the memory is
++        // found in the store once rather than once for each.
++        let store = store.as_store_ref();
++        let (definition, size) = memory
+             .handle
+-            .get(store.as_store_ref().objects().as_sys())
+-            .size();
+-
+-        let definition = memory
+-            .handle
+-            .get(store.as_store_ref().objects().as_sys())
+-            .vmmemory();
++            .get(store.objects().as_sys())
++            .vmmemory_and_size();
+         let def = unsafe { definition.as_ref() };
+ 
+         Self {
+diff --git a/lib/sys-utils/src/memory/fd_memory/memories.rs b/lib/sys-utils/src/memory/fd_memory/memories.rs
+index 359cabc..3e642a4 100644
+--- a/lib/sys-utils/src/memory/fd_memory/memories.rs
++++ b/lib/sys-utils/src/memory/fd_memory/memories.rs
+@@ -346,8 +346,10 @@ impl VMOwnedMemory {
+                 reason: "a shared memory must be static, so that it never moves".to_string(),
+             });
+         }
++        let definition = self.mmap.vm_memory_definition.as_ptr();
+         Ok(VMSharedMemory {
+             mmap: Arc::new(RwLock::new(self.mmap)),
++            definition,
+             config: self.config,
+             conditions: ThreadConditions::new(),
+         })
+@@ -420,11 +422,23 @@ impl LinearMemory for VMOwnedMemory {
+ pub struct VMSharedMemory {
+     // The underlying allocation.
+     mmap: Arc<RwLock<WasmMmap>>,
++    /// The memory definition `mmap` holds. The allocation it points at is
++    /// made with the mapping and is never replaced while the mapping lives,
++    /// only written through, so the pointer can be kept out here and read
++    /// without taking the lock, as the compiled guest code reads it.
++    definition: NonNull<VMMemoryDefinition>,
+     // Configuration of this memory
+     config: VMMemoryConfig,
+     conditions: ThreadConditions,
+ }
+ 
++/// # SAFETY: `definition` points into the allocation `mmap` owns, which
++/// outlives every handle to this memory, and the mapping itself is already
++/// declared safe to share.
++unsafe impl Send for VMSharedMemory {}
++/// # SAFETY: see above.
++unsafe impl Sync for VMSharedMemory {}
++
+ impl VMSharedMemory {
+     /// Create a new linear memory instance with specified minimum and maximum number of wasm pages.
+     ///
+@@ -453,8 +467,11 @@ impl VMSharedMemory {
+     /// Copies this memory to a new memory
+     pub fn copy(&self) -> Result<Self, MemoryError> {
+         let guard = self.mmap.read().unwrap();
++        let mmap = guard.copy()?;
++        let definition = mmap.vm_memory_definition.as_ptr();
+         Ok(Self {
+-            mmap: Arc::new(RwLock::new(guard.copy()?)),
++            mmap: Arc::new(RwLock::new(mmap)),
++            definition,
+             config: self.config.clone(),
+             conditions: ThreadConditions::new(),
+         })
+@@ -464,17 +481,14 @@ impl VMSharedMemory {
+ impl LinearMemory for VMSharedMemory {
+     /// Returns the type for this memory.
+     fn ty(&self) -> MemoryType {
+-        let minimum = {
+-            let guard = self.mmap.read().unwrap();
+-            guard.size()
+-        };
+-        self.config.ty(minimum)
++        self.config.ty(self.size())
+     }
+ 
+     /// Returns the size of the memory in pages
+     fn size(&self) -> Pages {
+-        let guard = self.mmap.read().unwrap();
+-        guard.size()
++        Bytes::from(unsafe { self.definition.as_ref() }.current_length)
++            .try_into()
++            .unwrap()
+     }
+ 
+     /// Resets the memory back down to zero size
+@@ -506,9 +520,16 @@ impl LinearMemory for VMSharedMemory {
+     }
+ 
+     /// Return a `VMMemoryDefinition` for exposing the memory to compiled wasm code.
++    ///
++    /// Answered from the pointer kept beside the mapping rather than from
++    /// under its lock; see the note on the field.
+     fn vmmemory(&self) -> NonNull<VMMemoryDefinition> {
+-        let guard = self.mmap.read().unwrap();
+-        guard.vm_memory_definition.as_ptr()
++        self.definition
++    }
++
++    /// Take the definition and the size together, both from that pointer.
++    fn vmmemory_and_size(&self) -> (NonNull<VMMemoryDefinition>, Pages) {
++        (self.definition, self.size())
+     }
+ 
+     /// Shared memory can always be cloned
+@@ -612,6 +633,10 @@ impl LinearMemory for VMMemory {
+         self.0.vmmemory()
+     }
+ 
++    fn vmmemory_and_size(&self) -> (NonNull<VMMemoryDefinition>, Pages) {
++        self.0.vmmemory_and_size()
++    }
++
+     /// Attempts to clone this memory (if its cloneable)
+     fn try_clone(&self) -> Result<Box<dyn LinearMemory + Send + Sync + 'static>, MemoryError> {
+         self.0.try_clone()
+@@ -758,4 +783,46 @@ mod tests {
+             Ok(_) => panic!("a dynamic shared memory was made"),
+         }
+     }
++
++    fn shared_memory(minimum: u32) -> VMSharedMemory {
++        VMSharedMemory::new(
++            &MemoryType::new(minimum, Some(16), true),
++            &MemoryStyle::Static {
++                bound: Pages(16),
++                offset_guard_size: 0,
++            },
++        )
++        .unwrap()
++    }
++
++    fn definition_of(memory: &VMSharedMemory) -> NonNull<VMMemoryDefinition> {
++        memory.mmap.read().unwrap().vm_memory_definition.as_ptr()
++    }
++
++    #[test]
++    fn a_shared_memory_answers_from_the_definition_the_mapping_holds() {
++        let memory = shared_memory(2);
++
++        assert_eq!(memory.vmmemory(), definition_of(&memory));
++        assert_eq!(memory.size(), Pages(2));
++        assert_eq!(memory.vmmemory_and_size(), (memory.vmmemory(), Pages(2)));
++    }
++
++    #[test]
++    fn a_grown_shared_memory_answers_with_the_size_it_grew_to() {
++        let mut memory = shared_memory(1);
++        let clone = memory.clone();
++        let definition = memory.vmmemory();
++
++        memory.grow(Pages(3)).unwrap();
++
++        assert_eq!(memory.vmmemory(), definition);
++        assert_eq!(memory.vmmemory(), definition_of(&memory));
++        assert_eq!(memory.size(), Pages(4));
++        assert_eq!(clone.vmmemory_and_size(), (definition, Pages(4)));
++        assert_eq!(
++            unsafe { definition.as_ref() }.current_length,
++            4 * WASM_PAGE_SIZE
++        );
++    }
+ }
+diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
+index 6d2c6d4..801b6b5 100644
+--- a/lib/vm/src/memory.rs
++++ b/lib/vm/src/memory.rs
+@@ -408,8 +408,10 @@ impl VMOwnedMemory {
+                 reason: "a shared memory must be static, so that it never moves".to_string(),
+             });
+         }
++        let definition = self.mmap.vm_memory_definition.as_ptr();
+         Ok(VMSharedMemory {
+             mmap: Arc::new(RwLock::new(self.mmap)),
++            definition,
+             config: self.config,
+             conditions: ThreadConditions::new(),
+         })
+@@ -489,12 +491,25 @@ impl LinearMemory for VMOwnedMemory {
+ pub struct VMSharedMemory {
+     // The underlying allocation.
+     mmap: Arc<RwLock<WasmMmap>>,
++    /// The memory definition `mmap` holds. The allocation it points at is
++    /// made with the mapping and is never replaced while the mapping lives,
++    /// only written through, so the pointer can be kept out here and read
++    /// without taking the lock. Every host call into guest memory asks for
++    /// it, which made that lock the busiest one in the runtime.
++    definition: NonNull<VMMemoryDefinition>,
+     // Configuration of this memory
+     config: VMMemoryConfig,
+     // waiters list for this memory
+     conditions: ThreadConditions,
+ }
+ 
++/// # SAFETY: `definition` points into the allocation `mmap` owns, which
++/// outlives every handle to this memory, and the mapping itself is already
++/// declared safe to share (see the impls on `WasmMmap`).
++unsafe impl Send for VMSharedMemory {}
++/// # SAFETY: see above.
++unsafe impl Sync for VMSharedMemory {}
++
+ impl VMSharedMemory {
+     /// Create a new linear memory instance with specified minimum and maximum number of wasm pages.
+     ///
+@@ -565,8 +580,11 @@ impl VMSharedMemory {
+     /// Copies this memory to a new memory
+     pub fn copy(&self) -> Result<Self, MemoryError> {
+         let guard = self.mmap.read().unwrap();
++        let mmap = guard.copy()?;
++        let definition = mmap.vm_memory_definition.as_ptr();
+         Ok(Self {
+-            mmap: Arc::new(RwLock::new(guard.copy()?)),
++            mmap: Arc::new(RwLock::new(mmap)),
++            definition,
+             config: self.config.clone(),
+             conditions: ThreadConditions::new(),
+         })
+@@ -576,17 +594,14 @@ impl VMSharedMemory {
+ impl LinearMemory for VMSharedMemory {
+     /// Returns the type for this memory.
+     fn ty(&self) -> MemoryType {
+-        let minimum = {
+-            let guard = self.mmap.read().unwrap();
+-            guard.size()
+-        };
+-        self.config.ty(minimum)
++        self.config.ty(self.size())
+     }
+ 
+     /// Returns the size of the memory in pages
+     fn size(&self) -> Pages {
+-        let guard = self.mmap.read().unwrap();
+-        guard.size()
++        Bytes::from(unsafe { self.definition.as_ref() }.current_length)
++            .try_into()
++            .unwrap()
+     }
+ 
+     /// Returns the memory style for this memory.
+@@ -618,9 +633,27 @@ impl LinearMemory for VMSharedMemory {
+     }
+ 
+     /// Return a `VMMemoryDefinition` for exposing the memory to compiled wasm code.
++    ///
++    /// Answered from the pointer kept beside the mapping rather than from
++    /// under its lock: the pointer is fixed when the mapping is made, and
++    /// what it points at is read without the lock anyway, both by the
++    /// compiled guest code, which holds no lock at all, and by every caller
++    /// here, which dereferences the pointer after the guard would have been
++    /// dropped. A grow writes the length and the base in place under the
++    /// write lock; a shared memory reserves all it can grow to when it is
++    /// made (its constructors refuse one that does not), so the base it
++    /// writes is the base that was already there, and
++    /// the length only rises, which leaves a reader that races a grow with
++    /// the smaller bound it would have had an instant earlier.
+     fn vmmemory(&self) -> NonNull<VMMemoryDefinition> {
+-        let guard = self.mmap.read().unwrap();
+-        guard.vm_memory_definition.as_ptr()
++        self.definition
++    }
++
++    /// Take the definition and the size together, which is what a host call
++    /// about to reach into guest memory asks for. Both come from the same
++    /// pointer, so the size is the one the definition handed over.
++    fn vmmemory_and_size(&self) -> (NonNull<VMMemoryDefinition>, Pages) {
++        (self.definition, self.size())
+     }
+ 
+     /// Shared memory can always be cloned
+@@ -726,6 +759,10 @@ impl LinearMemory for VMMemory {
+         self.0.vmmemory()
+     }
+ 
++    fn vmmemory_and_size(&self) -> (NonNull<VMMemoryDefinition>, Pages) {
++        self.0.vmmemory_and_size()
++    }
++
+     /// Attempts to clone this memory (if its cloneable)
+     fn try_clone(&self) -> Result<Box<dyn LinearMemory + Send + Sync + 'static>, MemoryError> {
+         self.0.try_clone()
+@@ -890,6 +927,16 @@ where
+     /// Return a `VMMemoryDefinition` for exposing the memory to compiled wasm code.
+     fn vmmemory(&self) -> NonNull<VMMemoryDefinition>;
+ 
++    /// Return the `VMMemoryDefinition` and the size of the memory together.
++    ///
++    /// A host call that reaches into guest memory needs both, and an
++    /// implementation that guards them with a lock can hand them over under
++    /// one acquisition rather than two. The default answers with the two
++    /// accessors, one after the other, as a caller would have.
++    fn vmmemory_and_size(&self) -> (NonNull<VMMemoryDefinition>, Pages) {
++        (self.vmmemory(), self.size())
++    }
++
+     /// Attempts to clone this memory (if its cloneable)
+     fn try_clone(&self) -> Result<Box<dyn LinearMemory + Send + Sync + 'static>, MemoryError>;
+ 
+@@ -999,4 +1046,92 @@ mod tests {
+             Ok(_) => panic!("a dynamic shared memory was made"),
+         }
+     }
++
++    fn static_style(bound: u32) -> MemoryStyle {
++        MemoryStyle::Static {
++            bound: Pages(bound),
++            offset_guard_size: 0,
++        }
++    }
++
++    fn dynamic_style() -> MemoryStyle {
++        MemoryStyle::Dynamic {
++            offset_guard_size: 0,
++        }
++    }
++
++    fn shared_memory(minimum: u32, style: MemoryStyle) -> VMSharedMemory {
++        VMSharedMemory::new(&MemoryType::new(minimum, Some(16), true), &style).unwrap()
++    }
++
++    fn definition_of(memory: &VMSharedMemory) -> NonNull<VMMemoryDefinition> {
++        memory.mmap.read().unwrap().vm_memory_definition.as_ptr()
++    }
++
++    #[test]
++    fn a_shared_memory_answers_from_the_definition_the_mapping_holds() {
++        let memory = shared_memory(2, static_style(16));
++
++        assert_eq!(memory.vmmemory(), definition_of(&memory));
++        assert_eq!(memory.size(), Pages(2));
++        assert_eq!(memory.ty().minimum, Pages(2));
++        assert_eq!(
++            unsafe { memory.vmmemory().as_ref() }.current_length,
++            2 * WASM_PAGE_SIZE
++        );
++
++        let (definition, size) = memory.vmmemory_and_size();
++        assert_eq!(definition, memory.vmmemory());
++        assert_eq!(size, memory.size());
++    }
++
++    #[test]
++    fn a_grown_shared_memory_answers_with_the_size_it_grew_to() {
++        let mut memory = shared_memory(1, static_style(16));
++        let definition = memory.vmmemory();
++
++        memory.grow(Pages(3)).unwrap();
++
++        // The definition is written through, not replaced.
++        assert_eq!(memory.vmmemory(), definition);
++        assert_eq!(memory.vmmemory(), definition_of(&memory));
++        let (_, size) = memory.vmmemory_and_size();
++        assert_eq!(size, Pages(4));
++        assert_eq!(memory.size(), Pages(4));
++        assert_eq!(
++            unsafe { definition.as_ref() }.current_length,
++            4 * WASM_PAGE_SIZE
++        );
++    }
++
++    #[test]
++    fn a_clone_of_a_shared_memory_answers_for_the_same_mapping() {
++        let mut memory = shared_memory(1, static_style(16));
++        let clone = memory.clone();
++
++        memory.grow(Pages(2)).unwrap();
++
++        assert_eq!(clone.vmmemory(), memory.vmmemory());
++        assert_eq!(clone.size(), Pages(3));
++        assert_eq!(clone.vmmemory_and_size().1, Pages(3));
++    }
++
++    #[test]
++    fn a_copy_of_a_shared_memory_answers_for_its_own_mapping() {
++        let memory = shared_memory(2, static_style(16));
++        let copy = LinearMemory::copy(&memory).unwrap();
++
++        assert_ne!(copy.vmmemory(), memory.vmmemory());
++        assert_eq!(copy.size(), memory.size());
++    }
++
++    #[test]
++    fn an_owned_memory_answers_as_its_two_accessors_do() {
++        let memory =
++            VMOwnedMemory::new(&MemoryType::new(1, None, false), &dynamic_style()).unwrap();
++
++        let (definition, size) = memory.vmmemory_and_size();
++        assert_eq!(definition, memory.vmmemory());
++        assert_eq!(size, memory.size());
++    }
+ }

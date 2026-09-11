@@ -1,0 +1,327 @@
+Subject: vm: refuse a memory that could move under code that assumes it cannot
+
+A memory moves to a new allocation whenever it grows past what it
+reserved, whatever its style: a dynamic memory reserves only what it
+starts with, and a static one reserves its bound, which need not cover
+its maximum. Two kinds of memory are read by code that assumes they
+never move.
+
+Code compiled for a static memory takes its bound as a constant and
+loads its base from the memory definition with a read-only load, which
+it may make once and keep for the rest of the function. A static
+memory whose bound is short of its maximum would outgrow that: past
+the bound it would move under the code that grew it. And a shared
+memory's base is read, without any lock, by every thread the guest
+runs, so a dynamic shared memory would move under the others. An owned
+dynamic memory is fine: its code reloads the base and the length after
+every call, and a call is the only place it can move.
+
+The default tunables make neither: they choose a static style only for
+a memory whose maximum is within the bound, and on a 64-bit host that
+bound, 4 GiB, covers every memory with 32-bit addresses. Other tunables,
+or a caller that builds a memory itself, could. So new_internal, which
+every memory is built through, now refuses a static style whose bound
+does not cover the maximum, a memory that declares none being taken at
+the greatest size a memory can have, and to_shared, which every shared
+memory is made through, refuses a dynamic style. Both answer
+InvalidMemory, so the callers report it rather than hand out a memory
+that cannot be grown safely. The sys-utils memories, which are the same
+code over a different mapping, get the same checks.
+
+Unit tests cover a static memory short of its maximum, or declaring
+none, being refused whether owned or shared, one whose bound covers it
+being accepted, and a dynamic memory being accepted as owned and
+refused as shared.
+
+diff --git a/lib/sys-utils/src/memory/fd_memory/memories.rs b/lib/sys-utils/src/memory/fd_memory/memories.rs
+index e8ffd43..359cabc 100644
+--- a/lib/sys-utils/src/memory/fd_memory/memories.rs
++++ b/lib/sys-utils/src/memory/fd_memory/memories.rs
+@@ -273,6 +273,22 @@ impl VMOwnedMemory {
+ 
+         let offset_guard_bytes = style.offset_guard_size() as usize;
+ 
++        // Code compiled for a static memory takes its bound as a constant and
++        // may load its base once and keep it for the rest of a function, so a
++        // static memory must reserve all it can grow to: past its bound it
++        // would move under that code. One that declares no maximum can grow to
++        // the greatest size there is.
++        if let MemoryStyle::Static { bound, .. } = style
++            && *bound < memory.maximum.unwrap_or_else(Pages::max_value)
++        {
++            return Err(MemoryError::InvalidMemory {
++                reason: format!(
++                    "a static memory's bound ({} pages) must cover its maximum",
++                    bound.0
++                ),
++            });
++        }
++
+         let minimum_pages = match style {
+             MemoryStyle::Dynamic { .. } => memory.minimum,
+             MemoryStyle::Static { bound, .. } => {
+@@ -320,12 +336,21 @@ impl VMOwnedMemory {
+     }
+ 
+     /// Converts this owned memory into shared memory
+-    pub fn to_shared(self) -> VMSharedMemory {
+-        VMSharedMemory {
++    pub fn to_shared(self) -> Result<VMSharedMemory, MemoryError> {
++        // Every thread the guest runs reads a shared memory's base without a
++        // lock, so it must never move, and a dynamic memory moves when it
++        // grows past what it reserved. A static one reserves all it can grow
++        // to, which new_internal makes sure of.
++        if let MemoryStyle::Dynamic { .. } = self.config.style() {
++            return Err(MemoryError::InvalidMemory {
++                reason: "a shared memory must be static, so that it never moves".to_string(),
++            });
++        }
++        Ok(VMSharedMemory {
+             mmap: Arc::new(RwLock::new(self.mmap)),
+             config: self.config,
+             conditions: ThreadConditions::new(),
+-        }
++        })
+     }
+ 
+     /// Copies this memory to a new memory
+@@ -406,7 +431,7 @@ impl VMSharedMemory {
+     /// This creates a `Memory` with owned metadata: this can be used to create a memory
+     /// that will be imported into Wasm modules.
+     pub fn new(memory: &MemoryType, style: &MemoryStyle) -> Result<Self, MemoryError> {
+-        Ok(VMOwnedMemory::new(memory, style)?.to_shared())
++        VMOwnedMemory::new(memory, style)?.to_shared()
+     }
+ 
+     /// Create a new linear memory instance with specified minimum and maximum number of wasm pages.
+@@ -422,7 +447,7 @@ impl VMSharedMemory {
+         vm_memory_location: NonNull<VMMemoryDefinition>,
+     ) -> Result<Self, MemoryError> {
+         let owned = unsafe { VMOwnedMemory::from_definition(memory, style, vm_memory_location)? };
+-        Ok(owned.to_shared())
++        owned.to_shared()
+     }
+ 
+     /// Copies this memory to a new memory
+@@ -676,3 +701,61 @@ pub unsafe fn initialize_memory_with_data(
+ 
+     Ok(())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn static_bound_16() -> MemoryStyle {
++        MemoryStyle::Static {
++            bound: Pages(16),
++            offset_guard_size: 0,
++        }
++    }
++
++    #[test]
++    fn a_static_memory_must_reserve_its_full_maximum() {
++        // Short of its maximum, or with none declared, the memory would have to
++        // move to grow past its bound.
++        for (case, maximum) in [("maximum 32", Some(32u32)), ("no maximum", None)] {
++            match VMOwnedMemory::new(&MemoryType::new(1u32, maximum, false), &static_bound_16()) {
++                Err(MemoryError::InvalidMemory { .. }) => {}
++                Err(other) => panic!("{case}: refused with the wrong error: {other}"),
++                Ok(_) => panic!("{case}: a static memory short of its maximum was made"),
++            }
++            assert!(
++                matches!(
++                    VMSharedMemory::new(&MemoryType::new(1u32, maximum, true), &static_bound_16()),
++                    Err(MemoryError::InvalidMemory { .. })
++                ),
++                "{case}: a shared memory short of its maximum was made"
++            );
++        }
++        // A bound that covers the maximum is accepted, owned or shared.
++        VMOwnedMemory::new(
++            &MemoryType::new(1u32, Some(16u32), false),
++            &static_bound_16(),
++        )
++        .unwrap();
++        VMSharedMemory::new(
++            &MemoryType::new(1u32, Some(16u32), true),
++            &static_bound_16(),
++        )
++        .unwrap();
++    }
++
++    #[test]
++    fn a_shared_memory_must_be_static() {
++        let dynamic = MemoryStyle::Dynamic {
++            offset_guard_size: 0,
++        };
++        // An owned memory may be dynamic: its code reloads the base.
++        VMOwnedMemory::new(&MemoryType::new(1u32, Some(16u32), false), &dynamic).unwrap();
++        // A shared one may not: other threads read the base without a lock.
++        match VMSharedMemory::new(&MemoryType::new(1u32, Some(16u32), true), &dynamic) {
++            Err(MemoryError::InvalidMemory { .. }) => {}
++            Err(other) => panic!("refused with the wrong error: {other}"),
++            Ok(_) => panic!("a dynamic shared memory was made"),
++        }
++    }
++}
+diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
+index de28f44..6d2c6d4 100644
+--- a/lib/vm/src/memory.rs
++++ b/lib/vm/src/memory.rs
+@@ -328,6 +328,22 @@ impl VMOwnedMemory {
+ 
+             let offset_guard_bytes = style.offset_guard_size() as usize;
+ 
++            // Code compiled for a static memory takes its bound as a constant and
++            // may load its base once and keep it for the rest of a function, so a
++            // static memory must reserve all it can grow to: past its bound it
++            // would move under that code. One that declares no maximum can grow to
++            // the greatest size there is.
++            if let MemoryStyle::Static { bound, .. } = style
++                && *bound < memory.maximum.unwrap_or_else(Pages::max_value)
++            {
++                return Err(MemoryError::InvalidMemory {
++                    reason: format!(
++                        "a static memory's bound ({} pages) must cover its maximum",
++                        bound.0
++                    ),
++                });
++            }
++
+             let minimum_pages = match style {
+                 MemoryStyle::Dynamic { .. } => memory.minimum,
+                 MemoryStyle::Static { bound, .. } => {
+@@ -382,12 +398,21 @@ impl VMOwnedMemory {
+     }
+ 
+     /// Converts this owned memory into shared memory
+-    pub fn to_shared(self) -> VMSharedMemory {
+-        VMSharedMemory {
++    pub fn to_shared(self) -> Result<VMSharedMemory, MemoryError> {
++        // Every thread the guest runs reads a shared memory's base without a
++        // lock, so it must never move, and a dynamic memory moves when it
++        // grows past what it reserved. A static one reserves all it can grow
++        // to, which new_internal makes sure of.
++        if let MemoryStyle::Dynamic { .. } = self.config.style() {
++            return Err(MemoryError::InvalidMemory {
++                reason: "a shared memory must be static, so that it never moves".to_string(),
++            });
++        }
++        Ok(VMSharedMemory {
+             mmap: Arc::new(RwLock::new(self.mmap)),
+             config: self.config,
+             conditions: ThreadConditions::new(),
+-        }
++        })
+     }
+ 
+     /// Copies this memory to a new memory
+@@ -476,7 +501,7 @@ impl VMSharedMemory {
+     /// This creates a `Memory` with owned metadata: this can be used to create a memory
+     /// that will be imported into Wasm modules.
+     pub fn new(memory: &MemoryType, style: &MemoryStyle) -> Result<Self, MemoryError> {
+-        Ok(VMOwnedMemory::new(memory, style)?.to_shared())
++        VMOwnedMemory::new(memory, style)?.to_shared()
+     }
+ 
+     /// Create a new linear memory instance with specified minimum and maximum number of wasm pages
+@@ -491,7 +516,7 @@ impl VMSharedMemory {
+         backing_file: std::path::PathBuf,
+         memory_type: MmapType,
+     ) -> Result<Self, MemoryError> {
+-        Ok(VMOwnedMemory::new_with_file(memory, style, backing_file, memory_type)?.to_shared())
++        VMOwnedMemory::new_with_file(memory, style, backing_file, memory_type)?.to_shared()
+     }
+ 
+     /// Create a new linear memory instance with specified minimum and maximum number of wasm pages.
+@@ -506,9 +531,7 @@ impl VMSharedMemory {
+         style: &MemoryStyle,
+         vm_memory_location: NonNull<VMMemoryDefinition>,
+     ) -> Result<Self, MemoryError> {
+-        unsafe {
+-            Ok(VMOwnedMemory::from_definition(memory, style, vm_memory_location)?.to_shared())
+-        }
++        unsafe { VMOwnedMemory::from_definition(memory, style, vm_memory_location)?.to_shared() }
+     }
+ 
+     /// Create a new linear memory instance with specified minimum and maximum number of wasm pages
+@@ -528,14 +551,14 @@ impl VMSharedMemory {
+         memory_type: MmapType,
+     ) -> Result<Self, MemoryError> {
+         unsafe {
+-            Ok(VMOwnedMemory::from_definition_with_file(
++            VMOwnedMemory::from_definition_with_file(
+                 memory,
+                 style,
+                 vm_memory_location,
+                 backing_file,
+                 memory_type,
+             )?
+-            .to_shared())
++            .to_shared()
+         }
+     }
+ 
+@@ -919,3 +942,61 @@ where
+         None
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn static_bound_16() -> MemoryStyle {
++        MemoryStyle::Static {
++            bound: Pages(16),
++            offset_guard_size: 0,
++        }
++    }
++
++    #[test]
++    fn a_static_memory_must_reserve_its_full_maximum() {
++        // Short of its maximum, or with none declared, the memory would have to
++        // move to grow past its bound.
++        for (case, maximum) in [("maximum 32", Some(32u32)), ("no maximum", None)] {
++            match VMOwnedMemory::new(&MemoryType::new(1u32, maximum, false), &static_bound_16()) {
++                Err(MemoryError::InvalidMemory { .. }) => {}
++                Err(other) => panic!("{case}: refused with the wrong error: {other}"),
++                Ok(_) => panic!("{case}: a static memory short of its maximum was made"),
++            }
++            assert!(
++                matches!(
++                    VMSharedMemory::new(&MemoryType::new(1u32, maximum, true), &static_bound_16()),
++                    Err(MemoryError::InvalidMemory { .. })
++                ),
++                "{case}: a shared memory short of its maximum was made"
++            );
++        }
++        // A bound that covers the maximum is accepted, owned or shared.
++        VMOwnedMemory::new(
++            &MemoryType::new(1u32, Some(16u32), false),
++            &static_bound_16(),
++        )
++        .unwrap();
++        VMSharedMemory::new(
++            &MemoryType::new(1u32, Some(16u32), true),
++            &static_bound_16(),
++        )
++        .unwrap();
++    }
++
++    #[test]
++    fn a_shared_memory_must_be_static() {
++        let dynamic = MemoryStyle::Dynamic {
++            offset_guard_size: 0,
++        };
++        // An owned memory may be dynamic: its code reloads the base.
++        VMOwnedMemory::new(&MemoryType::new(1u32, Some(16u32), false), &dynamic).unwrap();
++        // A shared one may not: other threads read the base without a lock.
++        match VMSharedMemory::new(&MemoryType::new(1u32, Some(16u32), true), &dynamic) {
++            Err(MemoryError::InvalidMemory { .. }) => {}
++            Err(other) => panic!("refused with the wrong error: {other}"),
++            Ok(_) => panic!("a dynamic shared memory was made"),
++        }
++    }
++}

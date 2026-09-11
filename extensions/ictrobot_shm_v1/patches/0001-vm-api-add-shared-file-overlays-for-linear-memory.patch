@@ -168,7 +168,7 @@ index 89894b1..abefc9e 100644
  maintenance = { status = "actively-developed" }
  
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index de28f44..2a9d1b8 100644
+index 801b6b5..c8aba95 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
 @@ -1,5 +1,7 @@
@@ -240,7 +240,7 @@ index de28f44..2a9d1b8 100644
      /// Copies the memory
      /// (in this case it performs a copy-on-write to save memory)
      pub fn copy(&self) -> Result<Self, MemoryError> {
-@@ -457,6 +506,20 @@ impl LinearMemory for VMOwnedMemory {
+@@ -484,6 +533,20 @@ impl LinearMemory for VMOwnedMemory {
      fn as_shared(&self) -> Result<VMSharedMemory, MemoryError> {
          Err(MemoryError::MemoryNotShared)
      }
@@ -261,7 +261,7 @@ index de28f44..2a9d1b8 100644
  }
  
  /// A shared linear memory instance.
-@@ -548,6 +611,28 @@ impl VMSharedMemory {
+@@ -589,6 +652,28 @@ impl VMSharedMemory {
              conditions: ThreadConditions::new(),
          })
      }
@@ -290,7 +290,7 @@ index de28f44..2a9d1b8 100644
  }
  
  impl LinearMemory for VMSharedMemory {
-@@ -616,6 +701,20 @@ impl LinearMemory for VMSharedMemory {
+@@ -672,6 +757,20 @@ impl LinearMemory for VMSharedMemory {
          Ok(self.clone())
      }
  
@@ -311,7 +311,7 @@ index de28f44..2a9d1b8 100644
      // Add current thread to waiter list
      unsafe fn do_wait(
          &mut self,
-@@ -722,6 +821,20 @@ impl LinearMemory for VMMemory {
+@@ -782,6 +881,20 @@ impl LinearMemory for VMMemory {
          self.0.as_shared()
      }
  
@@ -332,7 +332,7 @@ index de28f44..2a9d1b8 100644
      // Add current thread to waiter list
      unsafe fn do_wait(
          &mut self,
-@@ -890,6 +1003,26 @@ where
+@@ -960,6 +1073,26 @@ where
          Err(MemoryError::MemoryNotShared)
      }
  

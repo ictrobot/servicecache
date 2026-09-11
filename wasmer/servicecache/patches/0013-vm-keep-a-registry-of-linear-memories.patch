@@ -28,7 +28,7 @@ index 52770bf..6054d8f 100644
  pub use crate::mmap::{Mmap, MmapType};
  pub use crate::probestack::PROBESTACK;
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index 2a9d1b8..e638de0 100644
+index c8aba95..6dc2c61 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
 @@ -2,6 +2,10 @@
@@ -202,7 +202,7 @@ index 2a9d1b8..e638de0 100644
      }
  }
  
-@@ -389,6 +505,7 @@ impl VMOwnedMemory {
+@@ -405,6 +521,7 @@ impl VMOwnedMemory {
              let mapped_pages = memory.minimum;
              let mapped_bytes = mapped_pages.bytes();
  
@@ -210,7 +210,7 @@ index 2a9d1b8..e638de0 100644
              let mut alloc =
                  Mmap::accessible_reserved(mapped_bytes.0, request_bytes, backing_file, memory_type)
                      .map_err(MemoryError::Region)?;
-@@ -417,6 +534,7 @@ impl VMOwnedMemory {
+@@ -433,6 +550,7 @@ impl VMOwnedMemory {
                  alloc,
                  size: Bytes::from(mem_length).try_into().unwrap(),
              };

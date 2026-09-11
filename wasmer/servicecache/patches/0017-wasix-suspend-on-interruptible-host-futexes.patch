@@ -40,7 +40,7 @@ index 7a39208..ce1d729 100644
   "wasmparser 0.256.0",
   "wcgi",
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index e638de0..59dc506 100644
+index 6dc2c61..5fa8a97 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
 @@ -54,6 +54,9 @@ struct RegisteredMemory {
@@ -129,7 +129,7 @@ index e638de0..59dc506 100644
          Ok(copy)
      }
  }
-@@ -533,8 +571,17 @@ impl VMOwnedMemory {
+@@ -549,8 +587,17 @@ impl VMOwnedMemory {
                  },
                  alloc,
                  size: Bytes::from(mem_length).try_into().unwrap(),

@@ -14,3 +14,5 @@
 0014-wasix-do-less-on-the-syscall-entry-path-when-nothing.patch
 0015-wasix-keep-clock-offsets-in-atomics-instead-of-a-loc.patch
 0016-virtual-io-keep-interest-wakers-in-fixed-slots-inste.patch
+0017-vm-refuse-a-memory-that-could-move-under-code-that-a.patch
+0018-vm-read-a-shared-memory-s-definition-without-its-loc.patch
