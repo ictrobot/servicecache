@@ -17,11 +17,10 @@ fi
 sc_init "${1:?usage: $0 [--sources] service version}" \
   "${2:?usage: $0 [--sources] service version}"
 
-rm -rf "$SC_BUILD" "$SC_OUT/$SC_SERVICE-$SC_VERSION"
+rm -rf "$SC_OUT/$SC_SERVICE-$SC_VERSION"
 
 if [[ "$sources" -eq 1 ]]; then
-  rm -rf "$SC_SRC"
-elif [[ -e "$SC_SRC/.git" ]]; then
-  git -C "$SC_SRC" checkout --quiet -- .
-  git -C "$SC_SRC" clean --quiet -fdx
+  rm -rf "$SC_BUILD" "$SC_SRC"
+else
+  sc_reset_build_state
 fi

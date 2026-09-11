@@ -3,6 +3,7 @@ set -euo pipefail
 
 source "$(dirname "$0")/../../toolchain/lib.sh"
 sc_init beanstalkd "${1:?usage: $0 version}"
+sc_clean_if_toolchain_changed
 : "${SC_SOURCE_URL:=https://github.com/beanstalkd/beanstalkd.git}"
 : "${BEANSTALKD_TAG:=v$SC_VERSION}"
 sc_checkout "$SC_SOURCE_URL" "$BEANSTALKD_TAG" "$SC_SRC"

@@ -299,6 +299,51 @@ sc_sysroot_patch_hash() {
   done < "$patch_dir/series" | sha256sum | cut -d' ' -f1
 }
 
+# The toolchain a service version is compiled and linked with, one
+# "name: value" line per pin: what BUILD-INFO records, and what
+# sc_clean_if_toolchain_changed compares a build tree against.
+sc_toolchain_identity() {
+  echo "wasixcc: $WASIXCC_VERSION"
+  echo "WASIX sysroot: $WASIX_SYSROOT_TAG"
+  echo "WASIX sysroot patches: $(sc_sysroot_patch_hash)"
+  echo "WASIX LLVM: $WASIX_LLVM_TAG"
+  echo "Binaryen: $BINARYEN_TAG"
+}
+
+# Returns a version's build state to what a first build starts from: the
+# build directory removed and the source checkout reset to the pristine
+# upstream tag, so the next build re-applies the patch series and compiles
+# everything. The assembled package is left alone.
+sc_reset_build_state() {
+  rm -rf "$SC_BUILD"
+  if [[ -e "$SC_SRC/.git" ]]; then
+    git -C "$SC_SRC" checkout --quiet -- .
+    git -C "$SC_SRC" clean --quiet -fdx
+  fi
+}
+
+# The service builds are incremental, and neither make nor CMake notices that
+# the libc or the compiler changed, so a tree left by another toolchain would
+# relink nothing and its old binaries would be assembled under a BUILD-INFO
+# naming the new one. The build directory carries the identity of the
+# toolchain that built it; when that is missing or differs from the current
+# one, the build state is reset before building. Call it after sc_init and
+# before sc_checkout.
+sc_clean_if_toolchain_changed() {
+  local stamp="$SC_BUILD/.sc-toolchain" identity
+  identity="$(sc_toolchain_identity)"
+  if [[ -f "$stamp" && "$(cat "$stamp")" == "$identity" ]]; then
+    return 0
+  fi
+  if [[ -e "$SC_BUILD" || -e "$SC_SRC/.git" ]]; then
+    echo "$SC_SERVICE $SC_VERSION: the build tree is not stamped with the" \
+      "current toolchain; building from a clean tree" >&2
+    sc_reset_build_state
+  fi
+  mkdir -p "$SC_BUILD"
+  printf '%s\n' "$identity" > "$stamp"
+}
+
 sc_write_build_info() {
   local out_dir="${SC_OUT_DIR:?sc_assemble must run before sc_write_build_info}"
   local upstream_tag="${SC_UPSTREAM_TAG:?sc_checkout must run before sc_write_build_info}"
@@ -310,11 +355,7 @@ sc_write_build_info() {
     echo "Version: $SC_VERSION"
     echo "Upstream tag: $upstream_tag"
     echo "ServiceCache commit: $servicecache_commit"
-    echo "wasixcc: $WASIXCC_VERSION"
-    echo "WASIX sysroot: $WASIX_SYSROOT_TAG"
-    echo "WASIX sysroot patches: $(sc_sysroot_patch_hash)"
-    echo "WASIX LLVM: $WASIX_LLVM_TAG"
-    echo "Binaryen: $BINARYEN_TAG"
+    sc_toolchain_identity
     echo "Wasmer: $WASMER_VERSION"
     echo "Guest extensions: ${SC_GUEST_EXTENSIONS:-none}"
   } > "$out_dir/BUILD-INFO"

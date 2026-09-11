@@ -3,6 +3,7 @@ set -euo pipefail
 
 source "$(dirname "$0")/../../toolchain/lib.sh"
 sc_init postgresql "${1:?usage: $0 version}"
+sc_clean_if_toolchain_changed
 : "${SC_SOURCE_URL:=https://github.com/postgres/postgres.git}"
 : "${POSTGRESQL_TAG:=REL_${SC_VERSION//./_}}"
 sc_checkout "$SC_SOURCE_URL" "$POSTGRESQL_TAG" "$SC_SRC"

@@ -155,7 +155,8 @@ service-$(1)-$(2): bootstrap
 
 work/services/$(1)-$(2)/BUILD-INFO: services/$(1)/build.sh services/$(1)/service.toml \
     $$(wildcard services/$(1)/deps.sh) services/$(1)/versions/$(2)/version.env \
-    $$(shell find -L services/$(1)/versions/$(2)/patches -type f) | bootstrap
+    $$(shell find -L services/$(1)/versions/$(2)/patches -type f) \
+    toolchain/versions.sh patches/wasix-libc/series $$(wildcard patches/wasix-libc/*.patch) | bootstrap
 	services/$(1)/build.sh $(2)
 
 smoke-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO
