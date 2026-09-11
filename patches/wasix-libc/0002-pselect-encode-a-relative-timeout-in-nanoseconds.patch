@@ -1,0 +1,64 @@
+Subject: pselect: encode a relative timeout in nanoseconds
+
+`pselect()` built its clock subscription with `timespec_to_timestamp_clamp()`,
+a helper written for absolute timestamps: for `tv_sec <= 0` it stores the
+timestamp 1, which the runtime reads as "return immediately". A `pselect()`
+timeout is not a point in time but how long to wait, so every timeout under
+one second - which is every timeout an event loop with a sub-second tick
+passes - asked for an immediate return, and a program that expected to sleep
+spun instead: an event loop that waits in `select()` never slept between
+iterations, and burnt CPU polling its descriptors with nothing to do.
+
+`poll()` in the same tree does not share the bug: it encodes
+`timeout * 1000000` nanoseconds and uses 1 only for a timeout of exactly
+zero, because a subscription timeout of zero means an indefinite wait. This
+does the same with `tv_sec * 1000000000 + tv_nsec`, saturating rather than
+overflowing, and answers `EINVAL` for a negative or out-of-range timespec,
+which is what POSIX asks for and what the clamp hid.
+
+diff --git a/libc-bottom-half/cloudlibc/src/libc/sys/select/pselect.c b/libc-bottom-half/cloudlibc/src/libc/sys/select/pselect.c
+--- a/libc-bottom-half/cloudlibc/src/libc/sys/select/pselect.c
++++ b/libc-bottom-half/cloudlibc/src/libc/sys/select/pselect.c
+@@ -1,6 +1,8 @@
+ // Copyright (c) 2015-2016 Nuxi, https://nuxi.nl/
+ //
+ // SPDX-License-Identifier: BSD-2-Clause
++//
++// Modified for ServiceCache: encode the relative timeout in nanoseconds.
+ 
+ #include <common/time.h>
+ 
+@@ -66,15 +68,29 @@ int pselect(int nfds, fd_set *restrict readfds, fd_set *restrict writefds,
+ 
+   // Create extra event for the timeout.
+   if (timeout != NULL) {
++    // The timeout is how long to wait, not a point in time, so it is encoded
++    // in nanoseconds here as poll() does rather than through
++    // timespec_to_timestamp_clamp(), which is written for absolute
++    // timestamps: its "before the Epoch" case stores 1, so every timeout
++    // under one second became an immediate poll. As in poll(), 1 is used for
++    // a timeout of exactly zero, because a subscription timeout of zero is
++    // an indefinite wait.
++    if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
++        timeout->tv_nsec >= NSEC_PER_SEC) {
++      errno = EINVAL;
++      return -1;
++    }
++    __wasi_timestamp_t nanoseconds;
++    if (__builtin_mul_overflow(timeout->tv_sec, NSEC_PER_SEC, &nanoseconds) ||
++        __builtin_add_overflow(nanoseconds, timeout->tv_nsec, &nanoseconds)) {
++      nanoseconds = NUMERIC_MAX(__wasi_timestamp_t);
++    }
+     __wasi_subscription_t *subscription = &subscriptions[nsubscriptions++];
+     *subscription = (__wasi_subscription_t){
+         .u.tag = __WASI_EVENTTYPE_CLOCK,
+         .u.u.clock.id = __WASI_CLOCKID_REALTIME,
++        .u.u.clock.timeout = nanoseconds != 0 ? nanoseconds : 1,
+     };
+-    if (!timespec_to_timestamp_clamp(timeout, &subscription->u.u.clock.timeout)) {
+-      errno = EINVAL;
+-      return -1;
+-    }
+   }
+ 
+   // Execute poll().

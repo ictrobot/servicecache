@@ -219,10 +219,11 @@ run_smoke() {
   "$WASIXCC_DIR/bin/wasixcc" -O2 \
     "$SC_ROOT/toolchain/smoke/netprobe.c" -o "$build_dir/netprobe.wasm"
 
-  # The libc patch (patches/wasix-libc): two threads making relative-path
-  # syscalls at once must not corrupt each other's paths. Fails on the
-  # unpatched libc. Once per patched sysroot variant that runs as a plain
-  # module.
+  # The libc patches (patches/wasix-libc), once per patched sysroot variant
+  # that runs as a plain module; each fixture fails on the unpatched libc.
+  # Two threads making relative-path syscalls at once must not corrupt each
+  # other's paths, and select() and pselect() must wait for a timeout under
+  # one second rather than return at once.
   local flags
   for flags in "" "-fno-exceptions"; do
     # shellcheck disable=SC2086
@@ -230,8 +231,16 @@ run_smoke() {
       "$SC_ROOT/toolchain/smoke/relpath-race.c" -o "$build_dir/relpath-race.wasm"
     "$WASMER_DIR/bin/wasmer" run "$build_dir/relpath-race.wasm" > /dev/null ||
       fail "relative-path race smoke test failed (wasixcc ${flags:-default flags})"
+    # shellcheck disable=SC2086
+    "$WASIXCC_DIR/bin/wasixcc" -O2 $flags \
+      "$SC_ROOT/toolchain/smoke/select-sleeps.c" -o "$build_dir/select-sleeps.wasm"
+    output="$("$WASMER_DIR/bin/wasmer" run "$build_dir/select-sleeps.wasm")" ||
+      fail "select timeout smoke test failed (wasixcc ${flags:-default flags})"
+    [[ "$output" == "WASIX select and pselect wait for their timeouts" ]] ||
+      fail "select timeout smoke test returned unexpected output: $output"
   done
   echo "WASIX relative-path race test passed"
+  echo "WASIX select and pselect wait for their timeouts"
 
   # Guest fixtures for the fixes patch set run under the fixes variant:
   # stock does not carry the behaviour they test. PATH covers their
