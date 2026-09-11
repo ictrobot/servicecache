@@ -1,16 +1,34 @@
 Subject: wasix: support multiple epoll registrations per file
 
-The virtual epoll kept one interest registration per file, so adding
-the same file to a second epoll instance displaced the first waiter,
-and one readiness transition woke only one set. Linux gives each epoll
-instance its own registration, and multi-process servers rely on that:
-a latch self-pipe sits in several wait-event sets, and a signal
-handler's write must wake whichever set is being waited on. Keep an
-EpollInterestRegistry of independent registrations per file and fan
+The virtual epoll kept one interest registration per file, so adding the
+same file to a second epoll instance displaced the first waiter, and one
+readiness transition woke only one set. Linux gives each epoll instance
+its own registration, and multi-process servers rely on that: a self-
+pipe a process wakes itself through sits in several epoll sets, and a
+signal handler's write must wake whichever set is being waited on. Keep
+an EpollInterestRegistry of independent registrations per file and fan
 readiness out to every interested epoll instance. Every subscription
-reinstalls a socket source's selector registration, so one that
-arrives on a live descriptor - an interest switch after a request -
-snapshots the level-triggered readiness it joined.
+reinstalls a socket source's selector registration, so one that arrives
+on a live descriptor - an interest switch after a request - snapshots
+the level-triggered readiness it joined.
+
+Dispatch must not run a handler while the registry lock is held. A
+handler holds weak references to the epoll set it belongs to, and when
+a guest closes that set just as readiness is on its way, the upgrade
+the handler makes is the last strong reference: dropping it at the end
+of the call drops the set, its subscriptions and their join guards,
+and every one of those guards unsubscribes from this registry. Taking
+the registry lock again on the same thread would wedge the runtime's
+selector, and with it every socket in the process, so each
+registration carries its own lock, the registry lock only copies the
+registrations out, and the handlers are called with it released. The
+dispatcher owns the buffer they are copied into and empties it after
+each dispatch, so a steady stream of events allocates nothing and no
+registration is held between events. A registration removed while a
+dispatch is in flight may still be called by it once, which is
+harmless: its handler's weak references fail to upgrade once the epoll
+set is gone, and an event it queues for a subscription already deleted
+is dropped as stale when the set is drained.
 
 diff --git a/lib/wasix/src/fs/fd.rs b/lib/wasix/src/fs/fd.rs
 index ee9e945..93d2631 100644
@@ -74,7 +92,7 @@ index c1dcd7f..412224d 100644
          };
          self.fd_map.write().unwrap().insert(
 diff --git a/lib/wasix/src/os/epoll/mod.rs b/lib/wasix/src/os/epoll/mod.rs
-index a0731d6..2c0ada5 100644
+index a0731d6..f4227c9 100644
 --- a/lib/wasix/src/os/epoll/mod.rs
 +++ b/lib/wasix/src/os/epoll/mod.rs
 @@ -40,7 +40,7 @@
@@ -86,14 +104,18 @@ index a0731d6..2c0ada5 100644
          atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
      },
  };
-@@ -128,44 +128,125 @@ impl EpollFd {
+@@ -128,44 +128,158 @@ impl EpollFd {
      }
  }
  
++/// One registration. Each handler carries its own lock so that dispatch
++/// can call it with the registry lock released.
++type Registration = Arc<StdMutex<Box<dyn InterestHandler>>>;
++
 +#[derive(Debug, Default)]
 +struct EpollInterestRegistryInner {
 +    next_id: u64,
-+    handlers: FnvHashMap<u64, Box<dyn InterestHandler>>,
++    handlers: FnvHashMap<u64, Registration>,
 +}
 +
 +/// Fans readiness from a source's single handler slot out to every epoll
@@ -116,7 +138,7 @@ index a0731d6..2c0ada5 100644
 +            let mut inner = self.inner.lock().unwrap();
 +            let id = inner.next_id;
 +            inner.next_id = inner.next_id.wrapping_add(1);
-+            inner.handlers.insert(id, handler);
++            inner.handlers.insert(id, Arc::new(StdMutex::new(handler)));
 +            id
 +        };
 +
@@ -128,9 +150,7 @@ index a0731d6..2c0ada5 100644
 +        // spurious level events the others receive are within epoll
 +        // semantics. The lock is not held across the install, because the
 +        // replay re-enters the registry to dispatch.
-+        match install(Box::new(EpollInterestDispatcher {
-+            registry: self.clone(),
-+        })) {
++        match install(Box::new(EpollInterestDispatcher::new(self.clone()))) {
 +            Ok(()) => Ok(id),
 +            Err(error) => {
 +                self.inner.lock().unwrap().handlers.remove(&id);
@@ -143,6 +163,24 @@ index a0731d6..2c0ada5 100644
 +        self.inner.lock().unwrap().handlers.remove(&id);
 +    }
 +
++    /// Copies the registrations to call into the caller's buffer. Dispatch
++    /// must not hold the registry lock while a handler runs: an
++    /// EpollHandler upgrades its weak references, and when the guest has
++    /// just closed that epoll set the upgrade it drops at the end of the
++    /// call is the last strong reference, so the drop runs the set's join
++    /// guards, each of which unsubscribes here. Taking the lock again on
++    /// the dispatching thread would deadlock the selector and silence
++    /// every socket in the process, so the registrations are copied out,
++    /// the lock released, and each handler called under its own lock. A
++    /// registration removed in the meantime may still be called once, which
++    /// is harmless: its weak references fail to upgrade once the epoll set
++    /// is gone, and an event queued for a deleted subscription is dropped as
++    /// stale when the set is drained.
++    fn snapshot_into(&self, out: &mut Vec<Registration>) {
++        out.clear();
++        out.extend(self.inner.lock().unwrap().handlers.values().cloned());
++    }
++
 +    #[cfg(test)]
 +    fn handler_count(&self) -> usize {
 +        self.inner.lock().unwrap().handlers.len()
@@ -152,35 +190,48 @@ index a0731d6..2c0ada5 100644
 +#[derive(Debug)]
 +struct EpollInterestDispatcher {
 +    registry: Arc<EpollInterestRegistry>,
++    /// The registrations of the dispatch in progress. Kept between events
++    /// so that the steady state allocates nothing, and emptied again at
++    /// the end of every dispatch so that it holds no registration alive.
++    /// One small buffer per watched source.
++    scratch: Vec<Registration>,
++}
++
++impl EpollInterestDispatcher {
++    fn new(registry: Arc<EpollInterestRegistry>) -> Self {
++        Self {
++            registry,
++            scratch: Vec::new(),
++        }
++    }
 +}
 +
 +impl InterestHandler for EpollInterestDispatcher {
 +    fn push_interest(&mut self, interest: InterestType) {
-+        for handler in self.registry.inner.lock().unwrap().handlers.values_mut() {
-+            handler.push_interest(interest);
++        self.registry.snapshot_into(&mut self.scratch);
++        for handler in &self.scratch {
++            handler.lock().unwrap().push_interest(interest);
 +        }
++        self.scratch.clear();
 +    }
 +
 +    fn pop_interest(&mut self, interest: InterestType) -> bool {
-+        self.registry
-+            .inner
-+            .lock()
-+            .unwrap()
-+            .handlers
-+            .values_mut()
-+            .fold(false, |popped, handler| {
-+                handler.pop_interest(interest) || popped
-+            })
++        self.registry.snapshot_into(&mut self.scratch);
++        let mut popped = false;
++        for handler in &self.scratch {
++            popped |= handler.lock().unwrap().pop_interest(interest);
++        }
++        self.scratch.clear();
++        popped
 +    }
 +
 +    fn has_interest(&self, interest: InterestType) -> bool {
-+        self.registry
-+            .inner
-+            .lock()
-+            .unwrap()
-+            .handlers
-+            .values()
-+            .any(|handler| handler.has_interest(interest))
++        // The one path without a buffer to reuse, and the rare one.
++        let mut handlers = Vec::new();
++        self.registry.snapshot_into(&mut handlers);
++        handlers
++            .into_iter()
++            .any(|handler| handler.lock().unwrap().has_interest(interest))
 +    }
 +}
 +
@@ -240,7 +291,7 @@ index a0731d6..2c0ada5 100644
      }
  }
  
-@@ -526,18 +607,23 @@ pub(crate) fn drain_ready_events(
+@@ -526,18 +640,23 @@ pub(crate) fn drain_ready_events(
  struct EpollHandler {
      /// Watched fd associated with the subscription.
      fd: WasiFd,
@@ -270,7 +321,7 @@ index a0731d6..2c0ada5 100644
          })
      }
  }
-@@ -546,16 +632,20 @@ impl InterestHandler for EpollHandler {
+@@ -546,16 +665,20 @@ impl InterestHandler for EpollHandler {
      /// Producer path:
      /// set pending bits, enqueue once, and wake one waiter.
      fn push_interest(&mut self, interest: InterestType) {
@@ -295,7 +346,7 @@ index a0731d6..2c0ada5 100644
          } else {
              EPOLL_ENQUEUE_DEDUPE_HITS.fetch_add(1, Ordering::Relaxed);
          }
-@@ -563,18 +653,21 @@ impl InterestHandler for EpollHandler {
+@@ -563,18 +686,21 @@ impl InterestHandler for EpollHandler {
  
      /// Clears one readiness bit from this subscription only.
      fn pop_interest(&mut self, interest: InterestType) -> bool {
@@ -322,7 +373,7 @@ index a0731d6..2c0ada5 100644
      }
  }
  
-@@ -587,6 +680,7 @@ pub(crate) fn register_epoll_handler(
+@@ -587,6 +713,7 @@ pub(crate) fn register_epoll_handler(
      epoll_state: Arc<EpollState>,
      sub_state: Arc<EpollSubState>,
  ) -> Result<Option<EpollJoinGuard>, Errno> {
@@ -330,7 +381,7 @@ index a0731d6..2c0ada5 100644
      let mut type_ = Eventtype::FdRead;
      let mut peb = PollEventBuilder::new();
      if event.events().contains(EpollType::EPOLLOUT) {
-@@ -619,20 +713,6 @@ pub(crate) fn register_epoll_handler(
+@@ -619,20 +746,6 @@ pub(crate) fn register_epoll_handler(
              // Intentionally ignored, epoll doesn't work with files
              return Ok(None);
          }
@@ -351,7 +402,7 @@ index a0731d6..2c0ada5 100644
          InodeValFilePollGuardMode::PipeTx { .. } => {
              // The sending end of a pipe can't have an interest handler, since we
              // only support "readable" interest on pipes; they're considered to
-@@ -640,11 +720,51 @@ pub(crate) fn register_epoll_handler(
+@@ -640,11 +753,51 @@ pub(crate) fn register_epoll_handler(
              prime_immediate_writable_if_applicable(event, &fd_guard, &epoll_state, &sub_state);
              return Ok(None);
          }
@@ -375,9 +426,9 @@ index a0731d6..2c0ada5 100644
 +                    // dispatcher behind on a best-effort basis so the
 +                    // failure deafens only this subscription, not every
 +                    // registration on the descriptor.
-+                    let _ = inner.set_handler(Box::new(EpollInterestDispatcher {
-+                        registry: registry_for_error.clone(),
-+                    }));
++                    let _ = inner.set_handler(Box::new(EpollInterestDispatcher::new(
++                        registry_for_error.clone(),
++                    )));
 +                    return Err(net_error_into_io_err(error).into());
 +                }
 +            }
@@ -404,7 +455,58 @@ index a0731d6..2c0ada5 100644
  }
  
  /// Increments stale-generation dequeue metric.
-@@ -779,6 +899,44 @@ mod tests {
+@@ -692,6 +845,50 @@ mod tests {
+         (epoll_state, sub_state, handler)
+     }
+ 
++    fn test_poll_guard(fd: WasiFd) -> InodeValFilePollGuard {
++        let (tx, _rx) = Pipe::new().split();
++        InodeValFilePollGuard {
++            fd,
++            peb: PollEventBuilder::new().build(),
++            subscription: Subscription {
++                userdata: 0,
++                type_: Eventtype::FdRead,
++                data: SubscriptionUnion {
++                    fd_readwrite: SubscriptionFsReadwrite {
++                        file_descriptor: fd,
++                    },
++                },
++            },
++            mode: InodeValFilePollGuardMode::PipeTx {
++                tx: Arc::new(RwLock::new(Box::new(tx))),
++            },
++        }
++    }
++
++    /// A handler that drops a registration while it is being dispatched
++    /// to, which is what an EpollHandler does when the weak upgrade it
++    /// makes during dispatch is the last reference to a just-closed epoll
++    /// set: dropping the temporary drops the set's join guards, and each
++    /// of those unsubscribes from the registry that is dispatching.
++    #[derive(Debug)]
++    struct UnsubscribeOnDispatch {
++        guard: Arc<StdMutex<Option<EpollJoinGuard>>>,
++    }
++
++    impl InterestHandler for UnsubscribeOnDispatch {
++        fn push_interest(&mut self, _interest: InterestType) {
++            self.guard.lock().unwrap().take();
++        }
++
++        fn pop_interest(&mut self, _interest: InterestType) -> bool {
++            false
++        }
++
++        fn has_interest(&self, _interest: InterestType) -> bool {
++            false
++        }
++    }
++
+     fn test_sub_state(fd: WasiFd, generation: u64) -> Arc<EpollSubState> {
+         Arc::new(EpollSubState::new(
+             EpollFd::new(
+@@ -779,6 +976,103 @@ mod tests {
          );
      }
  
@@ -446,18 +548,73 @@ index a0731d6..2c0ada5 100644
 +        assert_eq!(epoll_b.ready.lock().unwrap().len(), 1);
 +    }
 +
++    #[test]
++    fn epoll_interest_registry_dispatches_without_holding_its_lock() {
++        let registry = Arc::new(EpollInterestRegistry::default());
++        let dispatcher = Arc::new(StdMutex::new(None));
++        let guard = Arc::new(StdMutex::new(None));
++
++        let dispatcher_out = dispatcher.clone();
++        let registration = registry
++            .subscribe(
++                Box::new(UnsubscribeOnDispatch {
++                    guard: guard.clone(),
++                }),
++                move |handler| {
++                    *dispatcher_out.lock().unwrap() = Some(handler);
++                    Ok::<(), ()>(())
++                },
++            )
++            .unwrap();
++        // A second registration must receive readiness as well, whichever
++        // order the registry dispatches the two in.
++        let (epoll_state, sub_state, handler) = test_epoll_handler(56);
++        let dispatcher_out = dispatcher.clone();
++        registry
++            .subscribe(handler, move |handler| {
++                *dispatcher_out.lock().unwrap() = Some(handler);
++                Ok::<(), ()>(())
++            })
++            .unwrap();
++        *guard.lock().unwrap() = Some(EpollJoinGuard::new(
++            test_poll_guard(55),
++            registry.clone(),
++            registration,
++        ));
++
++        // Dispatch on another thread: a registry lock held across the
++        // handler call deadlocks the caller outright, and the suite must
++        // fail rather than hang.
++        let (finished, wait_for_finish) = std::sync::mpsc::channel();
++        let dispatch = dispatcher.clone();
++        std::thread::spawn(move || {
++            dispatch
++                .lock()
++                .unwrap()
++                .as_mut()
++                .unwrap()
++                .push_interest(InterestType::Readable);
++            let _ = finished.send(());
++        });
++        wait_for_finish
++            .recv_timeout(std::time::Duration::from_secs(10))
++            .expect("dispatch deadlocked on the registry lock");
++
++        // The handler that unsubscribed is gone, and the other one still
++        // received the event.
++        assert_eq!(registry.handler_count(), 1);
++        assert_ne!(sub_state.pending_bits(), 0);
++        assert_eq!(epoll_state.ready.lock().unwrap().len(), 1);
++    }
++
      #[test]
      fn epoll_type_to_pending_bit_has_stable_mapping() {
          assert_eq!(
-@@ -914,23 +1072,31 @@ mod tests {
+@@ -914,23 +1208,15 @@ mod tests {
          let sub = Arc::new(EpollSubState::new(EpollFd::from_event_ctl(55, &event), 1));
          epoll_state.insert_subscription(55, sub.clone());
  
-+        let registry = Arc::new(EpollInterestRegistry::default());
-+        let (_, _, handler) = test_epoll_handler(55);
-+        let registration = registry.subscribe(handler, |_| Ok::<(), ()>(())).unwrap();
-+
-         let (tx, _rx) = Pipe::new().split();
+-        let (tx, _rx) = Pipe::new().split();
 -        sub.add_join(EpollJoinGuard::new(InodeValFilePollGuard {
 -            fd: 55,
 -            peb: PollEventBuilder::new().build(),
@@ -467,34 +624,26 @@ index a0731d6..2c0ada5 100644
 -                data: SubscriptionUnion {
 -                    fd_readwrite: SubscriptionFsReadwrite {
 -                        file_descriptor: 55,
-+        sub.add_join(EpollJoinGuard::new(
-+            InodeValFilePollGuard {
-+                fd: 55,
-+                peb: PollEventBuilder::new().build(),
-+                subscription: Subscription {
-+                    userdata: 0,
-+                    type_: Eventtype::FdRead,
-+                    data: SubscriptionUnion {
-+                        fd_readwrite: SubscriptionFsReadwrite {
-+                            file_descriptor: 55,
-+                        },
-                     },
-                 },
-+                mode: InodeValFilePollGuardMode::PipeTx {
-+                    tx: Arc::new(RwLock::new(Box::new(tx))),
-+                },
-             },
+-                    },
+-                },
+-            },
 -            mode: InodeValFilePollGuardMode::PipeTx {
 -                tx: Arc::new(RwLock::new(Box::new(tx))),
 -            },
 -        }));
++        let registry = Arc::new(EpollInterestRegistry::default());
++        let (_, _, handler) = test_epoll_handler(55);
++        let registration = registry.subscribe(handler, |_| Ok::<(), ()>(())).unwrap();
++
++        sub.add_join(EpollJoinGuard::new(
++            test_poll_guard(55),
 +            registry.clone(),
 +            registration,
 +        ));
  
          let leaked_ref = sub.clone();
          assert_eq!(leaked_ref.joins.lock().unwrap().len(), 1);
-@@ -938,5 +1104,6 @@ mod tests {
+@@ -938,5 +1224,6 @@ mod tests {
          epoll_state.apply_del(55).unwrap();
  
          assert_eq!(leaked_ref.joins.lock().unwrap().len(), 0);

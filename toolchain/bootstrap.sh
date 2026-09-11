@@ -198,6 +198,7 @@ install_wasmer() {
 }
 
 run_smoke() {
+  require_command timeout
   local build_dir="$SC_ROOT/work/build/toolchain-smoke"
   local module="$build_dir/wasix_cpp.wasm"
   local output expected
@@ -239,7 +240,12 @@ run_smoke() {
     fail "could not build the fixes Wasmer CLI (wasmer/build.sh fixes)"
   run_fixes_expecting() {
     local module="$1" expected="$2" output
-    output="$("$SC_ROOT/work/wasmer/fixes/bin/wasmer" run --net \
+    local -a watchdog=()
+    if [[ -n "${3:-}" ]]; then
+      # A runtime deadlock can also prevent a guest watchdog from exiting.
+      watchdog=(timeout --kill-after=2s "$3")
+    fi
+    output="$("${watchdog[@]}" "$SC_ROOT/work/wasmer/fixes/bin/wasmer" run --net \
       --volume "$SC_ROOT:$SC_ROOT" --cwd "$build_dir" \
       --env "PATH=$build_dir" "$build_dir/$module")" ||
       fail "$module failed under the fixes variant"
@@ -256,6 +262,11 @@ run_smoke() {
     -o "$build_dir/epoll-interest-switch.wasm"
   run_fixes_expecting epoll-interest-switch.wasm \
     "WASIX epoll interest switch keeps level readiness"
+  "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread \
+    "$SC_ROOT/toolchain/smoke/epoll-close-during-dispatch.c" \
+    -o "$build_dir/epoll-close-during-dispatch.wasm"
+  run_fixes_expecting epoll-close-during-dispatch.wasm \
+    "WASIX epoll sets close during dispatch without wedging the selector" 20s
   "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread \
     "$SC_ROOT/toolchain/smoke/signal-during-handler.c" \
     -o "$build_dir/signal-during-handler.wasm"
