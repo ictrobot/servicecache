@@ -9,3 +9,4 @@
 0009-wasix-recheck-pending-signals-before-a-wait-sleeps-a.patch
 0010-wasix-do-not-interrupt-a-syscall-that-cannot-block.patch
 0011-wasix-refresh-a-socket-future-s-waker-on-every-poll.patch
+0012-wasix-let-an-unset-socket-timeout-mean-no-deadline.patch

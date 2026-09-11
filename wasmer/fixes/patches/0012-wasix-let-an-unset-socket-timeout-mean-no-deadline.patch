@@ -1,0 +1,591 @@
+Subject: wasix: let an unset socket timeout mean no deadline
+
+Every socket call that can block read the matching timeout option off
+the socket and, when the guest had not set one, substituted thirty
+seconds: sock_recv, sock_recv_from, sock_send, sock_send_to,
+sock_send_file, sock_accept and the fd_read and fd_write paths for a
+socket, plus bind, listen and connect inside the socket itself. Two
+things follow from that default, and both are wrong.
+
+The first is guest-visible. A blocking recv on a socket with no
+SO_RCVTIMEO set returned ETIMEDOUT after thirty seconds, and a
+blocking read of the same socket returned EAGAIN, where Linux blocks
+until data arrives. A guest could not ask for the Linux behaviour
+either: clearing the option puts None back on the socket, which the
+callers turned straight back into thirty seconds. Worse, listen
+stored the default on the listener it built, so every later accept on
+that listener carried a thirty second deadline the guest never asked
+for and could not see coming.
+
+The second is that a deadline is not free. Each of those calls handed
+the timeout to a select against tasks.sleep_now, so every blocking
+read, write and accept armed a timer in the task manager for an
+instant that, for a guest that never sets a socket timeout, cannot be
+reached before the operation completes. An event loop pays it on
+every socket call it makes.
+
+So pass the option through. The socket operations already take
+Option<Duration> and already have a branch that awaits the operation
+alone when there is none; bind, listen and connect, which did not,
+select against a small deadline future that is simply
+std::future::pending when the timeout is absent. An operation with a
+timeout set behaves exactly as before, down to the errno.
+
+What that saves depends on the task manager. The one this tree ships
+for the sys backend spawns a Tokio task per sleep and aborts it when
+the operation wins the race, so every blocking socket call scheduled
+and cancelled a task on the runtime; a task manager that polls its
+timers in place instead still armed and dropped a timer per call.
+
+Unit tests cover the deadline future arming no timer, and so staying
+pending, when no timeout is set, and arming one and expiring when one
+is.
+
+diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
+index 1b827a6..b654795 100644
+--- a/lib/wasix/src/net/socket.rs
++++ b/lib/wasix/src/net/socket.rs
+@@ -238,6 +238,22 @@ pub struct InodeSocket {
+     pub(crate) inner: Arc<InodeSocketInner>,
+ }
+ 
++/// The deadline of a socket operation whose timeout may be unset.
++///
++/// A socket that carries no timeout for an operation blocks until the
++/// operation completes, as it does on Linux when the matching socket option
++/// was never set, so this future simply never completes and the operation it
++/// is selected against decides on its own. Nothing is armed in that case: a
++/// timeout costs a timer registration in the task manager on every call, and
++/// the sockets that guests use most - the ones an event loop drives with no
++/// timeout at all - would pay it for a deadline that cannot be reached.
++async fn deadline(tasks: &dyn VirtualTaskManager, timeout: Option<Duration>) {
++    match timeout {
++        Some(timeout) => tasks.sleep_now(timeout).await,
++        None => std::future::pending().await,
++    }
++}
++
+ impl InodeSocket {
+     pub fn new(kind: InodeSocketKind) -> Self {
+         let protected = InodeSocketProtected { kind };
+@@ -265,11 +281,7 @@ impl InodeSocket {
+         tasks: &dyn VirtualTaskManager,
+         net: &dyn VirtualNetworking,
+     ) -> Result<Option<InodeSocket>, Errno> {
+-        let timeout = self
+-            .opt_time(TimeType::BindTimeout)
+-            .ok()
+-            .flatten()
+-            .unwrap_or(Duration::from_secs(30));
++        let timeout = self.opt_time(TimeType::BindTimeout).ok().flatten();
+         let family = {
+             let inner = self.inner.protected.read().unwrap();
+             match &inner.kind {
+@@ -298,11 +310,7 @@ impl InodeSocket {
+         net: &dyn VirtualNetworking,
+         set_addr: SocketAddr,
+     ) -> Result<Option<InodeSocket>, Errno> {
+-        let timeout = self
+-            .opt_time(TimeType::BindTimeout)
+-            .ok()
+-            .flatten()
+-            .unwrap_or(Duration::from_secs(30));
++        let timeout = self.opt_time(TimeType::BindTimeout).ok().flatten();
+         self.bind_internal(tasks, net, set_addr, timeout).await
+     }
+ 
+@@ -311,7 +319,7 @@ impl InodeSocket {
+         tasks: &dyn VirtualTaskManager,
+         net: &dyn VirtualNetworking,
+         set_addr: SocketAddr,
+-        timeout: Duration,
++        timeout: Option<Duration>,
+     ) -> Result<Option<InodeSocket>, Errno> {
+         enum PendingBind {
+             Tcp {
+@@ -460,7 +468,7 @@ impl InodeSocket {
+                             }
+                         }
+                     },
+-                    _ = tasks.sleep_now(timeout) => {
++                    _ = deadline(tasks, timeout) => {
+                         // Bind timed out; roll back the pre-set address for the same reason.
+                         let mut inner = self.inner.protected.write().unwrap();
+                         if let InodeSocketKind::PreSocket { addr, .. } = &mut inner.kind {
+@@ -491,7 +499,7 @@ impl InodeSocket {
+                             }
+                         }
+                     },
+-                    _ = tasks.sleep_now(timeout) => {
++                    _ = deadline(tasks, timeout) => {
+                         let mut inner = self.inner.protected.write().unwrap();
+                         if let InodeSocketKind::PreSocket { addr, .. } = &mut inner.kind {
+                             addr.take();
+@@ -509,11 +517,7 @@ impl InodeSocket {
+         net: &dyn VirtualNetworking,
+         _backlog: usize,
+     ) -> Result<Option<InodeSocket>, Errno> {
+-        let timeout = self
+-            .opt_time(TimeType::AcceptTimeout)
+-            .ok()
+-            .flatten()
+-            .unwrap_or(Duration::from_secs(30));
++        let timeout = self.opt_time(TimeType::AcceptTimeout).ok().flatten();
+ 
+         let socket = {
+             let mut inner = self.inner.protected.write().unwrap();
+@@ -565,7 +569,7 @@ impl InodeSocket {
+                 InodeSocketKind::BoundTcp { socket, .. } => {
+                     return Ok(Some(InodeSocket::new(InodeSocketKind::TcpListener {
+                         socket: socket.listen().map_err(net_error_into_wasi_err)?,
+-                        accept_timeout: Some(timeout),
++                        accept_timeout: timeout,
+                     })));
+                 }
+                 InodeSocketKind::Icmp(_) => {
+@@ -598,10 +602,10 @@ impl InodeSocket {
+                 let socket = socket.map_err(net_error_into_wasi_err)?;
+                 Ok(Some(InodeSocket::new(InodeSocketKind::TcpListener {
+                     socket,
+-                    accept_timeout: Some(timeout),
++                    accept_timeout: timeout,
+                 })))
+             },
+-            _ = tasks.sleep_now(timeout) => Err(Errno::Timedout)
++            _ = deadline(tasks, timeout) => Err(Errno::Timedout)
+         }
+     }
+ 
+@@ -715,9 +719,7 @@ impl InodeSocket {
+         let new_write_timeout;
+         let new_read_timeout;
+ 
+-        let timeout = timeout
+-            .or_else(|| self.opt_time(TimeType::ConnectTimeout).ok().flatten())
+-            .unwrap_or(Duration::from_secs(30));
++        let timeout = timeout.or_else(|| self.opt_time(TimeType::ConnectTimeout).ok().flatten());
+ 
+         let handler;
+         let connect: TcpConnectFuture<'_> = {
+@@ -816,7 +818,7 @@ impl InodeSocket {
+ 
+         let mut socket = tokio::select! {
+             res = connect => res?,
+-            _ = tasks.sleep_now(timeout) => return Err(Errno::Timedout)
++            _ = deadline(tasks, timeout) => return Err(Errno::Timedout)
+         };
+ 
+         if let Some(handler) = handler {
+@@ -2216,7 +2218,7 @@ pub(crate) mod tests {
+                 &tasks,
+                 &net,
+                 SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+-                Duration::from_millis(10),
++                Some(Duration::from_millis(10)),
+             )
+             .await
+             .unwrap_err();
+@@ -2346,4 +2348,80 @@ pub(crate) mod tests {
+         assert!(second.woken(), "the latest poll's waker was not registered");
+         assert!(!first.woken(), "the stale waker was woken instead");
+     }
++
++    /// A task manager that counts the timers it is asked to arm. A deadline
++    /// only ever sleeps, so nothing else is expected of it.
++    #[cfg(feature = "sys")]
++    #[derive(Debug, Default)]
++    struct CountingSleeps(AtomicUsize);
++
++    #[cfg(feature = "sys")]
++    impl CountingSleeps {
++        fn armed(&self) -> usize {
++            self.0.load(Ordering::Relaxed)
++        }
++    }
++
++    #[cfg(feature = "sys")]
++    impl crate::runtime::task_manager::VirtualTaskManager for CountingSleeps {
++        fn sleep_now(
++            &self,
++            time: Duration,
++        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync + 'static>> {
++            self.0.fetch_add(1, Ordering::Relaxed);
++            Box::pin(tokio::time::sleep(time))
++        }
++
++        fn task_shared(
++            &self,
++            _task: Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send + 'static>,
++        ) -> Result<(), crate::os::task::thread::WasiThreadError> {
++            unreachable!("a deadline only sleeps")
++        }
++
++        fn task_wasm(
++            &self,
++            _task: crate::runtime::task_manager::TaskWasm,
++        ) -> Result<(), crate::os::task::thread::WasiThreadError> {
++            unreachable!("a deadline only sleeps")
++        }
++
++        fn task_dedicated(
++            &self,
++            _task: Box<dyn FnOnce() + Send + 'static>,
++        ) -> Result<(), crate::os::task::thread::WasiThreadError> {
++            unreachable!("a deadline only sleeps")
++        }
++
++        fn thread_parallelism(&self) -> Result<usize, crate::os::task::thread::WasiThreadError> {
++            Ok(1)
++        }
++    }
++
++    #[cfg(feature = "sys")]
++    #[tokio::test(flavor = "current_thread")]
++    async fn deadline_without_a_timeout_arms_no_timer() {
++        let tasks = CountingSleeps::default();
++        let mut deadline = Box::pin(super::deadline(&tasks, None));
++
++        let waker = futures::task::noop_waker();
++        let mut cx = Context::from_waker(&waker);
++        // No timer is armed, so nothing can ever make it ready: the operation
++        // it guards waits for as long as it takes.
++        assert!(deadline.as_mut().poll(&mut cx).is_pending());
++        assert!(deadline.as_mut().poll(&mut cx).is_pending());
++        assert_eq!(
++            tasks.armed(),
++            0,
++            "a deadline without a timeout armed a timer"
++        );
++    }
++
++    #[cfg(feature = "sys")]
++    #[tokio::test(flavor = "current_thread")]
++    async fn deadline_with_a_timeout_expires() {
++        let tasks = CountingSleeps::default();
++        super::deadline(&tasks, Some(Duration::from_millis(1))).await;
++        assert_eq!(tasks.armed(), 1, "a deadline with a timeout arms one timer");
++    }
+ }
+diff --git a/lib/wasix/src/syscalls/wasi/fd_read.rs b/lib/wasix/src/syscalls/wasi/fd_read.rs
+index f5de216..a73fd4e 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_read.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_read.rs
+@@ -236,11 +236,7 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
+                     drop(guard);
+ 
+                     let nonblocking = fd_flags.contains(Fdflags::NONBLOCK);
+-                    let timeout = socket
+-                        .opt_time(TimeType::ReadTimeout)
+-                        .ok()
+-                        .flatten()
+-                        .unwrap_or(Duration::from_secs(30));
++                    let timeout = socket.opt_time(TimeType::ReadTimeout).ok().flatten();
+ 
+                     let tasks = env.tasks().clone();
+                     let res = __asyncify_light(
+@@ -267,7 +263,7 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
+                                     .recv(
+                                         tasks.deref(),
+                                         buf.as_mut_uninit(),
+-                                        Some(timeout),
++                                        timeout,
+                                         nonblocking,
+                                         false,
+                                     )
+diff --git a/lib/wasix/src/syscalls/wasi/fd_write.rs b/lib/wasix/src/syscalls/wasi/fd_write.rs
+index 4fcfbf8..97a5e74 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_write.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_write.rs
+@@ -275,11 +275,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
+                     drop(guard);
+ 
+                     let nonblocking = fd_flags.contains(Fdflags::NONBLOCK);
+-                    let timeout = socket
+-                        .opt_time(TimeType::WriteTimeout)
+-                        .ok()
+-                        .flatten()
+-                        .unwrap_or(Duration::from_secs(30));
++                    let timeout = socket.opt_time(TimeType::WriteTimeout).ok().flatten();
+ 
+                     let tasks = env.tasks().clone();
+ 
+@@ -289,7 +285,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
+                         if socket.is_dgram() {
+                             let data = data.coalesce(&memory, MAX_SOCKET_PAYLOAD)?;
+                             sent += socket
+-                                .send(tasks.deref(), data.as_ref(), Some(timeout), nonblocking)
++                                .send(tasks.deref(), data.as_ref(), timeout, nonblocking)
+                                 .await?;
+                             return Ok(sent);
+                         }
+@@ -306,12 +302,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
+                                         .access()
+                                         .map_err(mem_error_to_wasi)?;
+                                     let local_sent = match socket
+-                                        .send(
+-                                            tasks.deref(),
+-                                            buf.as_ref(),
+-                                            Some(timeout),
+-                                            nonblocking,
+-                                        )
++                                        .send(tasks.deref(), buf.as_ref(), timeout, nonblocking)
+                                         .await
+                                     {
+                                         Ok(sent) => sent,
+@@ -326,7 +317,7 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
+                             }
+                             FdWriteSource::Buffer(data) => {
+                                 sent += socket
+-                                    .send(tasks.deref(), data.as_ref(), Some(timeout), nonblocking)
++                                    .send(tasks.deref(), data.as_ref(), timeout, nonblocking)
+                                     .await?;
+                             }
+                         }
+diff --git a/lib/wasix/src/syscalls/wasix/sock_accept.rs b/lib/wasix/src/syscalls/wasix/sock_accept.rs
+index b851666..54d385c 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_accept.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_accept.rs
+@@ -130,14 +130,10 @@ pub(crate) fn sock_accept_internal(
+                 fd_flags.set(Fdflags::NONBLOCK, true);
+                 nonblocking = true;
+             }
+-            let timeout = socket
+-                .opt_time(TimeType::AcceptTimeout)
+-                .ok()
+-                .flatten()
+-                .unwrap_or(Duration::from_secs(30));
++            let timeout = socket.opt_time(TimeType::AcceptTimeout).ok().flatten();
+             let local_addr = socket.addr_local()?;
+             socket
+-                .accept(tasks.deref(), nonblocking, Some(timeout))
++                .accept(tasks.deref(), nonblocking, timeout)
+                 .await
+                 .map(|a| (a.0, local_addr, a.1, fd_flags))
+         },
+diff --git a/lib/wasix/src/syscalls/wasix/sock_recv.rs b/lib/wasix/src/syscalls/wasix/sock_recv.rs
+index 78bfc42..3749485 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_recv.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_recv.rs
+@@ -135,17 +135,13 @@ pub(super) fn sock_recv_internal<M: MemorySize>(
+                     .map_err(mem_error_to_wasi)?;
+ 
+                 let nonblocking = nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
+-                let timeout = socket
+-                    .opt_time(TimeType::ReadTimeout)
+-                    .ok()
+-                    .flatten()
+-                    .unwrap_or(Duration::from_secs(30));
++                let timeout = socket.opt_time(TimeType::ReadTimeout).ok().flatten();
+ 
+                 let local_read = match socket
+                     .recv(
+                         env.tasks().deref(),
+                         buf.as_mut_uninit(),
+-                        Some(timeout),
++                        timeout,
+                         nonblocking,
+                         peek,
+                     )
+diff --git a/lib/wasix/src/syscalls/wasix/sock_recv_from.rs b/lib/wasix/src/syscalls/wasix/sock_recv_from.rs
+index b5b4fb2..b97ba62 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_recv_from.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_recv_from.rs
+@@ -77,19 +77,9 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
+                 |socket, fd| async move {
+                     let nonblocking =
+                         nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
+-                    let timeout = socket
+-                        .opt_time(TimeType::ReadTimeout)
+-                        .ok()
+-                        .flatten()
+-                        .unwrap_or(Duration::from_secs(30));
++                    let timeout = socket.opt_time(TimeType::ReadTimeout).ok().flatten();
+                     socket
+-                        .recv_from(
+-                            env.tasks().deref(),
+-                            writer,
+-                            Some(timeout),
+-                            nonblocking,
+-                            peek,
+-                        )
++                        .recv_from(env.tasks().deref(), writer, timeout, nonblocking, peek)
+                         .await
+                 },
+             ));
+@@ -108,24 +98,14 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
+                 Rights::SOCK_RECV_FROM,
+                 |socket, fd| async move {
+                     let nonblocking = fd.inner.flags.contains(Fdflags::NONBLOCK);
+-                    let timeout = socket
+-                        .opt_time(TimeType::ReadTimeout)
+-                        .ok()
+-                        .flatten()
+-                        .unwrap_or(Duration::from_secs(30));
++                    let timeout = socket.opt_time(TimeType::ReadTimeout).ok().flatten();
+ 
+                     let mut buf = Vec::with_capacity(max_size);
+                     unsafe {
+                         buf.set_len(max_size);
+                     }
+                     socket
+-                        .recv_from(
+-                            env.tasks().deref(),
+-                            &mut buf,
+-                            Some(timeout),
+-                            nonblocking,
+-                            peek,
+-                        )
++                        .recv_from(env.tasks().deref(), &mut buf, timeout, nonblocking, peek)
+                         .await
+                         .map(|(amt, addr)| {
+                             unsafe {
+diff --git a/lib/wasix/src/syscalls/wasix/sock_send.rs b/lib/wasix/src/syscalls/wasix/sock_send.rs
+index fab371b..b100a6e 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_send.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_send.rs
+@@ -100,21 +100,12 @@ pub(crate) fn sock_send_internal<M: MemorySize>(
+         Rights::SOCK_SEND,
+         |socket, fd| async move {
+             let nonblocking = nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
+-            let timeout = socket
+-                .opt_time(TimeType::WriteTimeout)
+-                .ok()
+-                .flatten()
+-                .unwrap_or(Duration::from_secs(30));
++            let timeout = socket.opt_time(TimeType::WriteTimeout).ok().flatten();
+ 
+             if socket.is_dgram() {
+                 let data = si_data.coalesce(&memory, MAX_SOCKET_PAYLOAD)?;
+                 return socket
+-                    .send(
+-                        env.tasks().deref(),
+-                        data.as_ref(),
+-                        Some(timeout),
+-                        nonblocking,
+-                    )
++                    .send(env.tasks().deref(), data.as_ref(), timeout, nonblocking)
+                     .await;
+             }
+ 
+@@ -131,12 +122,7 @@ pub(crate) fn sock_send_internal<M: MemorySize>(
+                             .access()
+                             .map_err(mem_error_to_wasi)?;
+                         let local_sent = match socket
+-                            .send(
+-                                env.tasks().deref(),
+-                                buf.as_ref(),
+-                                Some(timeout),
+-                                nonblocking,
+-                            )
++                            .send(env.tasks().deref(), buf.as_ref(), timeout, nonblocking)
+                             .await
+                         {
+                             Ok(s) => s,
+@@ -152,12 +138,7 @@ pub(crate) fn sock_send_internal<M: MemorySize>(
+                 }
+                 FdWriteSource::Buffer(data) => {
+                     socket
+-                        .send(
+-                            env.tasks().deref(),
+-                            data.as_ref(),
+-                            Some(timeout),
+-                            nonblocking,
+-                        )
++                        .send(env.tasks().deref(), data.as_ref(), timeout, nonblocking)
+                         .await
+                 }
+             }
+diff --git a/lib/wasix/src/syscalls/wasix/sock_send_file.rs b/lib/wasix/src/syscalls/wasix/sock_send_file.rs
+index 57910c9..ac2699f 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_send_file.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_send_file.rs
+@@ -130,11 +130,8 @@ pub(crate) fn sock_send_file_internal(
+                                 let tasks = tasks.clone();
+                                 drop(guard);
+ 
+-                                let read_timeout = socket
+-                                    .opt_time(TimeType::WriteTimeout)
+-                                    .ok()
+-                                    .flatten()
+-                                    .unwrap_or(Duration::from_secs(30));
++                                let read_timeout =
++                                    socket.opt_time(TimeType::WriteTimeout).ok().flatten();
+ 
+                                 let data = wasi_try_ok_ok!(__asyncify(ctx, None, async {
+                                     let mut buf = Vec::with_capacity(sub_count as usize);
+@@ -142,13 +139,7 @@ pub(crate) fn sock_send_file_internal(
+                                         buf.set_len(sub_count as usize);
+                                     }
+                                     socket
+-                                        .recv(
+-                                            tasks.deref(),
+-                                            &mut buf,
+-                                            Some(read_timeout),
+-                                            false,
+-                                            false,
+-                                        )
++                                        .recv(tasks.deref(), &mut buf, read_timeout, false, false)
+                                         .await
+                                         .map(|amt| {
+                                             unsafe {
+@@ -228,14 +219,8 @@ pub(crate) fn sock_send_file_internal(
+             sock,
+             Rights::SOCK_SEND,
+             |socket, fd| async move {
+-                let write_timeout = socket
+-                    .opt_time(TimeType::ReadTimeout)
+-                    .ok()
+-                    .flatten()
+-                    .unwrap_or(Duration::from_secs(30));
+-                socket
+-                    .send(tasks.deref(), &data, Some(write_timeout), true)
+-                    .await
++                let write_timeout = socket.opt_time(TimeType::ReadTimeout).ok().flatten();
++                socket.send(tasks.deref(), &data, write_timeout, true).await
+             },
+         ));
+         env = ctx.data();
+diff --git a/lib/wasix/src/syscalls/wasix/sock_send_to.rs b/lib/wasix/src/syscalls/wasix/sock_send_to.rs
+index 88bb391..f5db07d 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_send_to.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_send_to.rs
+@@ -110,11 +110,7 @@ pub(crate) fn sock_send_to_internal<M: MemorySize>(
+             Rights::SOCK_SEND_TO,
+             |socket, fd| async move {
+                 let nonblocking = nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
+-                let timeout = socket
+-                    .opt_time(TimeType::WriteTimeout)
+-                    .ok()
+-                    .flatten()
+-                    .unwrap_or(Duration::from_secs(30));
++                let timeout = socket.opt_time(TimeType::WriteTimeout).ok().flatten();
+ 
+                 if socket.is_dgram() {
+                     let data = si_data.coalesce(&memory, MAX_SOCKET_PAYLOAD)?;
+@@ -123,7 +119,7 @@ pub(crate) fn sock_send_to_internal<M: MemorySize>(
+                             env.tasks().deref(),
+                             data.as_ref(),
+                             addr,
+-                            Some(timeout),
++                            timeout,
+                             nonblocking,
+                         )
+                         .await;
+@@ -146,7 +142,7 @@ pub(crate) fn sock_send_to_internal<M: MemorySize>(
+                                     env.tasks().deref(),
+                                     buf.as_ref(),
+                                     addr,
+-                                    Some(timeout),
++                                    timeout,
+                                     nonblocking,
+                                 )
+                                 .await
+@@ -168,7 +164,7 @@ pub(crate) fn sock_send_to_internal<M: MemorySize>(
+                                 env.tasks().deref(),
+                                 data.as_ref(),
+                                 addr,
+-                                Some(timeout),
++                                timeout,
+                                 nonblocking,
+                             )
+                             .await
