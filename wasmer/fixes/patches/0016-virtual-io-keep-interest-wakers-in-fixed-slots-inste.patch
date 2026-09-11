@@ -1,0 +1,398 @@
+Subject: virtual-io: keep interest wakers in fixed slots instead of a map
+
+Every poll of every socket goes through InterestWakerMap. A poll clears
+the interest it is about to wait on, registers its waker under it and
+then tries the socket; the selector thread pushes readiness into the
+same map, which wakes the wakers waiting on that interest or, when none
+is waiting, records the interest for the next poll to find. Both halves
+lived in one Mutex over a HashMap<InterestType, Vec<Waker>> and a
+HashSet<InterestType>, so every one of those steps hashed an enum of
+four variants and took the same lock: three times per poll on the read
+path, four on the write path, and once more per readiness event. In a
+profile of a guest under load, the waker map, the selector and the poll
+guards together were 9% of the runtime's user-mode samples.
+
+Give InterestType an index and a bit, and keep the two halves in the
+shape they describe. The wakers become a fixed array of four vectors
+behind their own mutex, reached by index rather than by hash, and each
+slot keeps the space it grew to rather than the entry being removed and
+rebuilt around every event. The triggered set becomes an AtomicU8 of
+the same four bits, so push, pop and has_interest are one atomic
+read-modify-write or load each and take no lock at all. What is left on
+the poll path is the one lock the waker registration needs.
+
+What the callers rely on is that an event landing while a poll is
+registering cannot be missed by both sides. push_interest sets the bit
+with the wakers lock held, so a poll whose add took the lock first has
+left a waker in the slot for the event to wake, and a poll whose add
+takes the lock afterwards sees the bit set by the time add returns;
+every caller then either retries the socket, as the read and accept
+paths do, or asks has_interest, as the write path does for a closed
+peer. Wakers are woken with the lock held, as they were when they lived
+in the map behind the same mutex. Off that lock the mask is only ever
+changed a bit at a time, so taking one interest cannot disturb another,
+and a reader that races a writer sees the mask from one side of the
+write or the other, exactly as a read an instant earlier would have.
+
+WakerInterestHandler, which a poll of a socket that has no waker map
+builds from the task's waker and drops again, holds its interests in
+the same four bits rather than in a HashSet.
+
+Unit tests cover an interest pushed with nothing waiting being left for
+the next poll to pop, a waiting waker being woken exactly once with the
+interest not also recorded, a waker registered twice waking once and
+two distinct wakers both waking, one interest not disturbing another,
+and the race itself: five hundred rounds of an event landing on one
+thread while a poll registers on another, each asserting that the round
+either woke the waker or left the interest to be seen.
+
+diff --git a/lib/virtual-io/src/interest.rs b/lib/virtual-io/src/interest.rs
+index 7cf0529..244002f 100644
+--- a/lib/virtual-io/src/interest.rs
++++ b/lib/virtual-io/src/interest.rs
+@@ -1,7 +1,9 @@
+ use serde::{Deserialize, Serialize};
+ use std::{
+-    collections::{HashMap, HashSet},
+-    sync::{Arc, Mutex},
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicU8, Ordering},
++    },
+     task::{Context, RawWaker, RawWakerVTable, Waker},
+ };
+ 
+@@ -13,31 +15,55 @@ pub enum InterestType {
+     Error,
+ }
+ 
++impl InterestType {
++    /// The number of interests, and so the number of slots a handler that
++    /// keeps one piece of state per interest needs.
++    const COUNT: usize = 4;
++
++    /// The slot this interest occupies, in `0..COUNT`.
++    const fn index(self) -> usize {
++        match self {
++            InterestType::Readable => 0,
++            InterestType::Writable => 1,
++            InterestType::Closed => 2,
++            InterestType::Error => 3,
++        }
++    }
++
++    /// The bit this interest occupies in a mask of interests.
++    const fn bit(self) -> u8 {
++        1u8 << self.index()
++    }
++}
++
+ #[derive(Debug)]
+ pub struct WakerInterestHandler {
+-    set: HashSet<InterestType>,
++    /// The interests pushed to this handler, one bit each.
++    set: u8,
+     waker: Waker,
+ }
+ impl WakerInterestHandler {
+     pub fn new(waker: &Waker) -> Box<Self> {
+         Box::new(WakerInterestHandler {
+-            set: Default::default(),
++            set: 0,
+             waker: waker.clone(),
+         })
+     }
+ }
+ impl InterestHandler for WakerInterestHandler {
+     fn push_interest(&mut self, interest: InterestType) {
+-        self.set.insert(interest);
++        self.set |= interest.bit();
+         self.waker.wake_by_ref();
+     }
+ 
+     fn pop_interest(&mut self, interest: InterestType) -> bool {
+-        self.set.remove(&interest)
++        let had = (self.set & interest.bit()) != 0;
++        self.set &= !interest.bit();
++        had
+     }
+ 
+     fn has_interest(&self, interest: InterestType) -> bool {
+-        self.set.contains(&interest)
++        (self.set & interest.bit()) != 0
+     }
+ }
+ 
+@@ -141,56 +167,251 @@ const VTABLE: RawWakerVTable = unsafe {
+     )
+ };
+ 
+-#[derive(Debug, Clone, Default)]
++#[derive(Debug, Default)]
+ struct InterestWakerMapState {
+-    wakers: HashMap<InterestType, Vec<Waker>>,
+-    triggered: HashSet<InterestType>,
++    /// The wakers waiting on each interest, one slot per interest, indexed
++    /// by `InterestType::index`. Locked only when a waker is registered or
++    /// woken, and the slots keep the space they grow to, so a socket polled
++    /// over and over registers its waker without allocating.
++    wakers: Mutex<[Vec<Waker>; InterestType::COUNT]>,
++    /// The interests that fired with no waker registered to take them, one
++    /// bit each, so that recording, taking or testing one is a single
++    /// atomic operation and needs no lock. A reader that races a writer
++    /// sees the mask from one side of the write or the other, exactly as a
++    /// read an instant earlier would have; what the callers do rely on is
++    /// that a waker and a set bit cannot both be missed, which the wakers
++    /// lock gives them, as `push_interest` describes.
++    triggered: AtomicU8,
+ }
+ 
+ #[derive(Debug, Clone, Default)]
+ pub struct InterestWakerMap {
+-    state: Arc<Mutex<InterestWakerMapState>>,
++    state: Arc<InterestWakerMapState>,
+ }
+ 
+ impl InterestWakerMap {
++    /// Registers a waker to be woken when the interest next fires. A waker
++    /// that wakes the same task as one already registered is dropped, so a
++    /// socket polled in a loop keeps one waker per interest rather than a
++    /// copy per poll.
+     pub fn add(&self, interest: InterestType, waker: &Waker) {
+-        let mut state = self.state.lock().unwrap();
+-        let entries = state.wakers.entry(interest).or_default();
+-        if !entries.iter().any(|w| w.will_wake(waker)) {
+-            entries.push(waker.clone());
++        let mut wakers = self.state.wakers.lock().unwrap();
++        let slot = &mut wakers[interest.index()];
++        if !slot.iter().any(|w| w.will_wake(waker)) {
++            slot.push(waker.clone());
+         }
+     }
+ 
++    /// Takes the interest if it was recorded as triggered, and says whether
++    /// it was.
+     pub fn pop(&self, interest: InterestType) -> bool {
+-        let mut state = self.state.lock().unwrap();
+-        state.triggered.remove(&interest)
++        let previous = self
++            .state
++            .triggered
++            .fetch_and(!interest.bit(), Ordering::AcqRel);
++        (previous & interest.bit()) != 0
+     }
+ 
++    /// Records the interest as triggered, and says whether it was not
++    /// already.
+     pub fn push(&self, interest: InterestType) -> bool {
+-        let mut state = self.state.lock().unwrap();
+-        state.triggered.insert(interest)
++        let previous = self
++            .state
++            .triggered
++            .fetch_or(interest.bit(), Ordering::AcqRel);
++        (previous & interest.bit()) == 0
+     }
+ }
+ 
+ impl InterestHandler for InterestWakerMap {
+     fn push_interest(&mut self, interest: InterestType) {
+-        let mut state = self.state.lock().unwrap();
+-        if let Some(wakers) = state.wakers.remove(&interest) {
+-            for waker in wakers {
++        let mut wakers = self.state.wakers.lock().unwrap();
++        let slot = &mut wakers[interest.index()];
++        if slot.is_empty() {
++            // Nothing is waiting on this interest, so leave it for whoever
++            // asks next. The bit is set with the wakers lock held, which is
++            // what makes the race with a poll registering a waker safe: the
++            // poll's add either took the lock first, and left a waker in
++            // the slot for this event to wake, or takes it after this and
++            // so sees the bit set when it checks its source or asks
++            // has_interest.
++            self.state
++                .triggered
++                .fetch_or(interest.bit(), Ordering::AcqRel);
++        } else {
++            // Woken with the lock held, as they were when the wakers lived
++            // in a map behind the same mutex: an add that races this event
++            // either lands before it and is woken here, or waits for the
++            // lock and registers for the next one.
++            for waker in slot.drain(..) {
+                 waker.wake();
+             }
+-        } else {
+-            state.triggered.insert(interest);
+         }
+     }
+ 
+     fn pop_interest(&mut self, interest: InterestType) -> bool {
+-        let mut state = self.state.lock().unwrap();
+-        state.triggered.remove(&interest)
++        self.pop(interest)
+     }
+ 
+     fn has_interest(&self, interest: InterestType) -> bool {
+-        let state = self.state.lock().unwrap();
+-        state.triggered.contains(&interest)
++        (self.state.triggered.load(Ordering::Acquire) & interest.bit()) != 0
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::AtomicUsize;
++
++    #[derive(Debug, Default)]
++    struct Woken(AtomicUsize);
++
++    impl Woken {
++        fn count(&self) -> usize {
++            self.0.load(Ordering::Acquire)
++        }
++    }
++
++    impl futures::task::ArcWake for Woken {
++        fn wake_by_ref(arc_self: &Arc<Self>) {
++            arc_self.0.fetch_add(1, Ordering::AcqRel);
++        }
++    }
++
++    fn counting_waker() -> (Arc<Woken>, Waker) {
++        let woken = Arc::new(Woken::default());
++        let waker = futures::task::waker(woken.clone());
++        (woken, waker)
++    }
++
++    const ALL: [InterestType; InterestType::COUNT] = [
++        InterestType::Readable,
++        InterestType::Writable,
++        InterestType::Closed,
++        InterestType::Error,
++    ];
++
++    #[test]
++    fn every_interest_has_its_own_slot_and_bit() {
++        let mut seen = 0u8;
++        for interest in ALL {
++            assert!(interest.index() < InterestType::COUNT);
++            assert_eq!(interest.bit(), 1u8 << interest.index());
++            assert_eq!(seen & interest.bit(), 0, "{interest:?} shares a bit");
++            seen |= interest.bit();
++        }
++    }
++
++    #[test]
++    fn an_interest_pushed_with_nothing_waiting_waits_to_be_popped() {
++        let mut map = InterestWakerMap::default();
++        map.push_interest(InterestType::Readable);
++
++        assert!(map.has_interest(InterestType::Readable));
++        assert!(!map.has_interest(InterestType::Writable));
++
++        // A poll arriving afterwards registers its waker and still sees the
++        // interest, which is how a caller that checks has_interest after
++        // add cannot miss the event.
++        let (woken, waker) = counting_waker();
++        map.add(InterestType::Readable, &waker);
++        assert!(map.has_interest(InterestType::Readable));
++        assert!(map.pop(InterestType::Readable));
++        assert!(!map.pop(InterestType::Readable));
++        assert_eq!(woken.count(), 0);
++    }
++
++    #[test]
++    fn one_interest_pushed_leaves_the_others_alone() {
++        let map = InterestWakerMap::default();
++        assert!(map.push(InterestType::Closed));
++        assert!(!map.push(InterestType::Closed));
++        assert!(map.push(InterestType::Error));
++
++        assert!(map.pop(InterestType::Closed));
++        assert!(!map.pop(InterestType::Closed));
++        assert!(map.pop(InterestType::Error));
++    }
++
++    #[test]
++    fn a_waiting_waker_is_woken_once_and_takes_the_interest_with_it() {
++        let mut map = InterestWakerMap::default();
++        let (woken, waker) = counting_waker();
++        map.add(InterestType::Readable, &waker);
++
++        map.push_interest(InterestType::Readable);
++        assert_eq!(woken.count(), 1);
++        // The event went to the waker, so nothing is left to pop.
++        assert!(!map.has_interest(InterestType::Readable));
++        assert!(!map.pop(InterestType::Readable));
++
++        // The waker was consumed with the event: the next one has nothing
++        // to wake and is recorded instead.
++        map.push_interest(InterestType::Readable);
++        assert_eq!(woken.count(), 1);
++        assert!(map.pop(InterestType::Readable));
++    }
++
++    #[test]
++    fn a_waker_registered_twice_is_woken_once() {
++        let mut map = InterestWakerMap::default();
++        let (woken, waker) = counting_waker();
++        map.add(InterestType::Writable, &waker);
++        map.add(InterestType::Writable, &waker.clone());
++
++        map.push_interest(InterestType::Writable);
++        assert_eq!(woken.count(), 1);
++    }
++
++    #[test]
++    fn distinct_wakers_on_one_interest_are_all_woken() {
++        let mut map = InterestWakerMap::default();
++        let (first, first_waker) = counting_waker();
++        let (second, second_waker) = counting_waker();
++        map.add(InterestType::Writable, &first_waker);
++        map.add(InterestType::Writable, &second_waker);
++
++        map.push_interest(InterestType::Writable);
++        assert_eq!(first.count(), 1);
++        assert_eq!(second.count(), 1);
++    }
++
++    #[test]
++    fn a_waker_is_only_woken_by_the_interest_it_waits_on() {
++        let mut map = InterestWakerMap::default();
++        let (woken, waker) = counting_waker();
++        map.add(InterestType::Readable, &waker);
++
++        map.push_interest(InterestType::Writable);
++        assert_eq!(woken.count(), 0);
++        assert!(map.pop(InterestType::Writable));
++
++        map.push_interest(InterestType::Readable);
++        assert_eq!(woken.count(), 1);
++    }
++
++    #[test]
++    fn an_event_racing_a_poll_is_never_lost() {
++        // A poll registers its waker while the event lands, in whichever
++        // order the two threads happen to run. Either the waker is woken or
++        // the interest is left for the poll to see, never neither.
++        for _ in 0..500 {
++            let map = InterestWakerMap::default();
++            let (woken, waker) = counting_waker();
++
++            let mut pusher = map.clone();
++            let event = std::thread::spawn(move || {
++                pusher.push_interest(InterestType::Readable);
++            });
++
++            map.add(InterestType::Readable, &waker);
++            let seen = map.has_interest(InterestType::Readable);
++
++            event.join().unwrap();
++            assert!(
++                seen || woken.count() == 1,
++                "the event woke nothing and left nothing behind"
++            );
++        }
+     }
+ }

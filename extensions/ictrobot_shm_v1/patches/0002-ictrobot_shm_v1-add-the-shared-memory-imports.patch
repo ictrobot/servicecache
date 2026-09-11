@@ -722,7 +722,7 @@ index 29befce..2f5546e 100644
  
      imports
 diff --git a/lib/wasix/src/os/task/process.rs b/lib/wasix/src/os/task/process.rs
-index 4deeb12..eb62e37 100644
+index 32a2792..2b3c486 100644
 --- a/lib/wasix/src/os/task/process.rs
 +++ b/lib/wasix/src/os/task/process.rs
 @@ -1,4 +1,6 @@
@@ -775,10 +775,10 @@ index 4deeb12..eb62e37 100644
  /// Represents a process running within the compute state
  /// TODO: fields should be private and only accessed via methods.
  #[derive(Debug, Clone)]
-@@ -111,6 +148,10 @@ pub struct WasiProcess {
-     /// the exponential backoff of CPU is halted (as in CPU
-     /// is allowed to run freely)
-     pub(crate) cpu_run_tokens: Arc<AtomicU32>,
+@@ -115,6 +152,10 @@ pub struct WasiProcess {
+     /// outside the inner lock so the syscall entry path can find out that
+     /// there is no timed signal to deliver without taking it.
+     pub(crate) signal_interval_count: Arc<AtomicUsize>,
 +    /// File-backed ranges overlaid onto this process's WebAssembly memory,
 +    /// outside the inner lock so the futex path never contends with thread
 +    /// and signal bookkeeping.
@@ -786,10 +786,10 @@ index 4deeb12..eb62e37 100644
  }
  
  /// Represents a freeze of all threads to perform some action
-@@ -475,6 +516,7 @@ impl WasiProcess {
-             ),
+@@ -484,6 +525,7 @@ impl WasiProcess {
              waiting,
              cpu_run_tokens: Arc::new(AtomicU32::new(0)),
+             signal_interval_count: Default::default(),
 +            shared_memory_mappings: Default::default(),
          }
      }

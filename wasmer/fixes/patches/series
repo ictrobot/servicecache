@@ -10,3 +10,7 @@
 0010-wasix-do-not-interrupt-a-syscall-that-cannot-block.patch
 0011-wasix-refresh-a-socket-future-s-waker-on-every-poll.patch
 0012-wasix-let-an-unset-socket-timeout-mean-no-deadline.patch
+0013-wasix-check-for-signals-and-exit-without-locking-on-.patch
+0014-wasix-do-less-on-the-syscall-entry-path-when-nothing.patch
+0015-wasix-keep-clock-offsets-in-atomics-instead-of-a-loc.patch
+0016-virtual-io-keep-interest-wakers-in-fixed-slots-inste.patch

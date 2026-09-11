@@ -1,0 +1,291 @@
+Subject: wasix: do less on the syscall entry path when nothing is pending
+
+Every WASIX syscall begins with do_pending_operations, which asks the
+thread and the process whether anything has come up. What is left of
+that question, now that the signal queue and the exit status answer from
+atomics, is three reads of the instance handles and, for a guest that
+has installed a signal handler, a lock on the process inner state taken
+on every call. A profile of a guest under load put
+process_signals_internal, which is where that lock is taken, at 4% of
+the runtime's user-mode cycles, more than the clock syscall many of
+those calls go on to make.
+
+The lock is taken to look at signal_intervals, the timed signals a
+guest asks for with proc_raise_interval. The map is empty unless the
+guest asked for one, and almost none do, but the scan for a due signal
+locks the same state that thread bookkeeping and checkpoints use.
+Publish how many entries the map holds in an atomic beside the lock,
+written by signal_interval while it holds the lock, and read it before
+the scan. The count a reader sees is one the map had; a reader that
+races an install sees the count from one side of the change or the
+other, exactly as a read an instant earlier would have, and the next
+syscall, which every guest makes in short order, picks the new signal
+up. This is the shape SharedMemoryMappings already uses for the futex
+path.
+
+The instance handles are read three times over that path: once by
+process_signals_and_exit to see whether a handler is installed, once
+by process_signals to see the same thing, and once by
+process_signals_internal to take the handler. Read them once, into the
+two facts the path needs, and pass those down. On the backend where
+the handles live behind a thread-local table that is a lookup, a
+borrow and a reference count each time; process_signals, which nothing
+else called, folds into the shared step. With no signal queued and no
+timed signal to be due, the path now stops before the handler is
+reached at all, and answers exactly as it did before: the handler was
+installed, and no signal was delivered to it.
+
+The slow paths are untouched. Once a signal is queued or a timed
+signal exists, the same lock, the same scan and the same handler call
+run as they did.
+
+Unit tests cover the count following an install and a removal, one
+timed signal not hiding another, every handle of a process seeing what
+another set, and a removal that removes nothing announcing nothing.
+
+diff --git a/lib/wasix/src/os/task/process.rs b/lib/wasix/src/os/task/process.rs
+index 9b6ab37..32a2792 100644
+--- a/lib/wasix/src/os/task/process.rs
++++ b/lib/wasix/src/os/task/process.rs
+@@ -10,7 +10,7 @@ use std::{
+     ops::Range,
+     sync::{
+         Arc, Condvar, Mutex, MutexGuard, Weak,
+-        atomic::{AtomicU32, Ordering},
++        atomic::{AtomicU32, AtomicUsize, Ordering},
+     },
+     task::Waker,
+     time::Duration,
+@@ -111,6 +111,10 @@ pub struct WasiProcess {
+     /// the exponential backoff of CPU is halted (as in CPU
+     /// is allowed to run freely)
+     pub(crate) cpu_run_tokens: Arc<AtomicU32>,
++    /// How many entries `WasiProcessInner::signal_intervals` holds, kept
++    /// outside the inner lock so the syscall entry path can find out that
++    /// there is no timed signal to deliver without taking it.
++    pub(crate) signal_interval_count: Arc<AtomicUsize>,
+ }
+ 
+ /// Represents a freeze of all threads to perform some action
+@@ -161,7 +165,11 @@ pub struct WasiProcessInner {
+     pub threads: HashMap<WasiThreadId, WasiThread>,
+     /// Number of threads running for this process
+     pub thread_count: u32,
+-    /// Signals that will be triggered at specific intervals
++    /// Signals that will be triggered at specific intervals.
++    ///
++    /// Add and remove entries through [`WasiProcess::signal_interval`], which
++    /// keeps [`WasiProcess::signal_interval_count`] in step with the map; an
++    /// entry inserted here directly is invisible to the syscall entry path.
+     pub signal_intervals: HashMap<Signal, WasiSignalInterval>,
+     /// List of all the children spawned from this thread
+     pub children: Vec<WasiProcess>,
+@@ -475,6 +483,7 @@ impl WasiProcess {
+             ),
+             waiting,
+             cpu_run_tokens: Arc::new(AtomicU32::new(0)),
++            signal_interval_count: Default::default(),
+         }
+     }
+ 
+@@ -776,6 +785,7 @@ impl WasiProcess {
+         let interval = match interval {
+             None => {
+                 inner.signal_intervals.remove(&signal);
++                self.publish_signal_interval_count(&inner);
+                 return;
+             }
+             Some(a) => a,
+@@ -791,6 +801,28 @@ impl WasiProcess {
+                 repeat,
+             },
+         );
++        self.publish_signal_interval_count(&inner);
++    }
++
++    /// Records how many timed signals the process has, for
++    /// [`Self::has_signal_intervals`] to read without the inner lock. Called
++    /// with that lock held, so the count a reader sees is one the map had.
++    fn publish_signal_interval_count(&self, inner: &WasiProcessInner) {
++        self.signal_interval_count
++            .store(inner.signal_intervals.len(), Ordering::Relaxed);
++    }
++
++    /// Whether the process has any timed signal.
++    ///
++    /// Read on every syscall that processes signals, so that the common case
++    /// of a process which has never asked for one skips the inner lock the
++    /// scan for a due signal would take. Relaxed is enough: a reader that
++    /// races [`Self::signal_interval`] sees the count from one side of the
++    /// change or the other, exactly as a read an instant earlier would have,
++    /// and a signal installed in that instant is picked up by the next
++    /// syscall.
++    pub fn has_signal_intervals(&self) -> bool {
++        self.signal_interval_count.load(Ordering::Relaxed) != 0
+     }
+ 
+     /// Returns the number of active threads for this process
+@@ -1054,4 +1086,47 @@ mod tests {
+         );
+         assert_eq!(parent.try_join_any_child(), Err(Errno::Child));
+     }
++
++    #[test]
++    fn timed_signals_are_announced_without_the_inner_lock() {
++        let plane = WasiControlPlane::default();
++        let process = plane.new_process(ModuleHash::random()).unwrap();
++        assert!(!process.has_signal_intervals());
++
++        process.signal_interval(Signal::Sigalrm, Some(Duration::from_millis(10)), true);
++        assert!(process.has_signal_intervals());
++        assert_eq!(process.lock().signal_intervals.len(), 1);
++
++        // A second clock does not hide the first when it is taken away.
++        process.signal_interval(Signal::Sigvtalrm, Some(Duration::from_millis(20)), false);
++        process.signal_interval(Signal::Sigalrm, None, false);
++        assert!(process.has_signal_intervals());
++        assert_eq!(process.lock().signal_intervals.len(), 1);
++
++        process.signal_interval(Signal::Sigvtalrm, None, false);
++        assert!(!process.has_signal_intervals());
++        assert!(process.lock().signal_intervals.is_empty());
++    }
++
++    #[test]
++    fn timed_signals_are_announced_to_every_handle_of_the_process() {
++        let plane = WasiControlPlane::default();
++        let process = plane.new_process(ModuleHash::random()).unwrap();
++        let other_handle = process.clone();
++
++        process.signal_interval(Signal::Sigalrm, Some(Duration::from_millis(10)), true);
++        assert!(other_handle.has_signal_intervals());
++
++        other_handle.signal_interval(Signal::Sigalrm, None, false);
++        assert!(!process.has_signal_intervals());
++    }
++
++    #[test]
++    fn a_removed_timed_signal_that_was_never_there_announces_nothing() {
++        let plane = WasiControlPlane::default();
++        let process = plane.new_process(ModuleHash::random()).unwrap();
++
++        process.signal_interval(Signal::Sigalrm, None, false);
++        assert!(!process.has_signal_intervals());
++    }
+ }
+diff --git a/lib/wasix/src/state/env.rs b/lib/wasix/src/state/env.rs
+index 1555bc5..020c025 100644
+--- a/lib/wasix/src/state/env.rs
++++ b/lib/wasix/src/state/env.rs
+@@ -245,6 +245,20 @@ impl Clone for WasiEnv {
+     }
+ }
+ 
++/// What the instance handles say about the guest's signal handler.
++///
++/// Read once at the top of a syscall and passed down, so that the handles,
++/// which on some backends cost a thread-local lookup to reach, are found once
++/// rather than once per step of the signal check.
++#[derive(Debug, Clone, Copy)]
++struct SignalHandlerState {
++    /// Whether the guest has ever installed a signal handler. When it has
++    /// not, signals are handled by the runtime instead of the guest.
++    signal_set: bool,
++    /// Whether a handler function is currently registered.
++    has_handler: bool,
++}
++
+ impl WasiEnv {
+     /// Construct a new [`WasiEnvBuilder`] that allows customizing an environment.
+     pub fn builder(program_name: impl Into<String>) -> WasiEnvBuilder {
+@@ -712,11 +726,8 @@ impl WasiEnv {
+         // If a signal handler has never been set then we need to handle signals
+         // differently
+         let env = ctx.data();
+-        let env_inner = env
+-            .try_inner()
+-            .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
+-        let inner = env_inner.main_module_instance_handles();
+-        if !inner.signal_set {
++        let handler = Self::signal_handler_state(env)?;
++        if !handler.signal_set {
+             let signals = env.thread.pop_signals();
+             if !signals.is_empty() {
+                 for sig in signals {
+@@ -741,32 +752,46 @@ impl WasiEnv {
+             return Err(WasiError::Exit(forced_exit));
+         }
+ 
+-        Self::process_signals(ctx)
++        // The instance handles were already read above, so pass what they said
++        // rather than looking them up again.
++        Self::process_signals_for(ctx, handler)
+     }
+ 
+-    /// Processes any signals that are batched up
+-    pub(crate) fn process_signals(ctx: &mut FunctionEnvMut<'_, Self>) -> WasiResult<bool> {
+-        // If a signal handler has never been set then we need to handle signals
+-        // differently
+-        let env = ctx.data();
++    /// Reads what the instance handles say about the guest's signal handler.
++    fn signal_handler_state(env: &Self) -> Result<SignalHandlerState, WasiError> {
+         let env_inner = env
+             .try_inner()
+             .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
+         let inner = env_inner.main_module_instance_handles();
+-        if !inner.signal_set {
++        Ok(SignalHandlerState {
++            signal_set: inner.signal_set,
++            has_handler: inner.signal.is_some(),
++        })
++    }
++
++    /// Processes any signals that are batched up, given what the instance
++    /// handles said about the guest's signal handler.
++    fn process_signals_for(
++        ctx: &mut FunctionEnvMut<'_, Self>,
++        handler: SignalHandlerState,
++    ) -> WasiResult<bool> {
++        // If a signal handler has never been set, or none is registered right
++        // now, the runtime handles signals rather than the guest.
++        if !handler.signal_set || !handler.has_handler {
+             return Ok(Ok(false));
+         }
+ 
+-        // Check for any signals that we need to trigger
+-        // (but only if a signal handler is registered)
+-        let ret = if inner.signal.as_ref().is_some() {
+-            let signals = env.thread.pop_signals();
+-            Self::process_signals_internal(ctx, signals)?
+-        } else {
+-            false
+-        };
++        let env = ctx.data();
++        let signals = env.thread.pop_signals();
++        if signals.is_empty() && !env.process.has_signal_intervals() {
++            // Nothing was queued and no timed signal can be due, so there is
++            // nothing for the handler to be called with. Saying that here
++            // keeps the handler lookup and the process lock that the scan for
++            // a due signal takes off the path every syscall runs.
++            return Ok(Ok(true));
++        }
+ 
+-        Ok(Ok(ret))
++        Ok(Ok(Self::process_signals_internal(ctx, signals)?))
+     }
+ 
+     pub(crate) fn process_signals_internal(
+@@ -779,9 +804,11 @@ impl WasiEnv {
+             .ok_or_else(|| WasiError::Exit(Errno::Fault.into()))?;
+         let inner = env_inner.main_module_instance_handles();
+         if let Some(handler) = inner.signal.clone() {
+-            // We might also have signals that trigger on timers
++            // We might also have signals that trigger on timers. A process
++            // that has never asked for one has no map to scan, and the count
++            // says so without taking the lock that holds it.
+             let mut now = 0;
+-            {
++            if env.process.has_signal_intervals() {
+                 let mut has_signal_interval = false;
+                 let mut inner = env.process.inner.0.lock().unwrap();
+                 if !inner.signal_intervals.is_empty() {

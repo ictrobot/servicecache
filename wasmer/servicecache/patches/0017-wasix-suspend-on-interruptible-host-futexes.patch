@@ -601,7 +601,7 @@ index 33725f6..674456d 100644
  host-reqwest = ["reqwest"]
  host-fs = ["virtual-fs/host-fs"]
 diff --git a/lib/wasix/src/os/task/thread.rs b/lib/wasix/src/os/task/thread.rs
-index 6180c63..8c0175a 100644
+index 9516d09..5ebf3f5 100644
 --- a/lib/wasix/src/os/task/thread.rs
 +++ b/lib/wasix/src/os/task/thread.rs
 @@ -10,7 +10,7 @@ use crate::{
@@ -622,7 +622,7 @@ index 6180c63..8c0175a 100644
      stack: Mutex<ThreadStack>,
      status: Arc<OwnedTaskStatus>,
      #[cfg(feature = "journal")]
-@@ -269,6 +271,7 @@ impl WasiThread {
+@@ -275,6 +277,7 @@ impl WasiThread {
                  id,
                  status,
                  signals: Mutex::new((Vec::new(), Vec::new())),
@@ -630,7 +630,7 @@ index 6180c63..8c0175a 100644
                  stack: Mutex::new(ThreadStack::default()),
                  #[cfg(feature = "journal")]
                  check_pointing: AtomicBool::new(false),
-@@ -332,6 +335,7 @@ impl WasiThread {
+@@ -342,6 +345,7 @@ impl WasiThread {
      /// joined on it to wake up)
      pub fn set_status_finished(&self, res: Result<ExitCode, WasiRuntimeError>) {
          self.state.status.set_finished(res.map_err(Arc::new));
@@ -638,9 +638,9 @@ index 6180c63..8c0175a 100644
      }
  
      /// Waits until the thread is finished or the timeout is reached
-@@ -354,6 +358,24 @@ impl WasiThread {
-             guard.0.push(signal);
-         }
+@@ -367,6 +371,24 @@ impl WasiThread {
+         // between the push above and this store.
+         self.state.signals_pending.store(true, Ordering::Release);
          guard.1.drain(..).for_each(|w| w.wake());
 +        drop(guard);
 +        self.interrupt_waits();

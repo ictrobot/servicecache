@@ -1,0 +1,297 @@
+Subject: wasix: check for signals and exit without locking on the fast path
+
+Every WASIX syscall begins with do_pending_operations, which drains the
+thread's signal queue and then asks the thread and the process whether
+they have finished. Draining the queue locks its mutex and swaps a
+vector out, once when no signal handler is installed and a second time
+in process_signals when one is; asking about the finished status borrows
+a tokio watch and clones the status out of it, once for the thread and
+once for the process. A guest that has no signal queued and is not
+exiting pays all of that on every call. In a profile of a guest under
+load, those checks were 7% of the runtime's user-mode samples, which is
+more than the clock syscall many of them precede.
+
+Give each of the two questions an atomic that answers it in the common
+case. WasiThread gains a signals_pending flag, set by signal() while it
+holds the queue's lock and cleared by the two pops before they take the
+queue, also under that lock; pop_signals answers with an empty vector
+and no lock when the flag is clear. Because the flag only ever changes
+with the lock held, a push that races a pop sets it again after the pop
+cleared it, so no signal is stranded, and a read that finds it clear
+has not passed a queued signal. The queue is still reachable through
+signals(), which callers use to read it; queueing a signal there rather
+than through signal() would now be invisible, so the accessor says so.
+
+OwnedTaskStatus gains a finished flag, set before the finished status
+is sent to the watch and never cleared, since a task that has finished
+stays finished; try_finished consults it before borrowing the watch.
+Both the thread's and the process's try_join go through that status, so
+the pair of borrows the entry path makes becomes a pair of atomic
+loads. A reader that finds the flag set in the instant before the
+status is sent falls through to the watch and reads Running, exactly as
+a read an instant earlier would have, and sees the exit on its next
+check, which every syscall makes.
+
+The slow paths are untouched: once either flag says yes, the same lock,
+the same swap and the same watch borrow run as they did. Unit tests
+cover a signal queued after a pop being seen by the next pop, the
+subscribing pop clearing the flag as well, and a thread and a task
+status being seen as finished as soon as they are.
+
+diff --git a/lib/wasix/src/os/task/process.rs b/lib/wasix/src/os/task/process.rs
+index 4deeb12..9b6ab37 100644
+--- a/lib/wasix/src/os/task/process.rs
++++ b/lib/wasix/src/os/task/process.rs
+@@ -807,7 +807,7 @@ impl WasiProcess {
+ 
+     /// Attempts to join on the process
+     pub fn try_join(&self) -> Option<Result<ExitCode, Arc<WasiRuntimeError>>> {
+-        self.finished.status().into_finished()
++        self.finished.try_finished()
+     }
+ 
+     /// Waits for all the children to be finished
+diff --git a/lib/wasix/src/os/task/task_join_handle.rs b/lib/wasix/src/os/task/task_join_handle.rs
+index d503817..d20ee53 100644
+--- a/lib/wasix/src/os/task/task_join_handle.rs
++++ b/lib/wasix/src/os/task/task_join_handle.rs
+@@ -1,6 +1,9 @@
+ use std::{
+     pin::Pin,
+-    sync::Arc,
++    sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    },
+     task::{Context, Poll},
+ };
+ 
+@@ -75,6 +78,14 @@ pub struct OwnedTaskStatus {
+     // The signal handler that can be invoked for this owned task
+     signal_handler: Arc<DynSignalHandlerAbi>,
+ 
++    // Mirrors whether the watched status is Finished. Borrowing the watch
++    // takes its lock and clones the status, and every syscall asks a thread
++    // and a process whether they have finished, so the answer is kept here
++    // and the watch is read only once it is yes. Set before the finished
++    // status is sent and never cleared, since a task that has finished stays
++    // finished.
++    finished: AtomicBool,
++
+     watch_tx: tokio::sync::watch::Sender<TaskStatus>,
+     // Even through unused, without this receive there is a race condition
+     // where the previously sent values are lost.
+@@ -84,9 +95,11 @@ pub struct OwnedTaskStatus {
+ 
+ impl OwnedTaskStatus {
+     pub fn new(status: TaskStatus) -> Self {
++        let finished = AtomicBool::new(status.is_finished());
+         let (tx, rx) = tokio::sync::watch::channel(status);
+         Self {
+             signal_handler: default_signal_handler(),
++            finished,
+             watch_tx: tx,
+             watch_rx: rx,
+         }
+@@ -129,6 +142,11 @@ impl OwnedTaskStatus {
+                 }
+             }
+         };
++        // Published before the status is sent, so a reader that finds it
++        // clear has not been passed by a finished status; one that finds it
++        // set and the status not yet sent reads Running, exactly as a read
++        // an instant earlier would have.
++        self.finished.store(true, Ordering::Release);
+         self.watch_tx.send_modify(move |old| {
+             if !old.is_finished() {
+                 *old = TaskStatus::Finished(inner);
+@@ -140,6 +158,15 @@ impl OwnedTaskStatus {
+         self.watch_tx.borrow().clone()
+     }
+ 
++    /// The task's result, if it has finished, without reading the watch
++    /// unless it has.
++    pub fn try_finished(&self) -> Option<Result<ExitCode, Arc<WasiRuntimeError>>> {
++        if !self.finished.load(Ordering::Acquire) {
++            return None;
++        }
++        self.status().into_finished()
++    }
++
+     pub async fn await_termination(&self) -> Result<ExitCode, Arc<WasiRuntimeError>> {
+         let mut receiver = self.watch_tx.subscribe();
+         loop {
+@@ -221,3 +248,28 @@ impl TaskJoinHandle {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_finished_task_is_seen_without_reading_the_watch() {
++        let status = OwnedTaskStatus::default();
++        assert!(status.try_finished().is_none());
++        status.set_running();
++        assert!(status.try_finished().is_none());
++
++        status.set_finished(Ok(ExitCode::from(3)));
++        assert_eq!(status.try_finished().unwrap().unwrap(), ExitCode::from(3));
++        // The first result stands, as it does in the watched status.
++        status.set_finished(Ok(ExitCode::from(4)));
++        assert_eq!(status.try_finished().unwrap().unwrap(), ExitCode::from(3));
++    }
++
++    #[test]
++    fn a_task_that_starts_finished_is_seen_the_same_way() {
++        let status = OwnedTaskStatus::new_finished_with_code(ExitCode::from(7));
++        assert_eq!(status.try_finished().unwrap().unwrap(), ExitCode::from(7));
++    }
++}
+diff --git a/lib/wasix/src/os/task/thread.rs b/lib/wasix/src/os/task/thread.rs
+index 6180c63..9516d09 100644
+--- a/lib/wasix/src/os/task/thread.rs
++++ b/lib/wasix/src/os/task/thread.rs
+@@ -244,6 +244,12 @@ struct WasiThreadState {
+     #[cfg(feature = "journal")]
+     check_pointing: AtomicBool,
+     deep_sleeping: AtomicBool,
++    /// Mirrors whether the signal queue holds anything. Every syscall asks
++    /// the queue that question and for almost every one the answer is no,
++    /// so it is kept here and the queue's mutex is taken only when it is
++    /// yes. Set and cleared while that mutex is held, so a push that races
++    /// a pop sets it again after the pop has cleared it.
++    signals_pending: AtomicBool,
+ 
+     // Registers the task termination with the ControlPlane on drop.
+     // Never accessed, since it's a drop guard.
+@@ -273,6 +279,7 @@ impl WasiThread {
+                 #[cfg(feature = "journal")]
+                 check_pointing: AtomicBool::new(false),
+                 deep_sleeping: AtomicBool::new(false),
++                signals_pending: AtomicBool::new(false),
+                 _task_count_guard: guard,
+             }),
+             layout,
+@@ -302,6 +309,9 @@ impl WasiThread {
+     }
+ 
+     // TODO: this should be private, access should go through utility methods.
++    // A caller may read the queue through this handle but must not queue a
++    // signal on it: `signal` also publishes that the queue is not empty, and
++    // a push made here would be invisible to `pop_signals`.
+     pub fn signals(&self) -> &Mutex<(Vec<Signal>, Vec<Waker>)> {
+         &self.state.signals
+     }
+@@ -341,7 +351,7 @@ impl WasiThread {
+ 
+     /// Attempts to join on the thread
+     pub fn try_join(&self) -> Option<Result<ExitCode, Arc<WasiRuntimeError>>> {
+-        self.state.status.status().into_finished()
++        self.state.status.try_finished()
+     }
+ 
+     /// Adds a signal for this thread to process
+@@ -353,6 +363,9 @@ impl WasiThread {
+         if !guard.0.contains(&signal) {
+             guard.0.push(signal);
+         }
++        // Published while the queue is locked, so a pop cannot clear it
++        // between the push above and this store.
++        self.state.signals_pending.store(true, Ordering::Release);
+         guard.1.drain(..).for_each(|w| w.wake());
+     }
+ 
+@@ -391,6 +404,7 @@ impl WasiThread {
+     /// Returns all the signals that are waiting to be processed
+     pub fn pop_signals_or_subscribe(&self, waker: &Waker) -> Option<Vec<Signal>> {
+         let mut guard = self.state.signals.lock().unwrap();
++        self.state.signals_pending.store(false, Ordering::Release);
+         let mut ret = Vec::new();
+         std::mem::swap(&mut ret, &mut guard.0);
+         match ret.is_empty() {
+@@ -423,7 +437,17 @@ impl WasiThread {
+ 
+     /// Returns all the signals that are waiting to be processed
+     pub fn pop_signals(&self) -> Vec<Signal> {
++        // The queue is empty on all but a vanishing fraction of the calls
++        // that drain it, and the flag is set while the queue is locked, so a
++        // read of it that finds nothing pending has not passed a queued
++        // signal and can answer without taking the mutex.
++        if !self.state.signals_pending.load(Ordering::Acquire) {
++            return Vec::new();
++        }
+         let mut guard = self.state.signals.lock().unwrap();
++        // Cleared before the queue is taken and under the same lock, so a
++        // push that follows this one sets it again.
++        self.state.signals_pending.store(false, Ordering::Release);
+         let mut ret = Vec::new();
+         std::mem::swap(&mut ret, &mut guard.0);
+         ret
+@@ -654,3 +678,64 @@ impl From<WasiThreadError> for Errno {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::os::task::control_plane::WasiControlPlane;
++    use wasmer_types::ModuleHash;
++
++    fn new_thread() -> WasiThreadHandle {
++        let plane = WasiControlPlane::default();
++        let process = plane.new_process(ModuleHash::random()).unwrap();
++        process
++            .new_thread(WasiMemoryLayout::default(), ThreadStartType::MainThread)
++            .unwrap()
++    }
++
++    #[test]
++    fn a_signal_queued_after_a_pop_is_seen_by_the_next_one() {
++        let handle = new_thread();
++        let thread = handle.as_thread();
++
++        assert!(thread.pop_signals().is_empty());
++        thread.signal(Signal::Sigusr1);
++        assert_eq!(thread.pop_signals(), vec![Signal::Sigusr1]);
++        assert!(thread.pop_signals().is_empty());
++
++        thread.signal(Signal::Sigusr2);
++        assert_eq!(thread.pop_signals(), vec![Signal::Sigusr2]);
++        assert!(thread.pop_signals().is_empty());
++    }
++
++    #[test]
++    fn a_subscribing_pop_leaves_nothing_behind_either() {
++        let handle = new_thread();
++        let thread = handle.as_thread();
++        let waker = Waker::noop();
++
++        assert!(thread.pop_signals_or_subscribe(waker).is_none());
++        thread.signal(Signal::Sigusr1);
++        assert_eq!(
++            thread.pop_signals_or_subscribe(waker),
++            Some(vec![Signal::Sigusr1])
++        );
++        assert!(thread.pop_signals().is_empty());
++
++        thread.signal(Signal::Sigusr2);
++        assert_eq!(thread.pop_signals(), vec![Signal::Sigusr2]);
++    }
++
++    #[test]
++    fn a_finished_thread_is_seen_by_a_join_that_follows() {
++        let handle = new_thread();
++        let thread = handle.as_thread();
++
++        assert!(thread.try_join().is_none());
++        thread.set_status_running();
++        assert!(thread.try_join().is_none());
++
++        thread.set_status_finished(Ok(ExitCode::from(5)));
++        assert_eq!(thread.try_join().unwrap().unwrap(), ExitCode::from(5));
++    }
++}
