@@ -1,0 +1,199 @@
+Subject: wasix: do not interrupt a syscall that cannot block
+
+__asyncify polls the work once and, when it is still pending and the
+thread has signals queued, runs their handlers and returns Intr,
+dropping the work. Host file operations go to Tokio's blocking pool, so
+their first poll is always pending: a file syscall that runs through
+__asyncify fails with EINTR whenever a signal is queued while it is in
+flight. That is the answer a call the guest may block in owes its
+caller, as a socket read, a wait or a sleep does, applied to calls that
+cannot block, where the guest has no reason to expect it and no way to
+tell a spurious failure from a real one.
+
+POSIX gives lseek no EINTR at all: it does not block, so a caller may
+take its answer as final, and a caller that measures a file by seeking
+to its end therefore never retries. Under WASIX such a caller was told
+the file had no size whenever a signal arrived during the seek, which a
+parallel index build in a guest database server, whose workers signal
+the leader while it extends the relation it is filling, hit in most
+runs. fsync and fdatasync may return EINTR by the letter of POSIX, but
+a handler installed with SA_RESTART restarts them, nothing in a host
+flush waits on the guest, and Intr here abandons the flush while the
+host may still perform it, so the guest is told its data is unsynced
+with no way to learn otherwise.
+
+Give the asyncify machinery a second entry point for work that cannot
+block. It runs the queued handlers exactly as before, so a handler that
+exits the process still ends the call, and then polls the work again
+instead of abandoning it, going round until the queue is empty and the
+waker is subscribed again, so the syscall returns the answer it was
+asked for. The callers that take it are fd_seek's seek to the end of a
+file, fd_sync and fd_datasync, each of which reaches __asyncify only
+for a file handle.
+
+This is not general syscall restart. The sync calls complete whether
+or not the handler was installed with SA_RESTART, which a caller
+cannot tell from a sync that finished before the signal arrived, and
+no other call is restarted.
+
+Everything else keeps the interruptible entry point. sock_send_file
+reads a file too, but the call it is part of writes that file to a
+socket and blocks for as long as the socket takes, so it is a call the
+guest may block in and EINTR is its caller's to expect; the same goes
+for name resolution, process spawning and the network-port calls. Reads
+and writes are not affected either way, since they go through the light
+asyncify, which never looks at the signal queue; opening a path,
+stat-ing one, reading a directory and unlinking do not asyncify at all.
+
+diff --git a/lib/wasix/src/syscalls/mod.rs b/lib/wasix/src/syscalls/mod.rs
+index a80e76e..2ec5670 100644
+--- a/lib/wasix/src/syscalls/mod.rs
++++ b/lib/wasix/src/syscalls/mod.rs
+@@ -307,11 +307,48 @@ where
+ /// thus allowed for asynchronous operations to execute. It has built in functionality
+ /// to (optionally) timeout the IO, force exit the process, callback signals and pump
+ /// synchronous IO engine
++///
++/// The work is abandoned and `Errno::Intr` returned when a signal is queued
++/// while it is still pending, which is what a call the guest may block in
++/// owes its caller. Use [`__asyncify_uninterruptible`] for work that cannot
++/// block, where `Errno::Intr` would be a failure the guest has no way to
++/// have expected.
+ pub(crate) fn __asyncify<T, Fut>(
+     ctx: &mut FunctionEnvMut<'_, WasiEnv>,
+     timeout: Option<Duration>,
+     work: Fut,
+ ) -> WasiResult<T>
++where
++    T: 'static,
++    Fut: std::future::Future<Output = Result<T, Errno>>,
++{
++    __asyncify_maybe_interruptible(ctx, timeout, work, true)
++}
++
++/// As [`__asyncify`], for work that cannot block.
++///
++/// Queued signals still have their handlers run while the work is pending,
++/// but the work is then polled again rather than abandoned, so the call
++/// returns what it was asked for instead of `Errno::Intr`. A handler that
++/// exits the process still ends the call, as it does everywhere else.
++pub(crate) fn __asyncify_uninterruptible<T, Fut>(
++    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
++    timeout: Option<Duration>,
++    work: Fut,
++) -> WasiResult<T>
++where
++    T: 'static,
++    Fut: std::future::Future<Output = Result<T, Errno>>,
++{
++    __asyncify_maybe_interruptible(ctx, timeout, work, false)
++}
++
++fn __asyncify_maybe_interruptible<T, Fut>(
++    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
++    timeout: Option<Duration>,
++    work: Fut,
++    interruptible: bool,
++) -> WasiResult<T>
+ where
+     T: 'static,
+     Fut: std::future::Future<Output = Result<T, Errno>>,
+@@ -330,6 +367,7 @@ where
+     {
+         ctx: &'a mut FunctionEnvMut<'b, WasiEnv>,
+         pinned_work: Pin<Box<Fut>>,
++        interruptible: bool,
+     }
+     impl<Fut, T> Future for SignalPoller<'_, '_, Fut, T>
+     where
+@@ -337,23 +375,38 @@ where
+     {
+         type Output = Result<Fut::Output, WasiError>;
+         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+-            if let Poll::Ready(res) = Pin::new(&mut self.pinned_work).poll(cx) {
+-                return Poll::Ready(Ok(res));
+-            }
+-            if let Some(signals) = self.ctx.data().thread.pop_signals_or_subscribe(cx.waker()) {
++            loop {
++                if let Poll::Ready(res) = Pin::new(&mut self.pinned_work).poll(cx) {
++                    return Poll::Ready(Ok(res));
++                }
++                let Some(signals) = self.ctx.data().thread.pop_signals_or_subscribe(cx.waker())
++                else {
++                    // The queue was empty, so the waker above is subscribed
++                    // and a later signal will poll us again.
++                    return Poll::Pending;
++                };
+                 if let Err(err) = WasiEnv::process_signals_internal(self.ctx, signals) {
+                     return Poll::Ready(Err(err));
+                 }
+-                return Poll::Ready(Ok(Err(Errno::Intr)));
++                if self.interruptible {
++                    return Poll::Ready(Ok(Err(Errno::Intr)));
++                }
++                // The work cannot block, so it is still owed an answer. Go
++                // round again: the poll above resubscribes the waker once the
++                // queue is empty, and picks up any signal that arrived while
++                // the handlers ran.
+             }
+-            Poll::Pending
+         }
+     }
+ 
+     // Block on the work
+     let mut pinned_work = Box::pin(work);
+     let tasks = env.tasks().clone();
+-    let poller = SignalPoller { ctx, pinned_work };
++    let poller = SignalPoller {
++        ctx,
++        pinned_work,
++        interruptible,
++    };
+     block_on_with_timeout(&tasks, timeout, poller)
+ }
+ 
+diff --git a/lib/wasix/src/syscalls/wasi/fd_datasync.rs b/lib/wasix/src/syscalls/wasi/fd_datasync.rs
+index cc82f35..42e8985 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_datasync.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_datasync.rs
+@@ -32,7 +32,9 @@ pub fn fd_datasync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<E
+     };
+     drop(fd_entry);
+ 
+-    Ok(wasi_try_ok!(__asyncify(&mut ctx, None, async move {
+-        FlushPoller { file }.await.map(|_| Errno::Success)
+-    })?))
++    Ok(wasi_try_ok!(__asyncify_uninterruptible(
++        &mut ctx,
++        None,
++        async move { FlushPoller { file }.await.map(|_| Errno::Success) }
++    )?))
+ }
+diff --git a/lib/wasix/src/syscalls/wasi/fd_seek.rs b/lib/wasix/src/syscalls/wasi/fd_seek.rs
+index 35fdf7a..e297b9e 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_seek.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_seek.rs
+@@ -97,7 +97,9 @@ pub(crate) fn fd_seek_internal(
+                         let fd_offset = fd_entry.inner.offset.clone();
+                         drop(guard);
+ 
+-                        wasi_try_ok_ok!(__asyncify(ctx, None, async move {
++                        // POSIX gives lseek no EINTR: it does not block, so
++                        // callers take its answer as final and never retry.
++                        wasi_try_ok_ok!(__asyncify_uninterruptible(ctx, None, async move {
+                             let mut handle = handle.write().unwrap();
+                             let end = handle
+                                 .seek(SeekFrom::End(offset))
+diff --git a/lib/wasix/src/syscalls/wasi/fd_sync.rs b/lib/wasix/src/syscalls/wasi/fd_sync.rs
+index 3030a5f..f1c4ad7 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_sync.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_sync.rs
+@@ -34,7 +34,7 @@ pub fn fd_sync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<Errno
+                     // TODO: remove allow once inodes are refactored (see comments on [`WasiState`])
+                     #[allow(clippy::await_holding_lock)]
+                     let size = {
+-                        wasi_try_ok!(__asyncify(&mut ctx, None, async move {
++                        wasi_try_ok!(__asyncify_uninterruptible(&mut ctx, None, async move {
+                             // TODO: remove allow once inodes are refactored (see comments on [`WasiState`])
+                             #[allow(clippy::await_holding_lock)]
+                             let mut handle = handle.write().unwrap();

@@ -261,6 +261,11 @@ run_smoke() {
     -o "$build_dir/signal-during-handler.wasm"
   run_fixes_expecting signal-during-handler.wasm \
     "WASIX signal during a handler still wakes the wait"
+  "$WASIXCC_DIR/bin/wasixcc" -O2 \
+    "$SC_ROOT/toolchain/smoke/lseek-under-signal.c" \
+    -o "$build_dir/lseek-under-signal.wasm"
+  run_fixes_expecting lseek-under-signal.wasm \
+    "WASIX seeks and syncs survive a signal flood"
 }
 
 install_current_set() {

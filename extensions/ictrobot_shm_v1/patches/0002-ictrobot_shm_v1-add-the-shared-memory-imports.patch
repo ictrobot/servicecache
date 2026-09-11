@@ -957,7 +957,7 @@ index 0000000..086af06
 +    })
 +}
 diff --git a/lib/wasix/src/syscalls/mod.rs b/lib/wasix/src/syscalls/mod.rs
-index a80e76e..a46f96f 100644
+index 2ec5670..944beb5 100644
 --- a/lib/wasix/src/syscalls/mod.rs
 +++ b/lib/wasix/src/syscalls/mod.rs
 @@ -21,6 +21,7 @@ pub mod wasm;
