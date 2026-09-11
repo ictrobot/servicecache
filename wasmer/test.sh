@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # wasmer/test.sh <variant> [cargo test arguments...]: run the unit tests of
-# the workspace crates that go into the CLIs we build — a superset of every
-# crate the patch sets modify — inside the variant's checkout, so that
+# the workspace crates that go into the CLIs we build, and of any other
+# crate the patch sets modify, inside the variant's checkout, so that
 # patches carry their tests and the tests actually run, and stock is the
 # unpatched baseline. Unit tests only (--lib): upstream's integration
 # targets range from fixture runners to a rig that compiles guest programs
@@ -31,13 +31,14 @@ git -C "$WASMER_VARIANT_TREE" submodule update --init --depth 1 \
   }
 
 # The workspace members in the dependency tree of lib/cli under the features
-# wasmer/build.sh builds with, minus wasmer-vm, which runs separately below.
+# wasmer/build.sh builds with, minus wasmer-vm, which runs separately below,
+# plus wasmer-sys-utils, which no CLI uses but the fixes set patches.
 crates=(
   virtual-fs virtual-mio virtual-net
   wasmer wasmer-backend-api wasmer-cli wasmer-compiler
   wasmer-compiler-cranelift wasmer-config
-  wasmer-derive wasmer-journal wasmer-package wasmer-sdk wasmer-types
-  wasmer-wasix wasmer-wasix-types wasmer-wast
+  wasmer-derive wasmer-journal wasmer-package wasmer-sdk wasmer-sys-utils
+  wasmer-types wasmer-wasix wasmer-wasix-types wasmer-wast
 )
 
 run_tests() {

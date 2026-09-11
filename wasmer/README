@@ -32,8 +32,8 @@ not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
 
 build.sh <variant> builds and installs a variant's CLI; setup.sh <variant>
 only prepares its checkout; test.sh <variant> runs the unit tests of the
-crates that go into the built CLIs — a superset of everything the patch
-sets modify — so patches carry their tests and the tests actually run;
+crates that go into the built CLIs, and of any other crate the patch sets
+modify, so patches carry their tests and the tests actually run;
 upstream's integration suites and the backends we do not build are left to
 upstream's CI. The matching make targets are wasmer-<variant>,
 test-wasmer-<variant> and clean-wasmer-<variant>.
