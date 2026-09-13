@@ -1,0 +1,1546 @@
+Subject: wasix: wait for a blocking socket operation on its own thread
+
+A socket operation that would block handed its wait to the shared event
+selector: it registered a handler on the socket, the calling thread
+parked, and the selector thread woke on the kernel event and handed it
+over. The thread that needs the readiness waits for the descriptor
+itself instead, and nothing is handed anywhere.
+
+`direct_socket_wait` in syscalls/mod.rs `ppoll`s the socket's own
+descriptor and this thread's interrupt word until the socket's timeout,
+and `__sock_direct` is the loop around it - attempt, wait, attempt again
+- called from `sock_recv`, `sock_recv_from`, `sock_send`,
+`sock_send_to`, `sock_accept`, `sock_connect` and the socket branches of
+`fd_read` and `fd_write`. The attempt comes first and does not wait,
+because an operation that can be answered at once must not pay for
+resolving a wait it never makes; only an `Again` looks the socket up. A
+descriptor the guest marked non-blocking is answered `Again` there and
+then, and a read that has already filled a buffer when the next one
+would block answers with what it read, since an attempt run again would
+read over it. A connection is started without waiting: a connecting
+descriptor becomes writable when its handshake ends, and the socket's
+status, which reads the error the kernel latched, says how it ended; the
+connect timeout is read before the connection is started, because the
+stream the connect installs keeps only its read and write timeouts, and
+the deadline it sets bounds the direct wait and, with whatever is left
+of it, the existing one.
+
+Nothing is claimed, so nothing has to be given back: anything the loop
+cannot serve - a runtime with no descriptor wait, a journalled call, a
+socket no descriptor can be named for, a wait that cannot be made, a
+signal, a thread finished before the wait captured its interrupt
+generation - runs the existing path whole, which registers the socket
+with the selector exactly as before. An interrupt is what anything
+reaching a thread through its syscall path raises, a signal or the
+barrier the other threads are held at while a dynamic link operation
+runs, so the wait ends and the call is answered where it was before.
+
+Each operation reports one trace event saying which path answered it and
+with what.
+
+diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
+index 0e842db..ed36ea0 100644
+--- a/lib/wasix/src/net/socket.rs
++++ b/lib/wasix/src/net/socket.rs
+@@ -2001,6 +2001,19 @@ pub(crate) mod tests {
+         (socket, handler, reads)
+     }
+ 
++    /// A stream socket that names the descriptor a test opened, so that
++    /// the test can wait for that descriptor and then use it.
++    pub(crate) fn host_descriptor_socket_for(host_fd: std::os::fd::RawFd) -> InodeSocket {
++        InodeSocket::new(InodeSocketKind::TcpStream {
++            socket: Box::new(MockTcpSocket {
++                host_fd: Some(host_fd),
++                ..Default::default()
++            }),
++            write_timeout: None,
++            read_timeout: None,
++        })
++    }
++
+     pub(crate) fn host_descriptor_socket() -> (InodeSocket, MockHandlerSlot) {
+         let handler: MockHandlerSlot = Arc::new(StdMutex::new(None));
+         let socket = InodeSocket::new(InodeSocketKind::TcpStream {
+diff --git a/lib/wasix/src/syscalls/mod.rs b/lib/wasix/src/syscalls/mod.rs
+index 944beb5..4510f9a 100644
+--- a/lib/wasix/src/syscalls/mod.rs
++++ b/lib/wasix/src/syscalls/mod.rs
+@@ -719,6 +719,341 @@ pub(crate) fn __sock_check_rights(
+     Ok(fd_entry)
+ }
+ 
++/// Which readiness a blocking socket operation is waiting for.
++///
++/// Hangup and error are not named here: every kernel reports them whether
++/// or not they were asked for, and either one means the operation should
++/// be attempted again so that it can answer with the real error.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum DirectSocketDirection {
++    /// The operation is waiting for something to arrive: a byte, a
++    /// connection, or the end of the stream.
++    Read,
++    /// The operation is waiting for room to write, or for a connection in
++    /// progress to finish.
++    Write,
++}
++
++#[cfg(all(unix, feature = "direct-waits"))]
++impl DirectSocketDirection {
++    /// The readiness to ask the kernel for. A read also asks about the
++    /// peer shutting its writing half down, which is a level the
++    /// operation's own retry turns into an end of file.
++    fn wanted(self) -> u16 {
++        match self {
++            Self::Read => wasmer_vm::HOST_POLL_READ | wasmer_vm::HOST_POLL_RDHUP,
++            Self::Write => wasmer_vm::HOST_POLL_WRITE,
++        }
++    }
++}
++
++/// What one direct wait on a socket's own descriptor did.
++#[cfg(all(unix, feature = "direct-waits"))]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum DirectSocketWait {
++    /// Something happened on the descriptor, or the backend was already
++    /// holding readiness: attempt the operation again.
++    Ready,
++    /// The socket's own timeout elapsed first.
++    TimedOut,
++    /// A signal is queued, or a producer the descriptor cannot see ended
++    /// the wait.
++    Interrupted,
++    /// This thread cannot wait on the descriptor; the caller's existing
++    /// wait runs instead.
++    Unavailable,
++}
++
++/// The descriptor a wait would name, the readiness it would ask for, and
++/// whether the backend is already holding some of it.
++///
++/// `None` is a socket with no host descriptor at all: nothing here can
++/// wait for it. Readiness the backend holds - an accepted connection, a
++/// datagram already read, a recorded shutdown - is not a level `ppoll`
++/// would see, so it is reported at once rather than slept through, and
++/// hangup and error count whatever was asked for, because the operation
++/// itself is what turns them into the guest's answer.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_socket_descriptor(
++    socket: &InodeSocket,
++    direction: DirectSocketDirection,
++) -> Option<(std::os::fd::RawFd, u16)> {
++    Some((socket.host_fd()?, direction.wanted()))
++}
++
++/// Waits for one socket on the thread that needs it.
++///
++/// Nothing is claimed and nothing is kept. A blocking socket operation
++/// names its socket at the call, waits for it here, and has answered the
++/// guest by the time it returns, so the rule is local to one operation: a
++/// socket waited on here is being waited on by this thread until the call
++/// returns, and a wait that cannot be done reaches the caller's existing
++/// future, which registers the socket with the shared selector exactly as
++/// it always has. That is why there is no demotion: nothing was taken
++/// away from the selector to give back.
++///
++/// The socket must be held alive by the caller for the whole wait: another
++/// guest thread closing the fd must not leave this one blocked on a number
++/// the kernel has since given to something else.
++#[cfg(all(unix, feature = "direct-waits"))]
++pub(crate) fn direct_socket_wait(
++    thread: &WasiThread,
++    exiting: &dyn Fn() -> bool,
++    socket: &InodeSocket,
++    direction: DirectSocketDirection,
++    deadline: Option<Instant>,
++) -> Option<DirectSocketWait> {
++    let (host_fd, wanted) = direct_socket_descriptor(socket, direction)?;
++
++    // Captured before the checks below and before the wait, so that
++    // anything arriving in between changes it and the wait returns at once
++    // instead of sleeping through it. A termination moves it without
++    // queueing a signal, which is why a finished thread is asked about too.
++    let interrupt = thread.wait_interrupt();
++    if thread.signals_pending() || exiting() {
++        return Some(DirectSocketWait::Interrupted);
++    }
++
++    let mut fds = [wasmer_vm::HostPollFd {
++        fd: host_fd,
++        events: wanted,
++        revents: 0,
++        nbytes: 0,
++    }];
++    let epoch = wasmer_vm::pollfd_epoch();
++    // SAFETY: the descriptor belongs to a socket the caller holds for the
++    // whole wait, and the interrupt word belongs to this thread, which is
++    // the one suspending.
++    let result =
++        unsafe { wasmer_vm::try_suspend_on_pollfd(&mut fds, interrupt.0, interrupt.1, deadline) };
++    Some(match result {
++        // Which levels fired is not read: the operation itself is what
++        // reports what the socket can do now, and it runs next.
++        Some(wasmer_vm::HostPollFdResult::Ready) => DirectSocketWait::Ready,
++        Some(wasmer_vm::HostPollFdResult::TimedOut) => DirectSocketWait::TimedOut,
++        Some(wasmer_vm::HostPollFdResult::Interrupted) => DirectSocketWait::Interrupted,
++        Some(wasmer_vm::HostPollFdResult::Unavailable) | None => {
++            // A fork rebuilt the networking under the wait, so the
++            // descriptor is resolved again rather than given up on.
++            if wasmer_vm::pollfd_epoch() != epoch {
++                DirectSocketWait::Ready
++            } else {
++                DirectSocketWait::Unavailable
++            }
++        }
++    })
++}
++
++/// What an operation that would block can do about the descriptor it
++/// would have blocked on.
++#[cfg(all(unix, feature = "direct-waits"))]
++pub(crate) enum DirectSocketTarget {
++    /// A socket this thread can wait for, and when the wait runs out.
++    Wait(InodeSocket, Option<Instant>),
++    /// The descriptor is marked non-blocking, so `Again` is the whole
++    /// answer: the existing path would take the same descriptor, make
++    /// the same attempt and report the same thing.
++    Again,
++    /// Nothing here can wait for this descriptor, and the caller's
++    /// existing path must.
++    Fallthrough,
++}
++
++/// The socket a blocking operation on `sock` would wait for, and when its
++/// wait would run out.
++#[cfg(all(unix, feature = "direct-waits"))]
++pub(crate) fn direct_socket_target(
++    env: &WasiEnv,
++    sock: WasiFd,
++    rights: Rights,
++    time: crate::net::socket::TimeType,
++) -> DirectSocketTarget {
++    let Ok(fd_entry) = __sock_check_rights(env, sock, rights) else {
++        return DirectSocketTarget::Fallthrough;
++    };
++    if fd_entry.inner.flags.contains(Fdflags::NONBLOCK) {
++        return DirectSocketTarget::Again;
++    }
++    let socket = {
++        let inode_guard = fd_entry.inode.read();
++        match inode_guard.deref() {
++            Kind::Socket { socket } => socket.clone(),
++            _ => return DirectSocketTarget::Fallthrough,
++        }
++    };
++    // Only a socket whose backend can name a host descriptor, and nothing
++    // is installed on it or read from it to find out.
++    if socket.host_fd().is_none() {
++        return DirectSocketTarget::Fallthrough;
++    }
++    let deadline = match socket.opt_time(time) {
++        Ok(Some(timeout)) => match Instant::now().checked_add(timeout) {
++            Some(deadline) => Some(deadline),
++            None => return DirectSocketTarget::Fallthrough,
++        },
++        _ => None,
++    };
++    DirectSocketTarget::Wait(socket, deadline)
++}
++
++/// The turns of one socket operation that waits on the thread that needs
++/// it: attempt, wait, attempt again.
++///
++/// The attempt must not block - it is the operation the guest asked for,
++/// run as if the descriptor were non-blocking - and `Again` is what says
++/// the wait is needed. A second `Again` after a wait is not a surprise:
++/// another thread on the same socket may have taken what arrived, and the
++/// answer is to wait again rather than to report a level that is gone.
++///
++/// `None` hands the whole call to the caller's existing path, which waits
++/// exactly as it did before. Nothing has to be undone first, because
++/// nothing was claimed. Every interrupt leaves this loop, so anything that
++/// has to reach a thread through its own syscall path - a signal, or the
++/// barrier a dynamic link operation holds the other threads at - gets the
++/// thread out of here and into that path, which is where it was answered
++/// before any of this existed.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_socket_turns<T>(
++    attempt: &mut dyn FnMut() -> Result<Result<T, Errno>, WasiError>,
++    wait: &mut dyn FnMut() -> Option<DirectSocketWait>,
++) -> Result<(Option<Result<T, Errno>>, &'static str), WasiError> {
++    loop {
++        match wait() {
++            Some(DirectSocketWait::Ready) => {}
++            Some(DirectSocketWait::TimedOut) => {
++                return Ok((Some(Err(Errno::Timedout)), "timeout"));
++            }
++            // A signal is the existing path's to deliver, and it does so
++            // for this call exactly as it would have without any of this.
++            Some(DirectSocketWait::Interrupted) => return Ok((None, "interrupted")),
++            Some(DirectSocketWait::Unavailable) | None => return Ok((None, "fallthrough")),
++        }
++        match attempt()? {
++            Err(Errno::Again) => {}
++            answer => return Ok((Some(answer), "waited")),
++        }
++    }
++}
++
++/// One event per socket operation that could have waited, saying which
++/// path answered it and with what, in the shape `poll_oneoff` and
++/// `epoll_wait` report themselves.
++///
++/// `outcome` is `done` for an operation that never had to wait, `again`
++/// for one on a descriptor the guest marked non-blocking, `waited` for
++/// one this thread waited for itself, `timeout` for the socket's own
++/// timeout, and `interrupted` or `fallthrough` for the existing path
++/// taking the call over.
++fn trace_socket_call(op: &'static str, direct: bool, outcome: &'static str) {
++    tracing::trace!(op, direct, outcome, "socket operation answered");
++}
++
++/// Runs a blocking socket operation on the thread that needs it, rather
++/// than handing its wait to the shared selector.
++///
++/// `attempt` is the operation as the guest asked for it, run as if the
++/// descriptor were non-blocking: it is tried first, because an operation
++/// that can be answered at once - which is most of them, the guest having
++/// polled the socket already - must not pay for resolving a wait it never
++/// makes. Only an `Again` looks the socket up, and only then is anything
++/// waited on.
++///
++/// `None` means the caller's existing path runs, unchanged and whole: the
++/// attempt above did nothing that the existing path will not do again.
++pub(crate) fn __sock_direct<T>(
++    env: &WasiEnv,
++    sock: WasiFd,
++    rights: Rights,
++    direction: DirectSocketDirection,
++    time: crate::net::socket::TimeType,
++    op: &'static str,
++    mut attempt: impl FnMut() -> Result<Result<T, Errno>, WasiError>,
++) -> Result<Option<Result<T, Errno>>, WasiError> {
++    #[cfg(not(all(unix, feature = "direct-waits")))]
++    {
++        Ok(None)
++    }
++    #[cfg(all(unix, feature = "direct-waits"))]
++    {
++        __sock_direct_unix(env, sock, rights, direction, time, op, attempt)
++    }
++}
++
++/// The body of [`__sock_direct`] where the descriptor wait exists.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn __sock_direct_unix<T>(
++    env: &WasiEnv,
++    sock: WasiFd,
++    rights: Rights,
++    direction: DirectSocketDirection,
++    time: crate::net::socket::TimeType,
++    op: &'static str,
++    mut attempt: impl FnMut() -> Result<Result<T, Errno>, WasiError>,
++) -> Result<Option<Result<T, Errno>>, WasiError> {
++    match attempt()? {
++        Err(Errno::Again) => {}
++        answer => {
++            trace_socket_call(op, true, "done");
++            return Ok(Some(answer));
++        }
++    }
++    let (socket, deadline) = match direct_socket_target(env, sock, rights, time) {
++        DirectSocketTarget::Wait(socket, deadline) => (socket, deadline),
++        DirectSocketTarget::Again => {
++            trace_socket_call(op, true, "again");
++            return Ok(Some(Err(Errno::Again)));
++        }
++        DirectSocketTarget::Fallthrough => {
++            trace_socket_call(op, false, "fallthrough");
++            return Ok(None);
++        }
++    };
++    let thread = env.thread.clone();
++    let exiting = || env.should_exit().is_some();
++    let (answer, outcome) = direct_socket_turns(&mut attempt, &mut || {
++        direct_socket_wait(&thread, &exiting, &socket, direction, deadline)
++    })?;
++    trace_socket_call(op, answer.is_some(), outcome);
++    Ok(answer)
++}
++
++/// Whether a blocking socket operation can be waited for on the thread
++/// that makes it: this runtime has the descriptor wait, the call is not
++/// journalled - a journalled call records its wait through the existing
++/// path - and the guest did not ask for an answer that never waits, which
++/// needs none of this.
++pub(crate) fn direct_socket_eligible(env: &WasiEnv, nonblocking: bool) -> bool {
++    #[cfg(all(unix, feature = "direct-waits"))]
++    {
++        !nonblocking && wasmer_vm::can_suspend_on_pollfd() && !env.enable_journal
++    }
++    #[cfg(not(all(unix, feature = "direct-waits")))]
++    {
++        false
++    }
++}
++
++/// The direct branch of a socket operation whose attempt answers with one
++/// `Result`, guard included.
++///
++/// `once` is the operation, and its argument says whether this call of it
++/// must not wait. `None` is the existing path, whole and unchanged.
++pub(crate) fn __sock_direct_attempt<T>(
++    env: &WasiEnv,
++    sock: WasiFd,
++    rights: Rights,
++    direction: DirectSocketDirection,
++    time: crate::net::socket::TimeType,
++    op: &'static str,
++    nonblocking: bool,
++    once: &mut dyn FnMut(bool) -> Result<T, Errno>,
++) -> Result<Option<Result<T, Errno>>, WasiError> {
++    if !direct_socket_eligible(env, nonblocking) {
++        return Ok(None);
++    }
++    __sock_direct(env, sock, rights, direction, time, op, || Ok(once(true)))
++}
++
+ /// Performs mutable work on a socket under an asynchronous runtime with
+ /// built in signal processing
+ pub(crate) fn __sock_asyncify_mut<T, F, Fut>(
+@@ -1686,3 +2021,368 @@ pub(crate) fn conv_spawn_err_to_errno(err: &SpawnError) -> Errno {
+ pub(crate) fn conv_spawn_err_to_exit_code(err: &SpawnError) -> ExitCode {
+     conv_spawn_err_to_errno(err).into()
+ }
++
++#[cfg(all(test, unix, feature = "direct-waits"))]
++mod direct_socket_tests {
++    use super::*;
++    use crate::net::socket::tests::{
++        close_tracking_socket, host_descriptor_socket_for, watched_host_descriptor_socket,
++    };
++    use std::io::{Read, Write};
++    use std::net::{TcpListener, TcpStream};
++    use std::os::fd::{AsRawFd, RawFd};
++    use std::os::unix::net::UnixStream;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++
++    /// The wait a thread makes, as a test can make it: `poll(2)` on the
++    /// one descriptor with the same deadline.
++    ///
++    /// The real wait also watches the thread's interrupt word and the
++    /// freeze gate, and it can only run inside a coroutine, which no unit
++    /// test has; its interrupted and unavailable answers are handed to
++    /// the loop directly in the tests that want them, and the host's own
++    /// suite is what pins the wait itself.
++    fn poll_once(fd: RawFd, wanted: u16, deadline: Option<Instant>) -> DirectSocketWait {
++        let mut events = 0i16;
++        if wanted & wasmer_vm::HOST_POLL_READ != 0 {
++            events |= libc::POLLIN;
++        }
++        if wanted & wasmer_vm::HOST_POLL_WRITE != 0 {
++            events |= libc::POLLOUT;
++        }
++        #[cfg(any(target_os = "linux", target_os = "android"))]
++        if wanted & wasmer_vm::HOST_POLL_RDHUP != 0 {
++            events |= libc::POLLRDHUP;
++        }
++        let timeout = match deadline {
++            Some(deadline) => deadline
++                .saturating_duration_since(Instant::now())
++                .as_millis() as libc::c_int,
++            None => -1,
++        };
++        let mut entry = libc::pollfd {
++            fd,
++            events,
++            revents: 0,
++        };
++        match unsafe { libc::poll(&mut entry, 1, timeout) } {
++            0 => DirectSocketWait::TimedOut,
++            answer if answer > 0 => DirectSocketWait::Ready,
++            _ => DirectSocketWait::Unavailable,
++        }
++    }
++
++    /// Reads what the kernel has, in the shape an attempt answers in.
++    fn read_attempt(stream: &UnixStream, buf: &mut [u8]) -> Result<usize, Errno> {
++        match (&*stream).read(buf) {
++            Ok(read) => Ok(read),
++            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Err(Errno::Again),
++            Err(_) => Err(Errno::Io),
++        }
++    }
++
++    /// Writes what the kernel will take, in the shape an attempt answers
++    /// in.
++    fn write_attempt(stream: &UnixStream, buf: &[u8]) -> Result<usize, Errno> {
++        match (&*stream).write(buf) {
++            Ok(written) => Ok(written),
++            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Err(Errno::Again),
++            Err(_) => Err(Errno::Io),
++        }
++    }
++
++    /// Which socket a wait can be made for, what it asks the kernel, and
++    /// what it does not do to the socket to find out.
++    ///
++    /// Deciding this installs no handler and never reads the socket: the
++    /// registration with the shared selector and the read into the
++    /// runtime's buffer are the two costs the path exists to remove, and
++    /// the mock counts both.
++    #[test]
++    fn only_a_socket_with_a_host_descriptor_is_waited_for() {
++        let (socket, handler, reads) = watched_host_descriptor_socket();
++        let (fd, wanted) = direct_socket_descriptor(&socket, DirectSocketDirection::Read).unwrap();
++        assert_eq!(fd, 3);
++        assert_eq!(
++            wanted,
++            wasmer_vm::HOST_POLL_READ | wasmer_vm::HOST_POLL_RDHUP
++        );
++        let (_, wanted) = direct_socket_descriptor(&socket, DirectSocketDirection::Write).unwrap();
++        assert_eq!(wanted, wasmer_vm::HOST_POLL_WRITE);
++        assert!(handler.lock().unwrap().is_none());
++        assert_eq!(reads.load(Ordering::Relaxed), 0);
++
++        // A socket the host cannot name a descriptor for is not one this
++        // thread can wait for at all.
++        let opaque = close_tracking_socket(Arc::new(AtomicUsize::new(0)));
++        assert!(direct_socket_descriptor(&opaque, DirectSocketDirection::Read).is_none());
++    }
++
++    /// A receive on an empty socket: the thread waits for the socket's own
++    /// descriptor and the receive that follows the wait is the one that
++    /// reads what arrived.
++    #[test]
++    fn a_receive_that_would_block_waits_for_the_descriptor() {
++        let (ours, mut peer) = UnixStream::pair().unwrap();
++        ours.set_nonblocking(true).unwrap();
++        let socket = host_descriptor_socket_for(ours.as_raw_fd());
++        let (fd, wanted) = direct_socket_descriptor(&socket, DirectSocketDirection::Read).unwrap();
++        assert_eq!(fd, ours.as_raw_fd());
++
++        let writer = std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(50));
++            peer.write_all(b"hello").unwrap();
++        });
++
++        let mut buf = [0u8; 5];
++        let mut attempts = 0;
++        let (answer, outcome) = direct_socket_turns(
++            &mut || {
++                attempts += 1;
++                Ok(read_attempt(&ours, &mut buf))
++            },
++            &mut || Some(poll_once(fd, wanted, None)),
++        )
++        .unwrap();
++        assert_eq!(answer, Some(Ok(5)));
++        assert_eq!(outcome, "waited");
++        assert_eq!(attempts, 1);
++        assert_eq!(&buf, b"hello");
++        writer.join().unwrap();
++    }
++
++    /// A send on a socket with no room: the thread waits for the
++    /// descriptor and the send that follows the wait is the one that
++    /// writes.
++    #[test]
++    fn a_send_that_would_block_waits_for_room() {
++        let (ours, mut peer) = UnixStream::pair().unwrap();
++        ours.set_nonblocking(true).unwrap();
++        let block = [0u8; 4096];
++        let mut filled = 0usize;
++        loop {
++            match write_attempt(&ours, &block) {
++                Ok(written) => filled += written,
++                Err(Errno::Again) => break,
++                Err(err) => panic!("filling the socket failed: {err:?}"),
++            }
++            assert!(filled < 64 * 1024 * 1024, "the socket never filled up");
++        }
++
++        let socket = host_descriptor_socket_for(ours.as_raw_fd());
++        let (fd, wanted) = direct_socket_descriptor(&socket, DirectSocketDirection::Write).unwrap();
++
++        let reader = std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(50));
++            let mut drain = vec![0u8; filled];
++            peer.read_exact(&mut drain).unwrap();
++            drain.len()
++        });
++
++        let (answer, outcome) =
++            direct_socket_turns(&mut || Ok(write_attempt(&ours, b"x")), &mut || {
++                Some(poll_once(fd, wanted, None))
++            })
++            .unwrap();
++        assert_eq!(answer, Some(Ok(1)));
++        assert_eq!(outcome, "waited");
++        assert_eq!(reader.join().unwrap(), filled);
++    }
++
++    /// An accept with nothing queued: the thread waits for the listener's
++    /// own descriptor and accepts the connection that arrives.
++    #[test]
++    fn an_accept_that_would_block_waits_for_the_connection() {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let addr = listener.local_addr().unwrap();
++        // The mock only names the descriptor; what the operation does
++        // with it is this test's own accept.
++        let socket = host_descriptor_socket_for(listener.as_raw_fd());
++        let (fd, wanted) = direct_socket_descriptor(&socket, DirectSocketDirection::Read).unwrap();
++
++        let client = std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(50));
++            TcpStream::connect(addr).unwrap()
++        });
++
++        let (answer, outcome) = direct_socket_turns(
++            &mut || {
++                Ok(match listener.accept() {
++                    Ok(_) => Ok(1usize),
++                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Err(Errno::Again),
++                    Err(_) => Err(Errno::Io),
++                })
++            },
++            &mut || Some(poll_once(fd, wanted, None)),
++        )
++        .unwrap();
++        assert_eq!(answer, Some(Ok(1)));
++        assert_eq!(outcome, "waited");
++        let _client = client.join().unwrap();
++    }
++
++    /// A connection in progress: the descriptor becomes writable when the
++    /// handshake ends, and the error the kernel latched is what says how
++    /// it ended.
++    #[test]
++    fn a_connection_in_progress_waits_for_writability() {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let fd = unsafe {
++            libc::socket(
++                libc::AF_INET,
++                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
++                0,
++            )
++        };
++        assert!(fd >= 0, "could not open a socket");
++        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
++        addr.sin_family = libc::AF_INET as libc::sa_family_t;
++        addr.sin_port = port.to_be();
++        addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
++        let started = unsafe {
++            libc::connect(
++                fd,
++                std::ptr::addr_of!(addr).cast(),
++                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
++            )
++        };
++        if started != 0 {
++            assert_eq!(
++                std::io::Error::last_os_error().raw_os_error(),
++                Some(libc::EINPROGRESS),
++                "the connection neither finished nor started"
++            );
++        }
++
++        // The socket status is `Opening` until the handshake ends, which
++        // is what the call site loops on.
++        let mut answers = 0;
++        let (answer, outcome) = direct_socket_turns(
++            &mut || {
++                answers += 1;
++                Ok(match latched_error(fd) {
++                    0 if connected(fd) => Ok(()),
++                    0 => Err(Errno::Again),
++                    _ => Err(Errno::Connrefused),
++                })
++            },
++            &mut || Some(poll_once(fd, wasmer_vm::HOST_POLL_WRITE, None)),
++        )
++        .unwrap();
++        assert_eq!(answer, Some(Ok(())));
++        assert_eq!(outcome, "waited");
++        assert_eq!(answers, 1);
++        unsafe { libc::close(fd) };
++        drop(listener);
++    }
++
++    /// The error the kernel latched on a connecting socket, which is what
++    /// `SO_ERROR` answers.
++    fn latched_error(fd: RawFd) -> libc::c_int {
++        let mut error: libc::c_int = 0;
++        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
++        let answered = unsafe {
++            libc::getsockopt(
++                fd,
++                libc::SOL_SOCKET,
++                libc::SO_ERROR,
++                std::ptr::addr_of_mut!(error).cast(),
++                &mut len,
++            )
++        };
++        assert_eq!(answered, 0, "SO_ERROR could not be read");
++        error
++    }
++
++    /// Whether the handshake has finished, as the backend's own status
++    /// decides it: the socket has a peer.
++    fn connected(fd: RawFd) -> bool {
++        let mut peer: libc::sockaddr_in = unsafe { std::mem::zeroed() };
++        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
++        0 == unsafe { libc::getpeername(fd, std::ptr::addr_of_mut!(peer).cast(), &mut len) }
++    }
++
++    /// A wait that reaches the socket's own timeout is the operation's
++    /// timeout, and the operation is not attempted again.
++    #[test]
++    fn a_wait_that_runs_out_is_the_operations_timeout() {
++        let (ours, _peer) = UnixStream::pair().unwrap();
++        ours.set_nonblocking(true).unwrap();
++        let socket = host_descriptor_socket_for(ours.as_raw_fd());
++        let (fd, wanted) = direct_socket_descriptor(&socket, DirectSocketDirection::Read).unwrap();
++        let started = Instant::now();
++        let deadline = started + Duration::from_millis(50);
++
++        let mut attempts = 0;
++        let mut buf = [0u8; 1];
++        let (answer, outcome) = direct_socket_turns(
++            &mut || {
++                attempts += 1;
++                Ok(read_attempt(&ours, &mut buf))
++            },
++            &mut || Some(poll_once(fd, wanted, Some(deadline))),
++        )
++        .unwrap();
++        assert_eq!(answer, Some(Err(Errno::Timedout)));
++        assert_eq!(outcome, "timeout");
++        assert_eq!(attempts, 0);
++        // `poll(2)` counts whole milliseconds, so it may answer just
++        // inside the deadline; what is pinned is that it slept for it.
++        assert!(started.elapsed() >= Duration::from_millis(45));
++    }
++
++    /// Every way a wait can end without readiness leaves the call to the
++    /// existing path, which waits as it always has, and nothing is
++    /// attempted again on the way out.
++    #[test]
++    fn a_wait_that_cannot_answer_leaves_the_call_to_the_existing_path() {
++        for (wait, outcome) in [
++            (Some(DirectSocketWait::Interrupted), "interrupted"),
++            (Some(DirectSocketWait::Unavailable), "fallthrough"),
++            (None, "fallthrough"),
++        ] {
++            let mut attempts = 0;
++            let (answer, answered) = direct_socket_turns::<usize>(
++                &mut || {
++                    attempts += 1;
++                    Ok(Err(Errno::Again))
++                },
++                &mut || wait,
++            )
++            .unwrap();
++            assert_eq!(answer, None);
++            assert_eq!(answered, outcome);
++            assert_eq!(attempts, 0);
++        }
++    }
++
++    /// Readiness another thread took before this one looked is not an
++    /// answer: the operation would block again, and the loop waits again
++    /// rather than reporting a level that is gone.
++    #[test]
++    fn readiness_another_thread_took_is_waited_for_again() {
++        let waits = std::cell::Cell::new(0);
++        let mut attempts = 0;
++        let (answer, outcome) = direct_socket_turns(
++            &mut || {
++                attempts += 1;
++                Ok(if attempts < 3 {
++                    Err(Errno::Again)
++                } else {
++                    Ok(7usize)
++                })
++            },
++            &mut || {
++                waits.set(waits.get() + 1);
++                Some(DirectSocketWait::Ready)
++            },
++        )
++        .unwrap();
++        assert_eq!(answer, Some(Ok(7)));
++        assert_eq!(outcome, "waited");
++        assert_eq!(attempts, 3);
++        assert_eq!(waits.get(), 3);
++    }
++}
+diff --git a/lib/wasix/src/syscalls/wasi/fd_read.rs b/lib/wasix/src/syscalls/wasi/fd_read.rs
+index a73fd4e..f26d60b 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_read.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_read.rs
+@@ -239,44 +239,81 @@ pub(crate) fn fd_read_internal<M: MemorySize>(
+                     let timeout = socket.opt_time(TimeType::ReadTimeout).ok().flatten();
+ 
+                     let tasks = env.tasks().clone();
+-                    let res = __asyncify_light(
+-                        env,
+-                        if fd_flags.contains(Fdflags::NONBLOCK) {
+-                            Some(Duration::ZERO)
+-                        } else {
+-                            None
+-                        },
+-                        async move {
+-                            let mut total_read = 0usize;
+-
+-                            let iovs_arr =
+-                                iovs.slice(&memory, iovs_len).map_err(mem_error_to_wasi)?;
+-                            let iovs_arr = iovs_arr.access().map_err(mem_error_to_wasi)?;
+-                            for iovs in iovs_arr.iter() {
+-                                let mut buf = WasmPtr::<u8, M>::new(iovs.buf)
+-                                    .slice(&memory, iovs.buf_len)
+-                                    .map_err(mem_error_to_wasi)?
+-                                    .access()
+-                                    .map_err(mem_error_to_wasi)?;
+-
+-                                let local_read = socket
+-                                    .recv(
+-                                        tasks.deref(),
+-                                        buf.as_mut_uninit(),
+-                                        timeout,
+-                                        nonblocking,
+-                                        false,
+-                                    )
+-                                    .await?;
+-                                total_read += local_read;
+-                                if total_read != buf.len() {
+-                                    break;
++                    // The read itself, which the direct branch below runs
++                    // once without waiting and then again after every wait
++                    // it makes.
++                    let mut read_once = |dont_wait: bool| {
++                        // Borrowed, not moved: the attempt runs more
++                        // than once.
++                        let memory = &memory;
++                        let socket = socket.clone();
++                        let tasks = tasks.clone();
++                        let nonblocking = nonblocking || dont_wait;
++                        __asyncify_light(
++                            env,
++                            if nonblocking {
++                                Some(Duration::ZERO)
++                            } else {
++                                None
++                            },
++                            async move {
++                                let mut total_read = 0usize;
++
++                                let iovs_arr =
++                                    iovs.slice(&memory, iovs_len).map_err(mem_error_to_wasi)?;
++                                let iovs_arr = iovs_arr.access().map_err(mem_error_to_wasi)?;
++                                for iovs in iovs_arr.iter() {
++                                    let mut buf = WasmPtr::<u8, M>::new(iovs.buf)
++                                        .slice(&memory, iovs.buf_len)
++                                        .map_err(mem_error_to_wasi)?
++                                        .access()
++                                        .map_err(mem_error_to_wasi)?;
++
++                                    let local_read = match socket
++                                        .recv(
++                                            tasks.deref(),
++                                            buf.as_mut_uninit(),
++                                            timeout,
++                                            nonblocking,
++                                            false,
++                                        )
++                                        .await
++                                    {
++                                        Ok(read) => read,
++                                        // Bytes already read into the buffers
++                                        // before this one are the answer: an
++                                        // attempt run again would read over
++                                        // them, and the guest has them.
++                                        Err(_) if total_read > 0 => break,
++                                        Err(err) => return Err(err),
++                                    };
++                                    total_read += local_read;
++                                    if total_read != buf.len() {
++                                        break;
++                                    }
+                                 }
+-                            }
+-                            Ok(total_read)
+-                        },
+-                    );
+-                    let res = res?.map_err(|err| match err {
++                                Ok(total_read)
++                            },
++                        )
++                    };
++                    let answered = if direct_socket_eligible(env, nonblocking) {
++                        __sock_direct(
++                            env,
++                            fd,
++                            Rights::FD_READ,
++                            DirectSocketDirection::Read,
++                            TimeType::ReadTimeout,
++                            "fd_read",
++                            || read_once(true),
++                        )?
++                    } else {
++                        None
++                    };
++                    let res = match answered {
++                        Some(answer) => answer,
++                        None => read_once(false)?,
++                    };
++                    let res = res.map_err(|err| match err {
+                         Errno::Timedout => Errno::Again,
+                         a => a,
+                     });
+diff --git a/lib/wasix/src/syscalls/wasi/fd_write.rs b/lib/wasix/src/syscalls/wasi/fd_write.rs
+index 97a5e74..f5a1e7b 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_write.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_write.rs
+@@ -116,6 +116,7 @@ pub fn fd_pwrite<M: MemorySize>(
+     Ok(Errno::Success)
+ }
+ 
++#[derive(Clone)]
+ pub(crate) enum FdWriteSource<'a, M: MemorySize> {
+     Iovs {
+         iovs: WasmPtr<__wasi_ciovec_t<M>, M>,
+@@ -279,51 +280,77 @@ pub(crate) fn fd_write_internal<M: MemorySize>(
+ 
+                     let tasks = env.tasks().clone();
+ 
+-                    let res = __asyncify_light(env, None, async {
+-                        let mut sent = 0usize;
+-
+-                        if socket.is_dgram() {
+-                            let data = data.coalesce(&memory, MAX_SOCKET_PAYLOAD)?;
+-                            sent += socket
+-                                .send(tasks.deref(), data.as_ref(), timeout, nonblocking)
+-                                .await?;
+-                            return Ok(sent);
+-                        }
++                    // The write itself, which the direct branch below runs
++                    // once without waiting and then again after every wait
++                    // it makes.
++                    let mut write_once = |dont_wait: bool| {
++                        // Borrowed, not moved: the attempt runs more than once.
++                        let memory = &memory;
++                        let nonblocking = nonblocking || dont_wait;
++                        let data = data.clone();
++                        __asyncify_light(env, None, async {
++                            let mut sent = 0usize;
++
++                            if socket.is_dgram() {
++                                let data = data.coalesce(&memory, MAX_SOCKET_PAYLOAD)?;
++                                sent += socket
++                                    .send(tasks.deref(), data.as_ref(), timeout, nonblocking)
++                                    .await?;
++                                return Ok(sent);
++                            }
+ 
+-                        match &data {
+-                            FdWriteSource::Iovs { iovs, iovs_len } => {
+-                                let iovs_arr =
+-                                    iovs.slice(&memory, *iovs_len).map_err(mem_error_to_wasi)?;
+-                                let iovs_arr = iovs_arr.access().map_err(mem_error_to_wasi)?;
+-                                for iovs in iovs_arr.iter() {
+-                                    let buf = WasmPtr::<u8, M>::new(iovs.buf)
+-                                        .slice(&memory, iovs.buf_len)
+-                                        .map_err(mem_error_to_wasi)?
+-                                        .access()
++                            match &data {
++                                FdWriteSource::Iovs { iovs, iovs_len } => {
++                                    let iovs_arr = iovs
++                                        .slice(&memory, *iovs_len)
+                                         .map_err(mem_error_to_wasi)?;
+-                                    let local_sent = match socket
+-                                        .send(tasks.deref(), buf.as_ref(), timeout, nonblocking)
+-                                        .await
+-                                    {
+-                                        Ok(sent) => sent,
+-                                        Err(_) if sent > 0 => break,
+-                                        Err(err) => return Err(err),
+-                                    };
+-                                    sent += local_sent;
+-                                    if local_sent != buf.len() {
+-                                        break;
++                                    let iovs_arr = iovs_arr.access().map_err(mem_error_to_wasi)?;
++                                    for iovs in iovs_arr.iter() {
++                                        let buf = WasmPtr::<u8, M>::new(iovs.buf)
++                                            .slice(&memory, iovs.buf_len)
++                                            .map_err(mem_error_to_wasi)?
++                                            .access()
++                                            .map_err(mem_error_to_wasi)?;
++                                        let local_sent = match socket
++                                            .send(tasks.deref(), buf.as_ref(), timeout, nonblocking)
++                                            .await
++                                        {
++                                            Ok(sent) => sent,
++                                            Err(_) if sent > 0 => break,
++                                            Err(err) => return Err(err),
++                                        };
++                                        sent += local_sent;
++                                        if local_sent != buf.len() {
++                                            break;
++                                        }
+                                     }
+                                 }
++                                FdWriteSource::Buffer(data) => {
++                                    sent += socket
++                                        .send(tasks.deref(), data.as_ref(), timeout, nonblocking)
++                                        .await?;
++                                }
+                             }
+-                            FdWriteSource::Buffer(data) => {
+-                                sent += socket
+-                                    .send(tasks.deref(), data.as_ref(), timeout, nonblocking)
+-                                    .await?;
+-                            }
+-                        }
+-                        Ok(sent)
++                            Ok(sent)
++                        })
++                    };
++                    let answered = if direct_socket_eligible(env, nonblocking) {
++                        __sock_direct(
++                            env,
++                            fd,
++                            Rights::FD_WRITE,
++                            DirectSocketDirection::Write,
++                            TimeType::WriteTimeout,
++                            "fd_write",
++                            || write_once(true),
++                        )?
++                    } else {
++                        None
++                    };
++                    let written = wasi_try_ok_ok!(match answered {
++                        Some(answer) => answer,
++                        None => write_once(false)?,
+                     });
+-                    let written = wasi_try_ok_ok!(res?);
+                     (written, false, false)
+                 }
+                 Kind::PipeRx { .. } => {
+diff --git a/lib/wasix/src/syscalls/wasix/sock_accept.rs b/lib/wasix/src/syscalls/wasix/sock_accept.rs
+index 54d385c..ccccaec 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_accept.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_accept.rs
+@@ -120,6 +120,27 @@ pub(crate) fn sock_accept_internal(
+     let state = env.state();
+     let inodes = &state.inodes;
+ 
++    // An accept that would block waits for the listener on this thread
++    // instead of registering it with the shared selector. The attempt it
++    // makes is this same function asking not to wait, which is why the
++    // branch is skipped when that is what the caller asked for. A
++    // replayed accept, which is given the descriptor to reuse, keeps the
++    // existing path.
++    if with_fd.is_none() && direct_socket_eligible(env, nonblocking) {
++        let answered = __sock_direct(
++            env,
++            sock,
++            Rights::SOCK_ACCEPT,
++            DirectSocketDirection::Read,
++            TimeType::AcceptTimeout,
++            "sock_accept",
++            || sock_accept_internal(env, sock, fd_flags, true, None),
++        )?;
++        if let Some(answer) = answered {
++            return Ok(answer);
++        }
++    }
++
+     let tasks = env.tasks().clone();
+     let (child, local_addr, peer_addr, fd_flags) = wasi_try_ok_ok!(__sock_asyncify(
+         env,
+diff --git a/lib/wasix/src/syscalls/wasix/sock_connect.rs b/lib/wasix/src/syscalls/wasix/sock_connect.rs
+index cd4837f..d6e4951 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_connect.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_connect.rs
+@@ -72,6 +72,22 @@ pub(crate) fn sock_connect_internal(
+         Ok(fd_entry) => fd_entry.inner.flags.contains(Fdflags::NONBLOCK),
+         Err(err) => return Ok(Err(err)),
+     };
++    // Whether this thread waits for the handshake itself. When it does,
++    // the connection is started as a non-blocking one - nothing inside
++    // the upgrade waits for it - and the wait happens below, on the
++    // socket the upgrade installed. The connect timeout is read here,
++    // while the socket is still the pre-socket that carries it: the
++    // stream the upgrade installs keeps only its read and write timeouts.
++    let direct = direct_connect(ctx.data(), nonblocking);
++    let connect_deadline = if direct {
++        __sock_actor(ctx, sock, Rights::empty(), |socket, _| {
++            socket.opt_time(crate::net::socket::TimeType::ConnectTimeout)
++        })
++        .unwrap_or(None)
++        .and_then(|timeout| Instant::now().checked_add(timeout))
++    } else {
++        None
++    };
+     wasi_try_ok_ok!(__sock_upgrade(
+         ctx,
+         sock,
+@@ -86,7 +102,7 @@ pub(crate) fn sock_connect_internal(
+                     net.deref(),
+                     addr,
+                     None,
+-                    flags.contains(Fdflags::NONBLOCK),
++                    direct || flags.contains(Fdflags::NONBLOCK),
+                 )
+                 .await?;
+             Ok(connected_socket.or(bound_socket))
+@@ -101,9 +117,114 @@ pub(crate) fn sock_connect_internal(
+         return Ok(nonblocking_connect_result(status));
+     }
+ 
++    if direct {
++        // The handshake was left running. Either this thread waits for
++        // the descriptor to become writable, or, if it cannot, the
++        // existing wait for writability does what the connect itself
++        // would have done.
++        if let Some(answer) = direct_connect_finish(ctx.data(), sock, connect_deadline)? {
++            return Ok(answer);
++        }
++        return Ok(connect_wait_writable(ctx.data(), sock, connect_deadline));
++    }
++
+     Ok(Ok(()))
+ }
+ 
++/// Whether the calling thread can wait for a connection itself.
++fn direct_connect(env: &WasiEnv, nonblocking: bool) -> bool {
++    direct_socket_eligible(env, nonblocking)
++}
++
++/// Waits on this thread for a connection that has been started, and says
++/// how it ended.
++///
++/// A connecting descriptor becomes writable when its handshake finishes,
++/// whether it succeeded or not, and the socket's status is what tells the
++/// two apart: it reads the error the kernel latched (`SO_ERROR`) before
++/// it looks at the peer. The deadline is the connect timeout the caller
++/// read before the connection was started. `None` means this thread
++/// cannot do the wait and the existing one must.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_connect_finish(
++    env: &WasiEnv,
++    sock: WasiFd,
++    deadline: Option<Instant>,
++) -> Result<Option<Result<(), Errno>>, WasiError> {
++    let DirectSocketTarget::Wait(socket, _) = direct_socket_target(
++        env,
++        sock,
++        Rights::empty(),
++        crate::net::socket::TimeType::ConnectTimeout,
++    ) else {
++        return Ok(None);
++    };
++    loop {
++        match socket.status() {
++            Ok(crate::net::socket::WasiSocketStatus::Opened) => return Ok(Some(Ok(()))),
++            Ok(crate::net::socket::WasiSocketStatus::Opening) => {}
++            Ok(_) => {
++                // The error the kernel latched, which the status above
++                // has just read off the socket. A handshake that ended
++                // badly always has one; refusal is what a socket that
++                // cannot name its own failure is reported as.
++                let err = match socket.last_error() {
++                    Ok(Errno::Success) | Err(_) => Errno::Connrefused,
++                    Ok(err) => err,
++                };
++                return Ok(Some(Err(err)));
++            }
++            Err(err) => return Ok(Some(Err(err))),
++        }
++        match direct_socket_wait(
++            &env.thread,
++            &|| env.should_exit().is_some(),
++            &socket,
++            DirectSocketDirection::Write,
++            deadline,
++        ) {
++            Some(DirectSocketWait::Ready) => {}
++            Some(DirectSocketWait::TimedOut) => return Ok(Some(Err(Errno::Timedout))),
++            _ => return Ok(None),
++        }
++    }
++}
++
++#[cfg(not(all(unix, feature = "direct-waits")))]
++fn direct_connect_finish(
++    _env: &WasiEnv,
++    _sock: WasiFd,
++    _deadline: Option<Instant>,
++) -> Result<Option<Result<(), Errno>>, WasiError> {
++    Ok(None)
++}
++
++/// Waits for a started connection through the shared event selector, as
++/// the connect itself does when it is the one waiting, until the deadline
++/// the connect timeout set when the connection was started: a direct wait
++/// that was interrupted has used some of it, and only the rest is left.
++fn connect_wait_writable(
++    env: &WasiEnv,
++    sock: WasiFd,
++    deadline: Option<Instant>,
++) -> Result<(), Errno> {
++    let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
++    if remaining == Some(Duration::ZERO) {
++        return Err(Errno::Timedout);
++    }
++    let tasks = env.tasks().clone();
++    __sock_asyncify(env, sock, Rights::empty(), |mut socket, _| async move {
++        let writable = futures::future::poll_fn(|cx| Pin::new(&mut socket).poll_write_ready(cx));
++        match remaining {
++            Some(remaining) => tokio::select! {
++                res = writable => res.map(|_| ()).map_err(Errno::from),
++                _ = tasks.sleep_now(remaining) => Err(Errno::Timedout),
++            },
++            None => writable.await.map(|_| ()).map_err(Errno::from),
++        }
++    })
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::nonblocking_connect_result;
+diff --git a/lib/wasix/src/syscalls/wasix/sock_recv.rs b/lib/wasix/src/syscalls/wasix/sock_recv.rs
+index 3749485..dd64177 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_recv.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_recv.rs
+@@ -103,7 +103,7 @@ pub(super) fn sock_recv_internal_handler<M: MemorySize>(
+ ///
+ /// Number of bytes stored in ri_data and message flags.
+ pub(super) fn sock_recv_internal<M: MemorySize>(
+-    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
++    ctx: &FunctionEnvMut<'_, WasiEnv>,
+     sock: WasiFd,
+     ri_data: WasmPtr<__wasi_iovec_t<M>, M>,
+     ri_data_len: M::Offset,
+@@ -115,6 +115,36 @@ pub(super) fn sock_recv_internal<M: MemorySize>(
+     let memory = unsafe { env.memory_view(ctx) };
+     let peek = (ri_flags & __WASI_SOCK_RECV_INPUT_PEEK) != 0;
+     let nonblocking_flag = (ri_flags & __WASI_SOCK_RECV_INPUT_DONT_WAIT) != 0;
++
++    // A receive that would block waits for the socket on this thread
++    // instead of registering it with the shared selector. The attempt it
++    // makes is this same function asking not to wait, which is why the
++    // branch is skipped when that is what the guest asked for: the
++    // inner call sees the flag set and goes straight to the work.
++    if direct_socket_eligible(env, nonblocking_flag) {
++        let answered = __sock_direct(
++            env,
++            sock,
++            Rights::SOCK_RECV,
++            DirectSocketDirection::Read,
++            TimeType::ReadTimeout,
++            "sock_recv",
++            || {
++                sock_recv_internal::<M>(
++                    ctx,
++                    sock,
++                    ri_data,
++                    ri_data_len,
++                    ri_flags | __WASI_SOCK_RECV_INPUT_DONT_WAIT,
++                    ro_data_len,
++                    ro_flags,
++                )
++            },
++        )?;
++        if let Some(answer) = answered {
++            return Ok(answer);
++        }
++    }
+     let data = wasi_try_ok_ok!(__sock_asyncify(
+         env,
+         sock,
+diff --git a/lib/wasix/src/syscalls/wasix/sock_recv_from.rs b/lib/wasix/src/syscalls/wasix/sock_recv_from.rs
+index b97ba62..f477594 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_recv_from.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_recv_from.rs
+@@ -69,20 +69,33 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
+     let (bytes_read, peer) = {
+         if max_size <= 10240 {
+             let mut buf: [MaybeUninit<u8>; 10240] = unsafe { MaybeUninit::uninit().assume_init() };
+-            let writer = &mut buf[..max_size];
+-            let (amt, peer) = wasi_try_ok!(__sock_asyncify(
+-                env,
+-                sock,
+-                Rights::SOCK_RECV_FROM,
+-                |socket, fd| async move {
++            // The receive itself, which the direct branch below runs once
++            // without waiting and then again after every wait it makes.
++            let mut recv_once = |dont_wait: bool| {
++                let writer = &mut buf[..max_size];
++                __sock_asyncify(env, sock, Rights::SOCK_RECV_FROM, |socket, fd| async move {
+                     let nonblocking =
+-                        nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
++                        dont_wait || nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
+                     let timeout = socket.opt_time(TimeType::ReadTimeout).ok().flatten();
+                     socket
+                         .recv_from(env.tasks().deref(), writer, timeout, nonblocking, peek)
+                         .await
+-                },
+-            ));
++                })
++            };
++            let answered = __sock_direct_attempt(
++                env,
++                sock,
++                Rights::SOCK_RECV_FROM,
++                DirectSocketDirection::Read,
++                TimeType::ReadTimeout,
++                "sock_recv_from",
++                nonblocking_flag,
++                &mut recv_once,
++            )?;
++            let (amt, peer) = wasi_try_ok!(match answered {
++                Some(answer) => answer,
++                None => recv_once(false),
++            });
+ 
+             if amt > 0 {
+                 let buf: &[MaybeUninit<u8>] = &buf[..amt];
+@@ -92,12 +105,9 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
+                 (amt, peer)
+             }
+         } else {
+-            let (data, peer) = wasi_try_ok!(__sock_asyncify(
+-                env,
+-                sock,
+-                Rights::SOCK_RECV_FROM,
+-                |socket, fd| async move {
+-                    let nonblocking = fd.inner.flags.contains(Fdflags::NONBLOCK);
++            let mut recv_once = |dont_wait: bool| {
++                __sock_asyncify(env, sock, Rights::SOCK_RECV_FROM, |socket, fd| async move {
++                    let nonblocking = dont_wait || fd.inner.flags.contains(Fdflags::NONBLOCK);
+                     let timeout = socket.opt_time(TimeType::ReadTimeout).ok().flatten();
+ 
+                     let mut buf = Vec::with_capacity(max_size);
+@@ -114,8 +124,22 @@ pub(super) fn sock_recv_from_internal<M: MemorySize>(
+                             let buf: Vec<u8> = unsafe { std::mem::transmute(buf) };
+                             (buf, addr)
+                         })
+-                }
+-            ));
++                })
++            };
++            let answered = __sock_direct_attempt(
++                env,
++                sock,
++                Rights::SOCK_RECV_FROM,
++                DirectSocketDirection::Read,
++                TimeType::ReadTimeout,
++                "sock_recv_from",
++                nonblocking_flag,
++                &mut recv_once,
++            )?;
++            let (data, peer) = wasi_try_ok!(match answered {
++                Some(answer) => answer,
++                None => recv_once(false),
++            });
+ 
+             let data_len = data.len();
+             if data_len > 0 {
+diff --git a/lib/wasix/src/syscalls/wasix/sock_send.rs b/lib/wasix/src/syscalls/wasix/sock_send.rs
+index b100a6e..faa1893 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_send.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_send.rs
+@@ -94,6 +94,33 @@ pub(crate) fn sock_send_internal<M: MemorySize>(
+ 
+     let nonblocking_flag = (si_flags & __WASI_SOCK_SEND_INPUT_DONT_WAIT) != 0;
+ 
++    // A send that would block waits for the socket on this thread instead
++    // of registering it with the shared selector. The attempt it makes is
++    // this same function asking not to wait, which is why the branch is
++    // skipped when that is what the guest asked for: the inner call sees
++    // the flag set and goes straight to the work.
++    if direct_socket_eligible(env, nonblocking_flag) {
++        let answered = __sock_direct(
++            env,
++            sock,
++            Rights::SOCK_SEND,
++            DirectSocketDirection::Write,
++            TimeType::WriteTimeout,
++            "sock_send",
++            || {
++                sock_send_internal::<M>(
++                    ctx,
++                    sock,
++                    si_data.clone(),
++                    si_flags | __WASI_SOCK_SEND_INPUT_DONT_WAIT,
++                )
++            },
++        )?;
++        if let Some(answer) = answered {
++            return Ok(answer);
++        }
++    }
++
+     let bytes_written = wasi_try_ok_ok!(__sock_asyncify(
+         env,
+         sock,
+diff --git a/lib/wasix/src/syscalls/wasix/sock_send_to.rs b/lib/wasix/src/syscalls/wasix/sock_send_to.rs
+index f5db07d..dbffb4d 100644
+--- a/lib/wasix/src/syscalls/wasix/sock_send_to.rs
++++ b/lib/wasix/src/syscalls/wasix/sock_send_to.rs
+@@ -103,76 +103,91 @@ pub(crate) fn sock_send_to_internal<M: MemorySize>(
+ 
+     let nonblocking_flag = (si_flags & __WASI_SOCK_SEND_INPUT_DONT_WAIT) != 0;
+ 
+-    let bytes_written = {
+-        wasi_try_ok_ok!(__sock_asyncify(
+-            env,
+-            sock,
+-            Rights::SOCK_SEND_TO,
+-            |socket, fd| async move {
+-                let nonblocking = nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
+-                let timeout = socket.opt_time(TimeType::WriteTimeout).ok().flatten();
+-
+-                if socket.is_dgram() {
+-                    let data = si_data.coalesce(&memory, MAX_SOCKET_PAYLOAD)?;
+-                    return socket
+-                        .send_to::<M>(
+-                            env.tasks().deref(),
+-                            data.as_ref(),
+-                            addr,
+-                            timeout,
+-                            nonblocking,
+-                        )
+-                        .await;
+-                }
+-
+-                match si_data {
+-                    FdWriteSource::Iovs { iovs, iovs_len } => {
+-                        let iovs_arr = iovs.slice(&memory, iovs_len).map_err(mem_error_to_wasi)?;
+-                        let iovs_arr = iovs_arr.access().map_err(mem_error_to_wasi)?;
+-
+-                        let mut sent = 0usize;
+-                        for iovs in iovs_arr.iter() {
+-                            let buf = WasmPtr::<u8, M>::new(iovs.buf)
+-                                .slice(&memory, iovs.buf_len)
+-                                .map_err(mem_error_to_wasi)?
+-                                .access()
+-                                .map_err(mem_error_to_wasi)?;
+-                            let local_sent = match socket
+-                                .send_to::<M>(
+-                                    env.tasks().deref(),
+-                                    buf.as_ref(),
+-                                    addr,
+-                                    timeout,
+-                                    nonblocking,
+-                                )
+-                                .await
+-                            {
+-                                Ok(s) => s,
+-                                Err(_) if sent > 0 => break,
+-                                Err(err) => return Err(err),
+-                            };
+-                            sent += local_sent;
+-                            if local_sent != buf.len() {
+-                                break;
+-                            }
+-                        }
+-                        Ok(sent)
+-                    }
+-                    FdWriteSource::Buffer(data) => {
+-                        socket
++    // The send itself, which the direct branch below runs once without
++    // waiting and then again after every wait it makes.
++    let mut send_once = |dont_wait: bool| {
++        // Borrowed, not moved: the attempt runs more than once.
++        let memory = &memory;
++        let si_data = si_data.clone();
++        __sock_asyncify(env, sock, Rights::SOCK_SEND_TO, |socket, fd| async move {
++            let nonblocking =
++                dont_wait || nonblocking_flag || fd.inner.flags.contains(Fdflags::NONBLOCK);
++            let timeout = socket.opt_time(TimeType::WriteTimeout).ok().flatten();
++
++            if socket.is_dgram() {
++                let data = si_data.coalesce(&memory, MAX_SOCKET_PAYLOAD)?;
++                return socket
++                    .send_to::<M>(
++                        env.tasks().deref(),
++                        data.as_ref(),
++                        addr,
++                        timeout,
++                        nonblocking,
++                    )
++                    .await;
++            }
++
++            match si_data {
++                FdWriteSource::Iovs { iovs, iovs_len } => {
++                    let iovs_arr = iovs.slice(&memory, iovs_len).map_err(mem_error_to_wasi)?;
++                    let iovs_arr = iovs_arr.access().map_err(mem_error_to_wasi)?;
++
++                    let mut sent = 0usize;
++                    for iovs in iovs_arr.iter() {
++                        let buf = WasmPtr::<u8, M>::new(iovs.buf)
++                            .slice(&memory, iovs.buf_len)
++                            .map_err(mem_error_to_wasi)?
++                            .access()
++                            .map_err(mem_error_to_wasi)?;
++                        let local_sent = match socket
+                             .send_to::<M>(
+                                 env.tasks().deref(),
+-                                data.as_ref(),
++                                buf.as_ref(),
+                                 addr,
+                                 timeout,
+                                 nonblocking,
+                             )
+                             .await
++                        {
++                            Ok(s) => s,
++                            Err(_) if sent > 0 => break,
++                            Err(err) => return Err(err),
++                        };
++                        sent += local_sent;
++                        if local_sent != buf.len() {
++                            break;
++                        }
+                     }
++                    Ok(sent)
+                 }
+-            },
+-        ))
++                FdWriteSource::Buffer(data) => {
++                    socket
++                        .send_to::<M>(
++                            env.tasks().deref(),
++                            data.as_ref(),
++                            addr,
++                            timeout,
++                            nonblocking,
++                        )
++                        .await
++                }
++            }
++        })
+     };
++    let answered = __sock_direct_attempt(
++        env,
++        sock,
++        Rights::SOCK_SEND_TO,
++        DirectSocketDirection::Write,
++        TimeType::WriteTimeout,
++        "sock_send_to",
++        nonblocking_flag,
++        &mut send_once,
++    )?;
++    let bytes_written = wasi_try_ok_ok!(match answered {
++        Some(answer) => answer,
++        None => send_once(false),
++    });
+     trace!(
+         %bytes_written,
+     );
