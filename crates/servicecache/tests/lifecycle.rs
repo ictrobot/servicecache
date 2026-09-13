@@ -466,9 +466,8 @@ fn case_kill_at_every_phase(subject: &Subject) {
         for child in children {
             // A clone dies with its template.
             let pid = child.pid();
-            wait_until(Duration::from_secs(5), || !process_exists(pid));
             assert!(
-                !process_exists(pid),
+                wait_until(Duration::from_secs(5), || !process_exists(pid)),
                 "{}: clone of a killed template lingers",
                 subject.name
             );
@@ -478,16 +477,27 @@ fn case_kill_at_every_phase(subject: &Subject) {
     }
 }
 
+/// Whether `pid` is still running. A zombie (`Z`) is not, and neither is a
+/// process the kernel is releasing after its parent reaped it (`X`), which
+/// `/proc` reports for a few microseconds before the entry disappears.
 fn process_exists(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-        Ok(status) => !status.contains("State:\tZ"),
+        Ok(status) => !status.contains("State:\tZ") && !status.contains("State:\tX"),
         Err(_) => false,
     }
 }
 
-fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
+/// Polls `condition` until it holds or `timeout` passes, and says whether
+/// it held; callers assert on that rather than reading the condition again.
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
-    while !condition() && Instant::now() < deadline {
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
