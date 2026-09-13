@@ -6,7 +6,7 @@ that is already listening, and `LocalNetworking::selector` exposes the
 selector it registers with.
 
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index 67e581a..c0b2cab 100644
+index 69c359e..245b526 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
 @@ -61,6 +61,11 @@ impl LocalNetworking {
@@ -21,7 +21,7 @@ index 67e581a..c0b2cab 100644
  }
  
  impl Drop for LocalNetworking {
-@@ -303,6 +308,24 @@ pub struct LocalTcpListener {
+@@ -302,6 +307,24 @@ pub struct LocalTcpListener {
  }
  
  impl LocalTcpListener {

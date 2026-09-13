@@ -1,0 +1,301 @@
+Subject: virtual-net: read a host datagram socket without a backlog
+
+A host datagram socket answered whether a datagram was waiting by
+receiving one into a backlog of its own, and a receive then copied out
+of it. That is a second place readiness can live, which anything that
+looks only at the kernel descriptor - a poll, an epoll set, another
+thread - then has to be told about, and it costs an allocation and a
+copy per datagram. Leaving the datagram in the kernel is simpler.
+
+Readiness is now one byte peeked, which says a datagram is waiting and
+leaves it where it is. A receive reads straight into the caller's
+buffer, and a peek copies out of the kernel and leaves the datagram
+there, which is what a peek on the socket means. A zero-length datagram
+is readable and reports one, as it did, because a count of zero reads
+as hangup.
+
+Winsock answers a buffer shorter than the datagram with WSAEMSGSIZE and
+reports no sender, where recvfrom(2) hands over the first bytes. For the
+probe that error is the answer it was after. A receive on Windows
+receives or peeks the whole datagram into a buffer its thread keeps and
+copies what fits, so a short receive or peek gets the same bytes and
+sender it gets elsewhere. Its readiness is one-shot too, re-armed only
+by an operation answering WouldBlock, so a receive or peek that succeeded
+is followed by the one-byte probe: another datagram waiting is reported,
+and an empty socket re-arms the interest.
+
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index 67e581a..69c359e 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -8,8 +8,6 @@ use crate::{
+     VirtualUdpSocket,
+ };
+ use crate::{VirtualIoSource, io_err_into_net_error};
+-use bytes::BytesMut;
+-use std::collections::VecDeque;
+ use std::io::{self, Read, Write};
+ use std::mem::MaybeUninit;
+ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
+@@ -19,6 +17,8 @@ use std::os::fd::AsRawFd;
+ use std::os::fd::RawFd;
+ #[cfg(windows)]
+ use std::os::windows::io::AsRawSocket;
++#[cfg(windows)]
++use windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE;
+ 
+ use std::sync::{Arc, Mutex};
+ use std::task::Poll;
+@@ -215,7 +215,6 @@ impl VirtualNetworking for LocalNetworking {
+             socket,
+             addr,
+             handler_guard: HandlerGuardState::None,
+-            backlog: Default::default(),
+             ruleset: self.ruleset.clone(),
+         };
+ 
+@@ -994,6 +993,48 @@ impl VirtualIoSource for LocalTcpStream {
+     }
+ }
+ 
++/// Straight out of the kernel into `buf`, or peeked and left there. A buffer
++/// shorter than the datagram gets its first bytes, as recvfrom(2) gives
++/// them.
++#[cfg(not(target_os = "windows"))]
++fn recv_from(
++    socket: &mio::net::UdpSocket,
++    buf: &mut [u8],
++    peek: bool,
++) -> io::Result<(usize, SocketAddr)> {
++    if peek {
++        socket.peek_from(buf)
++    } else {
++        socket.recv_from(buf)
++    }
++}
++
++/// Winsock answers a buffer shorter than the datagram with WSAEMSGSIZE and
++/// reports no sender, so the datagram is received or peeked whole into a
++/// buffer the thread keeps for this, and what fits is copied out.
++#[cfg(target_os = "windows")]
++fn recv_from(
++    socket: &mio::net::UdpSocket,
++    buf: &mut [u8],
++    peek: bool,
++) -> io::Result<(usize, SocketAddr)> {
++    thread_local! {
++        static WHOLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
++    }
++    WHOLE.with(|whole| {
++        let mut whole = whole.borrow_mut();
++        whole.resize(MAX_SOCKET_PAYLOAD, 0);
++        let (len, addr) = if peek {
++            socket.peek_from(&mut whole[..])?
++        } else {
++            socket.recv_from(&mut whole[..])?
++        };
++        let amt = buf.len().min(len);
++        buf[..amt].copy_from_slice(&whole[..amt]);
++        Ok((amt, addr))
++    })
++}
++
+ /// Whether the kernel holds a connection for a listening socket, asked with
+ /// a zero-timeout poll so that the connection stays where it is.
+ #[cfg(not(target_os = "windows"))]
+@@ -1036,7 +1077,6 @@ pub struct LocalUdpSocket {
+     addr: SocketAddr,
+     selector: Arc<Selector>,
+     handler_guard: HandlerGuardState,
+-    backlog: VecDeque<(BytesMut, SocketAddr)>,
+     ruleset: Option<Ruleset>,
+ }
+ 
+@@ -1165,21 +1205,40 @@ impl VirtualConnectionlessSocket for LocalUdpSocket {
+         buf: &mut [MaybeUninit<u8>],
+         peek: bool,
+     ) -> Result<(usize, SocketAddr)> {
+-        if self.backlog.is_empty() {
+-            self.recv_into_backlog().map_err(io_err_into_net_error)?;
++        let buf: &mut [u8] = unsafe { std::mem::transmute(buf) };
++        let ret = recv_from(&self.socket, buf, peek).map_err(io_err_into_net_error);
++        // mio's readiness on Windows is one-shot and only an operation
++        // answering WouldBlock re-arms it, so a receive or peek that
++        // succeeded is followed by a probe: a datagram still waiting is
++        // reported, and an empty socket re-arms the interest.
++        #[cfg(target_os = "windows")]
++        if ret.is_ok() {
++            self.reassert_readable_if_ready();
+         }
++        ret
++    }
++}
+ 
+-        let buf: &mut [u8] = unsafe { std::mem::transmute(buf) };
+-        let Some((packet, addr)) = self.backlog.front() else {
+-            return Err(NetworkError::WouldBlock);
++#[cfg(target_os = "windows")]
++impl LocalUdpSocket {
++    /// Reports a datagram still waiting after a receive, as a level-triggered
++    /// guest expects, through the one-byte peek that also re-arms mio when
++    /// there is none.
++    fn reassert_readable_if_ready(&mut self) {
++        let guard = match &mut self.handler_guard {
++            HandlerGuardState::ExternalHandler(guard) | HandlerGuardState::WakerMap(guard, _) => {
++                guard
++            }
++            HandlerGuardState::None => return,
+         };
+-        let amt = buf.len().min(packet.len());
+-        let addr = *addr;
+-        buf[..amt].copy_from_slice(&packet[..amt]);
+-        if !peek {
+-            self.backlog.pop_front();
++        let mut probe = [0u8; 1];
++        let waiting = match self.socket.peek_from(&mut probe) {
++            Ok(_) => true,
++            Err(err) => err.raw_os_error() == Some(WSAEMSGSIZE),
++        };
++        if waiting {
++            guard.interest(InterestType::Readable);
+         }
+-        Ok((amt, addr))
+     }
+ }
+ 
+@@ -1230,29 +1289,6 @@ impl VirtualSocket for LocalUdpSocket {
+ }
+ 
+ impl LocalUdpSocket {
+-    /// A queued zero-length UDP datagram is readable (Linux `POLLIN`), but
+-    /// wasix poll treats `nbytes == 0` as hangup, so report at least 1.
+-    fn backlog_read_ready_len(&self) -> usize {
+-        self.backlog
+-            .front()
+-            .map(|(packet, _)| packet.len().max(1))
+-            .unwrap_or_default()
+-    }
+-
+-    fn recv_into_backlog(&mut self) -> io::Result<()> {
+-        let mut buffer = BytesMut::default();
+-        buffer.reserve(MAX_SOCKET_PAYLOAD);
+-        let uninit: &mut [MaybeUninit<u8>] = buffer.spare_capacity_mut();
+-        let uninit_unsafe: &mut [u8] = unsafe { std::mem::transmute(uninit) };
+-
+-        let (amt, peer) = self.socket.recv_from(uninit_unsafe)?;
+-        unsafe {
+-            buffer.set_len(amt);
+-        }
+-        self.backlog.push_back((buffer, peer));
+-        Ok(())
+-    }
+-
+     fn split_borrow(
+         &mut self,
+     ) -> (
+@@ -1280,17 +1316,22 @@ impl VirtualIoSource for LocalUdpSocket {
+     }
+ 
+     fn poll_read_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<usize>> {
+-        if !self.backlog.is_empty() {
+-            return Poll::Ready(Ok(self.backlog_read_ready_len()));
+-        }
+-
+         let (state, selector, socket) = self.split_borrow();
+         let map = state_as_waker_map(state, selector, socket).map_err(io_err_into_net_error)?;
+         map.pop(InterestType::Readable);
+         map.add(InterestType::Readable, cx.waker());
+ 
+-        match self.recv_into_backlog() {
+-            Ok(()) => Poll::Ready(Ok(self.backlog_read_ready_len())),
++        // One byte peeked says a datagram is waiting and leaves it in the
++        // kernel for the receive that follows. A zero-length datagram is
++        // readable too (Linux `POLLIN`), and wasix poll treats a count of
++        // zero as hangup, so a waiting datagram always reports one.
++        let mut probe = [0u8; 1];
++        match self.socket.peek_from(&mut probe) {
++            Ok(_) => Poll::Ready(Ok(1)),
++            // Winsock reports a datagram longer than the buffer as an error,
++            // which for a probe is the answer it was after.
++            #[cfg(target_os = "windows")]
++            Err(err) if err.raw_os_error() == Some(WSAEMSGSIZE) => Poll::Ready(Ok(1)),
+             Err(err) if err.kind() == io::ErrorKind::ConnectionAborted => Poll::Ready(Ok(0)),
+             Err(err) if err.kind() == io::ErrorKind::ConnectionReset => Poll::Ready(Ok(0)),
+             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+@@ -1402,6 +1443,76 @@ mod tests {
+         ));
+     }
+ 
++    /// A waiting datagram is readiness the kernel holds: asking leaves it in
++    /// the kernel, where a second handle on the same socket can receive it,
++    /// and the socket is then not ready.
++    #[test]
++    fn a_datagram_socket_leaves_a_datagram_in_the_kernel() {
++        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let addr = socket.local_addr().unwrap();
++        socket.set_nonblocking(true).unwrap();
++        let queue = socket.try_clone().unwrap();
++        let mut socket = LocalUdpSocket {
++            socket: mio::net::UdpSocket::from_std(socket),
++            addr,
++            selector: Selector::new(),
++            handler_guard: HandlerGuardState::None,
++            ruleset: None,
++        };
++        let waker = std::task::Waker::noop();
++        let mut cx = std::task::Context::from_waker(waker);
++        assert!(matches!(socket.poll_read_ready(&mut cx), Poll::Pending));
++
++        let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        sender.send_to(b"hello", addr).unwrap();
++        while !matches!(socket.poll_read_ready(&mut cx), Poll::Ready(Ok(1))) {
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        assert!(matches!(
++            socket.poll_read_ready(&mut cx),
++            Poll::Ready(Ok(1))
++        ));
++        // The other handle shares the kernel's queue and nothing else, so
++        // the datagram it receives is the one the poll saw.
++        let mut buf = [0u8; 8];
++        assert_eq!(queue.recv_from(&mut buf).unwrap().0, 5);
++        assert!(matches!(socket.poll_read_ready(&mut cx), Poll::Pending));
++    }
++
++    /// A peek copies out of the kernel and takes nothing, so the receive
++    /// that follows gets the whole datagram, and the next one gets nothing.
++    #[test]
++    fn a_peeked_datagram_stays_whole() {
++        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let addr = socket.local_addr().unwrap();
++        socket.set_nonblocking(true).unwrap();
++        let mut socket = LocalUdpSocket {
++            socket: mio::net::UdpSocket::from_std(socket),
++            addr,
++            selector: Selector::new(),
++            handler_guard: HandlerGuardState::None,
++            ruleset: None,
++        };
++        let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        sender.send_to(b"hello", addr).unwrap();
++        let waker = std::task::Waker::noop();
++        let mut cx = std::task::Context::from_waker(waker);
++        while !matches!(socket.poll_read_ready(&mut cx), Poll::Ready(Ok(1))) {
++            std::thread::sleep(Duration::from_millis(5));
++        }
++
++        let mut one = [MaybeUninit::new(0u8); 1];
++        let (amt, from) = socket.try_recv_from(&mut one, true).unwrap();
++        assert_eq!((amt, from), (1, sender.local_addr().unwrap()));
++        let mut buf = [MaybeUninit::new(0u8); 8];
++        let (amt, from) = socket.try_recv_from(&mut buf, false).unwrap();
++        assert_eq!((amt, from), (5, sender.local_addr().unwrap()));
++        assert!(matches!(
++            socket.try_recv_from(&mut buf, false),
++            Err(NetworkError::WouldBlock)
++        ));
++    }
++
+     /// A connection that arrives once the queue has been emptied is reported
+     /// as a fresh event: nothing about the probe stops the next edge.
+     #[test]

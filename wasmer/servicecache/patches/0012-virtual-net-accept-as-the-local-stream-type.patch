@@ -6,10 +6,10 @@ which now implements `AsRawFd`, as does `LocalTcpListener`; `try_accept`
 boxes the stream as before.
 
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index f571ff0..0f1ab96 100644
+index 43ac984..31c50e7 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
-@@ -353,6 +353,14 @@ impl LocalTcpListener {
+@@ -352,6 +352,14 @@ impl LocalTcpListener {
          Ok(())
      }
  
@@ -24,7 +24,7 @@ index f571ff0..0f1ab96 100644
      /// mio delivers readiness transitions, while WASIX epoll is level
      /// triggered. If another connection remains after one accept, synthesize
      /// the level event that the guest's next epoll_wait expects.
-@@ -394,7 +402,7 @@ impl LocalTcpListener {
+@@ -393,7 +401,7 @@ impl LocalTcpListener {
          Ok(())
      }
  
@@ -33,7 +33,7 @@ index f571ff0..0f1ab96 100644
          match self.stream.accept().map_err(io_err_into_net_error) {
              Ok((stream, addr)) => {
                  if let Some(ruleset) = self.ruleset.as_ref()
-@@ -411,7 +419,7 @@ impl LocalTcpListener {
+@@ -410,7 +418,7 @@ impl LocalTcpListener {
                  if let Some(keep_alive) = self.keep_alive {
                      socket.set_keepalive(keep_alive).ok();
                  }
@@ -42,7 +42,7 @@ index f571ff0..0f1ab96 100644
              }
              Err(NetworkError::WouldBlock) => {
                  if let HandlerGuardState::WakerMap(_, map) = &mut self.handler_guard {
-@@ -427,9 +435,8 @@ impl LocalTcpListener {
+@@ -426,9 +434,8 @@ impl LocalTcpListener {
  
  impl VirtualTcpListener for LocalTcpListener {
      fn try_accept(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
@@ -54,7 +54,7 @@ index f571ff0..0f1ab96 100644
      }
  
      fn set_handler(&mut self, mut handler: Box<dyn InterestHandler + Send + Sync>) -> Result<()> {
-@@ -673,6 +680,20 @@ impl LocalTcpStream {
+@@ -672,6 +679,20 @@ impl LocalTcpStream {
      }
  }
  

@@ -10,10 +10,10 @@ instead be re-submitted on the child's runtime, but nothing gains from
 that.
 
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index c0b2cab..c1e79de 100644
+index 245b526..73244ea 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
-@@ -23,7 +23,6 @@ use std::os::windows::io::AsRawSocket;
+@@ -23,7 +23,6 @@ use windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE;
  use std::sync::{Arc, Mutex};
  use std::task::Poll;
  use std::time::Duration;
@@ -45,7 +45,7 @@ index c0b2cab..c1e79de 100644
              ruleset: Some(ruleset),
          }
      }
-@@ -277,11 +273,11 @@ impl VirtualNetworking for LocalNetworking {
+@@ -276,11 +272,11 @@ impl VirtualNetworking for LocalNetworking {
          } else {
              format!("{}:{}", host, port.unwrap_or(0))
          };
