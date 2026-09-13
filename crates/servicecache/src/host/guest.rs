@@ -23,6 +23,21 @@ use crate::{
     runtime::{ReadOnlyMount, read_only_mounts},
 };
 
+/// The engine every guest in this host is compiled by.
+///
+/// With `SERVICECACHE_PERFMAP` set, Cranelift also appends each module's
+/// functions to `/tmp/perf-<pid>.map` as it places them, compiled or loaded
+/// from the cache, so `perf` can name frames in guest code. The names come
+/// from the module's `name` section; a module without one adds nothing.
+fn engine() -> Engine {
+    let mut compiler = wasmer::sys::Cranelift::default();
+    if std::env::var_os("SERVICECACHE_PERFMAP").is_some() {
+        wasmer::sys::CompilerConfig::enable_perfmap(&mut compiler);
+    }
+    let compiler: Box<dyn wasmer::sys::CompilerConfig> = Box::new(compiler);
+    wasmer::sys::EngineBuilder::new(compiler).into()
+}
+
 /// Compiles on a private Rayon pool that is dropped before this returns.
 /// Rayon's global pool is permanent and would make the host unforkable.
 fn compile_module(engine: &Engine, bytes: &[u8]) -> Result<Module, wasmer::CompileError> {
@@ -79,7 +94,7 @@ impl GuestRuntime {
     ) -> Result<Self> {
         let fs = read_only_mounts(mounts, &tasks.handle())?;
         Ok(Self {
-            engine: Engine::default(),
+            engine: engine(),
             tasks,
             fs: Arc::new(fs),
             networking,
