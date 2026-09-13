@@ -59,7 +59,7 @@ index fd3467c..6cbb626 100644
          self.queue_modification(SelectorModification::PushInterest { token, interest });
      }
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index 8120c50..8787cc9 100644
+index 2211dbc..1794511 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
 @@ -324,6 +324,38 @@ impl LocalTcpListener {

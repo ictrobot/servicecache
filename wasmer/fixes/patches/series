@@ -17,3 +17,4 @@
 0017-vm-refuse-a-memory-that-could-move-under-code-that-a.patch
 0018-vm-read-a-shared-memory-s-definition-without-its-loc.patch
 0019-virtual-io-wasix-give-each-thread-one-waker-for-all-.patch
+0020-virtual-net-read-a-host-stream-without-a-read-ahead-.patch

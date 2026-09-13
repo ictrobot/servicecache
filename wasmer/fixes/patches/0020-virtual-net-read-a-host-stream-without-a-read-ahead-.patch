@@ -1,0 +1,327 @@
+Subject: virtual-net: read a host stream without a read-ahead buffer
+
+A host TCP stream kept a buffer of its own. Asking whether it was
+readable reserved ten kilobytes and read the kernel socket into that
+buffer to learn a byte count, and a receive then copied out of it. That
+is a second place readiness can live, which anything that looks only at
+the kernel descriptor - a poll, an epoll set, another thread - then has
+to be told about, and it costs a reserve, a copy and a read syscall on
+every readiness question. Leaving the bytes in the kernel is simpler.
+
+Ask the kernel instead of emptying it. Readiness is one byte peeked: a
+byte says the socket is readable, none says the peer has gone and the
+next receive will report the end of the stream, and neither takes
+anything out of the kernel. The count the answer carries is then one or
+none, which is all any reader of it uses. A receive reads straight into
+the caller's buffer.
+
+mio reports readiness transitions and the guest's epoll is level
+triggered, so a receive that cannot have drained the socket asserts what
+is left, exactly as the listener does after an accept: a read that
+filled the buffer it was given may have left more behind, and a peek
+takes nothing at all. A read that emptied the socket asserts nothing.
+
+mio's readiness on Windows is one-shot, re-armed only by an operation
+that answers WouldBlock, so there every successful receive is followed
+by the one-byte peek that decides whether to reassert: bytes still
+waiting are reported, and an empty socket re-arms the interest.
+
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index 86f5499..68c5630 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -8,7 +8,7 @@ use crate::{
+     VirtualUdpSocket,
+ };
+ use crate::{VirtualIoSource, io_err_into_net_error};
+-use bytes::{Buf, BytesMut};
++use bytes::BytesMut;
+ use std::collections::VecDeque;
+ use std::io::{self, Read, Write};
+ use std::mem::MaybeUninit;
+@@ -561,7 +561,6 @@ pub struct LocalTcpStream {
+     shutdown: Option<Shutdown>,
+     selector: Arc<Selector>,
+     handler_guard: HandlerGuardState,
+-    buffer: BytesMut,
+     connect_state: Mutex<ConnectState>,
+ }
+ 
+@@ -574,7 +573,6 @@ impl LocalTcpStream {
+             shutdown: None,
+             selector,
+             handler_guard: HandlerGuardState::None,
+-            buffer: BytesMut::new(),
+             connect_state: Mutex::new(ConnectState::Unknown),
+         };
+ 
+@@ -584,7 +582,7 @@ impl LocalTcpStream {
+         // make a non-blocking `poll` call to determine this state
+         #[cfg(target_os = "windows")]
+         {
+-            let (state, selector, socket, _) = ret.split_borrow();
++            let (state, selector, socket) = ret.split_borrow();
+             if let Ok(map) = state_as_waker_map(state, selector, socket) {
+                 map.push(InterestType::Writable);
+             }
+@@ -753,21 +751,25 @@ impl VirtualConnectedSocket for LocalTcpStream {
+ 
+     fn try_recv(&mut self, buf: &mut [MaybeUninit<u8>], peek: bool) -> Result<usize> {
+         let buf: &mut [u8] = unsafe { std::mem::transmute(buf) };
+-        if !self.buffer.is_empty() {
+-            let amt = buf.len().min(self.buffer.len());
+-            buf[..amt].copy_from_slice(&self.buffer[..amt]);
+-            if !peek {
+-                self.buffer.advance(amt);
+-            }
+-            return Ok(amt);
+-        }
+-
+-        if peek {
++        let wanted = buf.len();
++        let ret = if peek {
+             self.stream.peek(buf)
+         } else {
+             self.stream.read(buf)
+         }
+-        .map_err(io_err_into_net_error)
++        .map_err(io_err_into_net_error);
++        // A receive that took everything it was offered may have left more
++        // behind, and a peek takes nothing at all, so what remains is
++        // asserted again rather than waited for: mio reports transitions
++        // and no further one is coming for bytes that are already there.
++        // On Windows every successful receive is followed by the probe,
++        // because mio's readiness there is one-shot and only an operation
++        // answering WouldBlock re-arms it, which the probe's peek is when
++        // the socket is empty.
++        if matches!(ret, Ok(amt) if peek || amt == wanted || cfg!(target_os = "windows")) {
++            self.reassert_readable_if_ready();
++        }
++        ret
+     }
+ }
+ 
+@@ -867,17 +869,47 @@ impl LocalTcpStream {
+         &mut HandlerGuardState,
+         &Arc<Selector>,
+         &mut mio::net::TcpStream,
+-        &mut BytesMut,
+     ) {
+-        (
+-            &mut self.handler_guard,
+-            &self.selector,
+-            &mut self.stream,
+-            &mut self.buffer,
+-        )
++        (&mut self.handler_guard, &self.selector, &mut self.stream)
++    }
++
++    /// mio delivers readiness transitions, while WASIX epoll is level
++    /// triggered. If the socket still holds bytes after a receive that
++    /// cannot have drained it, synthesize the level event that the guest's
++    /// next wait expects, exactly as the listener does after an accept.
++    ///
++    /// A socket nothing has registered a handler on has no transitions to
++    /// keep, because whoever waits for it looks at the descriptor itself.
++    /// That is the common case and it is answered before the probe, so a
++    /// receive on such a socket costs no syscall for this.
++    fn reassert_readable_if_ready(&mut self) {
++        let guard = match &mut self.handler_guard {
++            HandlerGuardState::ExternalHandler(guard) | HandlerGuardState::WakerMap(guard, _) => {
++                guard
++            }
++            HandlerGuardState::None => return,
++        };
++        if bytes_pending(&self.stream) {
++            guard.interest(InterestType::Readable);
++        }
+     }
+ }
+ 
++/// Whether the kernel holds bytes for a connected socket, asked without
++/// taking any.
++#[cfg(not(target_os = "windows"))]
++fn bytes_pending(stream: &mio::net::TcpStream) -> bool {
++    libc_poll(stream.as_raw_fd(), libc::POLLIN).is_some_and(|events| events & libc::POLLIN != 0)
++}
++
++/// One byte peeked through mio, so that a socket found empty re-arms mio's
++/// one-shot readiness by answering WouldBlock.
++#[cfg(target_os = "windows")]
++fn bytes_pending(stream: &mio::net::TcpStream) -> bool {
++    let mut probe = [0u8; 1];
++    matches!(stream.peek(&mut probe), Ok(n) if n > 0)
++}
++
+ impl VirtualIoSource for LocalTcpStream {
+     fn remove_handler(&mut self) {
+         let mut guard = HandlerGuardState::None;
+@@ -894,27 +926,20 @@ impl VirtualIoSource for LocalTcpStream {
+     }
+ 
+     fn poll_read_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<usize>> {
+-        if !self.buffer.is_empty() {
+-            return Poll::Ready(Ok(self.buffer.len()));
+-        }
+-
+-        let (state, selector, stream, buffer) = self.split_borrow();
++        let (state, selector, stream) = self.split_borrow();
+         let map = state_as_waker_map(state, selector, stream).map_err(io_err_into_net_error)?;
+         map.pop(InterestType::Readable);
+         map.add(InterestType::Readable, cx.waker());
+ 
+-        buffer.reserve(buffer.len() + 10240);
+-        let uninit: &mut [MaybeUninit<u8>] = buffer.spare_capacity_mut();
+-        let uninit_unsafe: &mut [u8] = unsafe { std::mem::transmute(uninit) };
+-
+-        match stream.read(uninit_unsafe) {
++        // One byte peeked answers every question a poll asks - a byte
++        // waiting, the end of the stream, or nothing yet - and takes
++        // nothing out of the kernel, so the readiness it finds is still
++        // there for the receive that follows and for anything waiting on
++        // the descriptor itself.
++        let mut probe = [0u8; 1];
++        match stream.peek(&mut probe) {
+             Ok(0) => Poll::Ready(Ok(0)),
+-            Ok(amt) => {
+-                unsafe {
+-                    buffer.set_len(buffer.len() + amt);
+-                }
+-                Poll::Ready(Ok(amt))
+-            }
++            Ok(amt) => Poll::Ready(Ok(amt)),
+             Err(err) if err.kind() == io::ErrorKind::ConnectionAborted => Poll::Ready(Ok(0)),
+             Err(err) if err.kind() == io::ErrorKind::ConnectionReset => Poll::Ready(Ok(0)),
+             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+@@ -923,7 +948,7 @@ impl VirtualIoSource for LocalTcpStream {
+     }
+ 
+     fn poll_write_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<usize>> {
+-        let (state, selector, stream, _) = self.split_borrow();
++        let (state, selector, stream) = self.split_borrow();
+         let map = state_as_waker_map(state, selector, stream).map_err(io_err_into_net_error)?;
+         #[cfg(not(target_os = "windows"))]
+         map.pop(InterestType::Writable);
+@@ -1337,4 +1362,122 @@ mod tests {
+         expect_readable(&receiver);
+         listener.try_accept().unwrap();
+     }
++
++    /// Accepts one connection on a fresh listener and hands back both
++    /// ends, with the listener kept alive so the connection stays up.
++    fn connected_pair(
++        selector: &Arc<Selector>,
++    ) -> (
++        LocalTcpListener,
++        TcpStream,
++        Box<dyn VirtualTcpSocket + Sync>,
++    ) {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let addr = listener.local_addr().unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let mut listener = LocalTcpListener {
++            stream: mio::net::TcpListener::from_std(listener),
++            selector: selector.clone(),
++            handler_guard: HandlerGuardState::None,
++            no_delay: None,
++            keep_alive: None,
++            backlog: Default::default(),
++            ruleset: None,
++        };
++        let client = TcpStream::connect(addr).unwrap();
++        let stream = loop {
++            match listener.try_accept() {
++                Ok((stream, _)) => break stream,
++                Err(_) => std::thread::sleep(Duration::from_millis(5)),
++            }
++        };
++        (listener, client, stream)
++    }
++
++    /// Readiness is the kernel's, peeked rather than taken: an empty
++    /// socket is not ready, and one holding bytes says so without moving
++    /// any of them out of the kernel, so the stream holds nothing of its
++    /// own and a wait on its descriptor sees everything.
++    #[test]
++    fn a_stream_is_ready_when_the_kernel_holds_bytes() {
++        let selector = Selector::new();
++        let (_listener, mut client, mut stream) = connected_pair(&selector);
++        let waker = std::task::Waker::noop();
++        let mut cx = std::task::Context::from_waker(waker);
++
++        assert!(matches!(stream.poll_read_ready(&mut cx), Poll::Pending));
++
++        client.write_all(b"hello").unwrap();
++        loop {
++            match stream.poll_read_ready(&mut cx) {
++                Poll::Ready(Ok(1)) => break,
++                Poll::Pending => std::thread::sleep(Duration::from_millis(5)),
++                other => panic!("unexpected readiness {other:?}"),
++            }
++        }
++
++        // Asking did not take the bytes: the receive that follows gets all
++        // of them, and the socket is then not ready again.
++        let mut buf = [MaybeUninit::new(0u8); 8];
++        assert_eq!(stream.try_recv(&mut buf, false).unwrap(), 5);
++        assert!(matches!(stream.poll_read_ready(&mut cx), Poll::Pending));
++        selector.shutdown();
++    }
++
++    /// A peer that has gone away leaves a socket that holds no bytes and
++    /// is still ready: the peek reports nothing, and the receive that
++    /// follows reports the end of the stream.
++    #[test]
++    fn a_stream_whose_peer_has_gone_is_an_end_of_stream() {
++        let selector = Selector::new();
++        let (_listener, client, mut stream) = connected_pair(&selector);
++        let waker = std::task::Waker::noop();
++        let mut cx = std::task::Context::from_waker(waker);
++
++        assert!(matches!(stream.poll_read_ready(&mut cx), Poll::Pending));
++        drop(client);
++        loop {
++            match stream.poll_read_ready(&mut cx) {
++                Poll::Ready(Ok(0)) => break,
++                Poll::Pending => std::thread::sleep(Duration::from_millis(5)),
++                other => panic!("unexpected readiness {other:?}"),
++            }
++        }
++        let mut buf = [MaybeUninit::new(0u8); 8];
++        assert_eq!(stream.try_recv(&mut buf, false).unwrap(), 0);
++        selector.shutdown();
++    }
++
++    /// mio reports transitions and the guest's epoll is level triggered,
++    /// so a receive that cannot have drained the socket asserts what is
++    /// left rather than waiting for an edge that will not come: a read
++    /// that filled the buffer it was given, and a peek, which takes
++    /// nothing at all. A read that emptied the socket asserts nothing.
++    #[test]
++    fn a_receive_that_leaves_bytes_behind_reasserts_readability() {
++        let selector = Selector::new();
++        let (_listener, mut client, mut stream) = connected_pair(&selector);
++        let (sender, receiver) = mpsc::channel();
++        stream
++            .set_handler(Box::new(ChannelHandler(sender)))
++            .unwrap();
++
++        client.write_all(b"abcd").unwrap();
++        expect_readable(&receiver);
++        while receiver.try_recv().is_ok() {}
++
++        let mut buf = [MaybeUninit::new(0u8); 2];
++        assert_eq!(stream.try_recv(&mut buf, true).unwrap(), 2);
++        expect_readable(&receiver);
++        while receiver.try_recv().is_ok() {}
++
++        assert_eq!(stream.try_recv(&mut buf, false).unwrap(), 2);
++        expect_readable(&receiver);
++        while receiver.try_recv().is_ok() {}
++
++        let mut rest = [MaybeUninit::new(0u8); 8];
++        assert_eq!(stream.try_recv(&mut rest, false).unwrap(), 2);
++        assert!(receiver.try_recv().is_err());
++        selector.shutdown();
++    }
+ }
