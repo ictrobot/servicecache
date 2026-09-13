@@ -167,7 +167,7 @@ index 83cd32f..a220418 100644
  pub use trap::{Trap, UnwindReason};
  #[cfg(feature = "baremetal")]
 diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
-index adc2d60..59789db 100644
+index 8e2355f..38ffa51 100644
 --- a/lib/vm/src/trap/suspend.rs
 +++ b/lib/vm/src/trap/suspend.rs
 @@ -34,7 +34,7 @@ use std::future::Future;
@@ -368,7 +368,7 @@ index adc2d60..59789db 100644
  /// Registers the caller as active unless the gate is closed and `started`.
  ///
  /// With sequentially consistent ordering either this thread sees the closed
-@@ -192,6 +351,65 @@ fn wait_ready(fut: BlockedFuture, gate: Option<&mut dyn TopLevelCoro>) {
+@@ -206,6 +365,65 @@ fn wait_ready(fut: BlockedFuture, gate: Option<&mut dyn TopLevelCoro>) {
      }
  }
  
@@ -434,7 +434,7 @@ index adc2d60..59789db 100644
  /// Suspends the calling coroutine until the host loop has polled `fut` to
  /// completion, possibly on another OS thread. Returns `false`, without
  /// polling, when suspension is disabled or the caller is not on a coroutine.
-@@ -247,6 +465,13 @@ struct Fused<'a, F: Future> {
+@@ -261,6 +479,13 @@ struct Fused<'a, F: Future> {
      done: bool,
  }
  
@@ -448,7 +448,7 @@ index adc2d60..59789db 100644
  impl<F: Future> Future for Fused<'_, F> {
      type Output = ();
  
-@@ -308,7 +533,7 @@ struct GuestCoro<T> {
+@@ -322,7 +547,7 @@ struct GuestCoro<T> {
      /// one crashes the process as it would anywhere else.
      with_trap_context: bool,
      /// The wait the coroutine is suspended in, if any.
@@ -457,7 +457,7 @@ index adc2d60..59789db 100644
      /// The OS thread currently driving a registered coroutine, for unparking.
      thread: Mutex<Option<Thread>>,
      /// Per-thread state captured by the last driving thread when it retired.
-@@ -332,8 +557,14 @@ impl<T: 'static> GuestCoro<T> {
+@@ -346,8 +571,14 @@ impl<T: 'static> GuestCoro<T> {
          } else {
              self.coro.resume(())
          };
@@ -474,7 +474,7 @@ index adc2d60..59789db 100644
          }
          result
      }
-@@ -394,6 +625,15 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+@@ -408,6 +639,15 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
                  }
                  None => wait_ready(fut, None),
              },
@@ -490,7 +490,7 @@ index adc2d60..59789db 100644
              CoroutineResult::Return(result) => break result,
          }
      };
-@@ -434,7 +674,7 @@ pub fn set_thread_state_hooks(hooks: ThreadStateHooks) {
+@@ -448,7 +688,7 @@ pub fn set_thread_state_hooks(hooks: ThreadStateHooks) {
  }
  
  enum Step {
@@ -499,7 +499,7 @@ index adc2d60..59789db 100644
      Done,
  }
  
-@@ -442,7 +682,7 @@ enum Step {
+@@ -456,7 +696,7 @@ enum Step {
  trait TopLevelCoro: Send {
      fn id(&self) -> u64;
      fn started(&self) -> bool;
@@ -508,7 +508,7 @@ index adc2d60..59789db 100644
      fn step(&mut self) -> Step;
      fn set_thread(&self, thread: Thread);
      fn unpark(&self);
-@@ -459,13 +699,18 @@ impl<T: 'static> TopLevelCoro for GuestCoro<T> {
+@@ -473,13 +713,18 @@ impl<T: 'static> TopLevelCoro for GuestCoro<T> {
          self.coro.started()
      }
  
@@ -529,7 +529,7 @@ index adc2d60..59789db 100644
              CoroutineResult::Yield(WasmYield::Unwind(_)) => {
                  // SAFETY: as in `run_wasm_call`: `unwind_with` guarantees only
                  // Wasm frames on the stack.
-@@ -565,7 +810,7 @@ pub fn run_guest_thread<F: FnOnce() + Send + 'static>(stack_size: usize, f: F) {
+@@ -579,7 +824,7 @@ pub fn run_guest_thread<F: FnOnce() + Send + 'static>(stack_size: usize, f: F) {
  }
  
  /// Drives a registered coroutine to completion on the calling thread.
@@ -538,7 +538,7 @@ index adc2d60..59789db 100644
      HOST_LOOPS.fetch_add(1, Ordering::SeqCst);
      // SAFETY: the registry owns the box behind `ptr` and only this loop drives
      // it; the freezer touches it through `&self` methods only while no loop
-@@ -574,8 +819,11 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<BlockedFuture>)
+@@ -588,8 +833,11 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<BlockedFuture>)
      coro.set_thread(std::thread::current());
      CURRENT_COROUTINE.with(|current| current.set(coro.id()));
      loop {
@@ -552,7 +552,7 @@ index adc2d60..59789db 100644
          }
          if !try_enter(coro.started()) {
              retire(coro);
-@@ -629,6 +877,8 @@ pub fn exit_current_thread() -> ! {
+@@ -643,6 +891,8 @@ pub fn exit_current_thread() -> ! {
  /// thread spawn in flight completes and the spawner drains to its own wait.
  pub fn close_gate() {
      GATE_CLOSED.store(true, Ordering::SeqCst);
@@ -601,7 +601,7 @@ index 33725f6..674456d 100644
  host-reqwest = ["reqwest"]
  host-fs = ["virtual-fs/host-fs"]
 diff --git a/lib/wasix/src/os/task/thread.rs b/lib/wasix/src/os/task/thread.rs
-index 9516d09..5ebf3f5 100644
+index 3859b6a..b7e2793 100644
 --- a/lib/wasix/src/os/task/thread.rs
 +++ b/lib/wasix/src/os/task/thread.rs
 @@ -10,7 +10,7 @@ use crate::{
@@ -622,7 +622,7 @@ index 9516d09..5ebf3f5 100644
      stack: Mutex<ThreadStack>,
      status: Arc<OwnedTaskStatus>,
      #[cfg(feature = "journal")]
-@@ -275,6 +277,7 @@ impl WasiThread {
+@@ -295,6 +297,7 @@ impl WasiThread {
                  id,
                  status,
                  signals: Mutex::new((Vec::new(), Vec::new())),
@@ -630,7 +630,7 @@ index 9516d09..5ebf3f5 100644
                  stack: Mutex::new(ThreadStack::default()),
                  #[cfg(feature = "journal")]
                  check_pointing: AtomicBool::new(false),
-@@ -342,6 +345,7 @@ impl WasiThread {
+@@ -362,6 +365,7 @@ impl WasiThread {
      /// joined on it to wake up)
      pub fn set_status_finished(&self, res: Result<ExitCode, WasiRuntimeError>) {
          self.state.status.set_finished(res.map_err(Arc::new));
@@ -638,7 +638,7 @@ index 9516d09..5ebf3f5 100644
      }
  
      /// Waits until the thread is finished or the timeout is reached
-@@ -367,6 +371,24 @@ impl WasiThread {
+@@ -387,6 +391,24 @@ impl WasiThread {
          // between the push above and this store.
          self.state.signals_pending.store(true, Ordering::Release);
          guard.1.drain(..).for_each(|w| w.wake());

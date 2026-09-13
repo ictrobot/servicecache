@@ -8,6 +8,12 @@ there is one so that no OS thread stack holds guest state. A guest
 thread that waits therefore has its whole state in memory, which is what
 freezing and forking a process rely on.
 
+The waker the park loops hand to the futures they poll is the thread's
+own, cloned from one `Arc` per OS thread, for the same reason virtual-io
+lends each thread one parker: what a wait registers its waker with keeps
+one entry per waker it can tell apart, and a waker built per wait is one
+it cannot.
+
 Every thread-local access on the resume path goes through a function
 that is never inlined: the compiler materialises a thread-local's
 address once per function, and a coroutine resumed on another thread
@@ -49,10 +55,10 @@ index 94cfbc5..c0e9418 100644
  pub use traphandlers::install_unwinder;
 diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
 new file mode 100644
-index 0000000..fdd004b
+index 0000000..c19cc16
 --- /dev/null
 +++ b/lib/vm/src/trap/suspend.rs
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,379 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
 +// Copyright (c) 2026 Ethan Jones
 +
@@ -205,11 +211,25 @@ index 0000000..fdd004b
 +    }
 +}
 +
++thread_local! {
++    /// The one unparker an OS thread hands out, for the life of the thread.
++    static THREAD_UNPARKER: Arc<Unparker> = Arc::new(Unparker(std::thread::current()));
++}
++
++/// A waker that unparks this thread. Every wait on a thread clones it from
++/// the same `Arc`, so whatever it waits on recognises the thread with
++/// `Waker::will_wake` and keeps one waker for it rather than one per poll.
++fn thread_waker() -> Waker {
++    THREAD_UNPARKER
++        .try_with(|unparker| Waker::from(unparker.clone()))
++        .unwrap_or_else(|_| Waker::from(Arc::new(Unparker(std::thread::current()))))
++}
++
 +/// Polls `fut` on this thread, parking between polls, until it is ready.
 +/// Every poll is registered as active, so a freeze never catches a poll in
 +/// flight.
 +fn wait_ready(fut: BlockedFuture) {
-+    let waker = Waker::from(Arc::new(Unparker(std::thread::current())));
++    let waker = thread_waker();
 +    let mut cx = Context::from_waker(&waker);
 +    loop {
 +        try_enter(false);
@@ -306,7 +326,7 @@ index 0000000..fdd004b
 +            done: false,
 +        });
 +        if !try_suspend_on_block(fused.as_mut()) {
-+            let waker = Waker::from(Arc::new(Unparker(std::thread::current())));
++            let waker = thread_waker();
 +            let mut cx = Context::from_waker(&waker);
 +            while fused.as_mut().poll(&mut cx).is_pending() {
 +                match deadline {

@@ -23,21 +23,17 @@ index ba1a981..c988c00 100644
  pub use arc::*;
  #[cfg(feature = "sys")]
 diff --git a/lib/virtual-io/src/waker.rs b/lib/virtual-io/src/waker.rs
-index a2c8e9a..34200db 100644
+index 4aa62f1..a011dd4 100644
 --- a/lib/virtual-io/src/waker.rs
 +++ b/lib/virtual-io/src/waker.rs
-@@ -1,22 +1,75 @@
+@@ -1,8 +1,25 @@
+ use std::cell::Cell;
 +use std::pin::Pin;
 +use std::sync::OnceLock;
  use std::task::{Context, Poll, Waker};
  
  use futures::Future;
  
--pub fn block_on<'a, A>(task: impl Future<Output = A> + 'a) -> A {
--    // Create the waker
--    let (parker, unparker) = parking::pair();
--    let waker = Waker::from(unparker.clone());
--    let mut cx = Context::from_waker(&waker);
 +/// Lets the caller's coroutine suspend instead of parking the OS thread.
 +///
 +/// The hook receives the wait as one fused future that lives on the caller's
@@ -52,6 +48,13 @@ index a2c8e9a..34200db 100644
 +pub fn set_suspend_hook(hook: SuspendHook) {
 +    let _ = SUSPEND_HOOK.set(hook);
 +}
++
+ /// What an OS thread parks on while a wait it is driving makes progress,
+ /// and the waker built from it. One exists per thread for the life of the
+ /// thread, and every wait the thread drives clones its waker: the clones
+@@ -78,23 +95,59 @@ fn park_until_done(poll: &mut dyn FnMut(&mut Context<'_>) -> bool) {
+     }
+ }
  
 +/// The wait as a fused future: a suspended coroutine's wait may be re-polled
 +/// after it completed (a forked child re-creates every wait from its future,
@@ -82,12 +85,14 @@ index a2c8e9a..34200db 100644
 +    }
 +}
 +
-+pub fn block_on<'a, A>(task: impl Future<Output = A> + 'a) -> A {
+ pub fn block_on<'a, A>(task: impl Future<Output = A> + 'a) -> A {
 +    let mut slot: Option<A> = None;
      let mut task = Box::pin(task);
--    loop {
--        match task.as_mut().poll(&mut cx) {
--            Poll::Pending => {
+-    let mut output = None;
+-    park_until_done(&mut |cx| match task.as_mut().poll(cx) {
+-        Poll::Ready(value) => {
+-            output = Some(value);
+-            true
 +    {
 +        let mut fused = std::pin::pin!(Fused {
 +            task: task.as_mut(),
@@ -100,16 +105,19 @@ index a2c8e9a..34200db 100644
 +        };
 +        if !suspended {
 +            // Not suspendable: park the OS thread between polls.
-+            let (parker, unparker) = parking::pair();
-+            let waker = Waker::from(unparker.clone());
-+            let mut cx = Context::from_waker(&waker);
-+            while fused.as_mut().poll(&mut cx).is_pending() {
-                 parker.park();
-             }
--            Poll::Ready(ret) => {
--                return ret;
--            }
++            park_until_done(&mut |cx| fused.as_mut().poll(cx).is_ready());
          }
-     }
+-        Poll::Pending => false,
+-    });
+-    output.expect("a wait that finished produced no output")
++    }
 +    slot.expect("a fused future completed without an output")
  }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use std::pin::Pin;
+ 
+     /// A future that is pending on its first poll and wakes itself from
+     /// another thread, so the wait driving it really parks.

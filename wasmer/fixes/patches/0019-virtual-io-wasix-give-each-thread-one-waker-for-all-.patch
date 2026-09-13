@@ -1,0 +1,412 @@
+Subject: virtual-io, wasix: give each thread one waker for all its waits
+
+A wait that cannot be served at once registers its waker with whatever it
+is waiting on, and both lists that hold those wakers -- an interest's slot
+in virtual-io, a thread's signal subscription in wasix -- keep one entry
+per distinct waker, deciding with `Waker::will_wake`. The park loop built
+a parker and a waker for each wait, so no two waits were ever recognised
+as the same waiter: every poll of every wait appended another entry to
+every list whose source had not fired yet, and a list only drains when it
+does. A source that stays quiet while the process works -- an idle
+listening socket, a thread nothing signals -- therefore grew its list by
+an entry per request, and the `will_wake` scan over it, which every poll
+pays, grew with it. Under a single-client request loop that is quadratic:
+throughput falls away steadily and the wakers are memory the process does
+not get back.
+
+Each OS thread now keeps one parker and one waker for its life and lends
+them to one wait at a time, so every wait registers a waker the lists
+recognise and each holds at most one entry per waiting thread. A wait
+started inside the poll of another wait on the same thread still builds
+its own pair, because a parker's token says only that the thread was
+woken: sharing one would let the inner loop consume the token the outer
+wait's event left behind.
+
+A list that grows to 64 entries records a debug event, so that the
+growth shows in a trace.
+
+diff --git a/lib/virtual-io/src/interest.rs b/lib/virtual-io/src/interest.rs
+index 244002f..669e798 100644
+--- a/lib/virtual-io/src/interest.rs
++++ b/lib/virtual-io/src/interest.rs
+@@ -189,6 +189,11 @@ pub struct InterestWakerMap {
+     state: Arc<InterestWakerMapState>,
+ }
+ 
++/// The length at which a slot records a debug event as it grows. A waiter
++/// registers its thread's waker, which `will_wake` recognises, so a slot
++/// holds one entry per waiting thread.
++const WAKER_WARNING: usize = 64;
++
+ impl InterestWakerMap {
+     /// Registers a waker to be woken when the interest next fires. A waker
+     /// that wakes the same task as one already registered is dropped, so a
+@@ -197,8 +202,16 @@ impl InterestWakerMap {
+     pub fn add(&self, interest: InterestType, waker: &Waker) {
+         let mut wakers = self.state.wakers.lock().unwrap();
+         let slot = &mut wakers[interest.index()];
+-        if !slot.iter().any(|w| w.will_wake(waker)) {
+-            slot.push(waker.clone());
++        if slot.iter().any(|w| w.will_wake(waker)) {
++            return;
++        }
++        slot.push(waker.clone());
++        if slot.len() == WAKER_WARNING {
++            tracing::debug!(
++                ?interest,
++                wakers = slot.len(),
++                "many wakers waiting on one interest"
++            );
+         }
+     }
+ 
+@@ -390,6 +403,32 @@ mod tests {
+         assert_eq!(woken.count(), 1);
+     }
+ 
++    fn registered(map: &InterestWakerMap, interest: InterestType) -> usize {
++        map.state.wakers.lock().unwrap()[interest.index()].len()
++    }
++
++    #[test]
++    fn a_thread_that_polls_over_and_over_registers_one_waker() {
++        let map = InterestWakerMap::default();
++        for _ in 0..10_000 {
++            map.add(InterestType::Readable, &crate::waker::thread_waker());
++        }
++        assert_eq!(registered(&map, InterestType::Readable), 1);
++    }
++
++    #[test]
++    fn distinct_wakers_are_all_kept() {
++        let map = InterestWakerMap::default();
++        let mut woken = Vec::new();
++        for _ in 0..2 * WAKER_WARNING {
++            let (count, waker) = counting_waker();
++            map.add(InterestType::Readable, &waker);
++            woken.push(count);
++        }
++        assert_eq!(registered(&map, InterestType::Readable), 2 * WAKER_WARNING);
++        assert!(woken.iter().all(|count| count.count() == 0));
++    }
++
+     #[test]
+     fn an_event_racing_a_poll_is_never_lost() {
+         // A poll registers its waker while the event lands, in whichever
+diff --git a/lib/virtual-io/src/waker.rs b/lib/virtual-io/src/waker.rs
+index a2c8e9a..4aa62f1 100644
+--- a/lib/virtual-io/src/waker.rs
++++ b/lib/virtual-io/src/waker.rs
+@@ -1,22 +1,171 @@
++use std::cell::Cell;
+ use std::task::{Context, Poll, Waker};
+ 
+ use futures::Future;
+ 
+-pub fn block_on<'a, A>(task: impl Future<Output = A> + 'a) -> A {
+-    // Create the waker
++/// What an OS thread parks on while a wait it is driving makes progress,
++/// and the waker built from it. One exists per thread for the life of the
++/// thread, and every wait the thread drives clones its waker: the clones
++/// share one data pointer, so the lists a poll registers on - a source's
++/// waker slot, a thread's signal subscription - recognise them with
++/// `Waker::will_wake` and hold one entry per waiting thread rather than one
++/// per poll. A pair built per wait is recognised by nothing, and those
++/// lists grow by an entry on every poll until their source fires.
++struct ThreadPark {
++    parker: parking::Parker,
++    waker: Waker,
++    /// Set while a wait on this thread is parking on the parker. A parker's
++    /// token says only that something woke the thread, so a wait nested
++    /// inside another's poll cannot share it: it would consume the token
++    /// the outer wait's event left. The nested wait builds a private pair.
++    lent: Cell<bool>,
++}
++
++thread_local! {
++    static THREAD_PARK: ThreadPark = {
++        let (parker, unparker) = parking::pair();
++        ThreadPark {
++            parker,
++            waker: Waker::from(unparker),
++            lent: Cell::new(false),
++        }
++    };
++}
++
++/// Returns the parker's lending flag when the wait is over, however it
++/// ends.
++struct Returned;
++
++impl Drop for Returned {
++    fn drop(&mut self) {
++        let _ = THREAD_PARK.try_with(|park| park.lent.set(false));
++    }
++}
++
++/// A clone of this thread's waker. Every clone wakes the same parker, so
++/// `Waker::will_wake` holds between any two of them.
++#[cfg(test)]
++pub(crate) fn thread_waker() -> Waker {
++    THREAD_PARK.with(|park| park.waker.clone())
++}
++
++/// Polls until `poll` reports the wait finished, parking the OS thread in
++/// between. The thread's own parker is used when it is free; see
++/// `ThreadPark`.
++fn park_until_done(poll: &mut dyn FnMut(&mut Context<'_>) -> bool) {
++    let borrowed = THREAD_PARK.try_with(|park| {
++        if park.lent.replace(true) {
++            return false;
++        }
++        let _returned = Returned;
++        let waker = park.waker.clone();
++        let mut cx = Context::from_waker(&waker);
++        while !poll(&mut cx) {
++            park.parker.park();
++        }
++        true
++    });
++    if matches!(borrowed, Ok(true)) {
++        return;
++    }
++    // Either a wait further up this thread's stack holds the parker, or the
++    // thread is being torn down and its locals are gone.
+     let (parker, unparker) = parking::pair();
+-    let waker = Waker::from(unparker.clone());
++    let waker = Waker::from(unparker);
+     let mut cx = Context::from_waker(&waker);
++    while !poll(&mut cx) {
++        parker.park();
++    }
++}
+ 
++pub fn block_on<'a, A>(task: impl Future<Output = A> + 'a) -> A {
+     let mut task = Box::pin(task);
+-    loop {
+-        match task.as_mut().poll(&mut cx) {
+-            Poll::Pending => {
+-                parker.park();
++    let mut output = None;
++    park_until_done(&mut |cx| match task.as_mut().poll(cx) {
++        Poll::Ready(value) => {
++            output = Some(value);
++            true
++        }
++        Poll::Pending => false,
++    });
++    output.expect("a wait that finished produced no output")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::pin::Pin;
++
++    /// A future that is pending on its first poll and wakes itself from
++    /// another thread, so the wait driving it really parks.
++    struct PendsOnce {
++        polls: usize,
++    }
++
++    impl Future for PendsOnce {
++        type Output = usize;
++
++        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
++            self.polls += 1;
++            if self.polls > 1 {
++                return Poll::Ready(self.polls);
+             }
+-            Poll::Ready(ret) => {
+-                return ret;
++            let waker = cx.waker().clone();
++            std::thread::spawn(move || waker.wake());
++            Poll::Pending
++        }
++    }
++
++    #[test]
++    fn a_thread_keeps_one_waker_for_every_wait_it_makes() {
++        let first = thread_waker();
++        for _ in 0..10_000 {
++            assert!(thread_waker().will_wake(&first));
++        }
++        // A second thread's waker is its own, so two threads waiting on one
++        // source register one waker each rather than sharing one.
++        let other = std::thread::spawn(thread_waker).join().unwrap();
++        assert!(!other.will_wake(&first));
++    }
++
++    #[test]
++    fn a_wait_that_is_ready_at_once_never_parks() {
++        assert_eq!(block_on(async { 7 }), 7);
++    }
++
++    #[test]
++    fn a_wait_woken_from_another_thread_completes() {
++        assert_eq!(block_on(PendsOnce { polls: 0 }), 2);
++    }
++
++    #[test]
++    fn a_nested_wait_leaves_its_caller_the_token_its_event_left() {
++        // The outer wait is woken while its poll is still running, and the
++        // wait that poll starts parks before the outer loop does. If the
++        // two shared a parker the inner park would consume the outer's
++        // token and the outer would park for ever; the outer's second poll
++        // is the proof that it did not.
++        struct Outer {
++            polls: usize,
++        }
++
++        impl Future for Outer {
++            type Output = usize;
++
++            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
++                self.polls += 1;
++                if self.polls > 1 {
++                    return Poll::Ready(self.polls);
++                }
++                // The event this wait is waiting for, arriving during the
++                // poll: legal, and it leaves a token on the parker.
++                cx.waker().wake_by_ref();
++                // A wait started inside the poll, which parks.
++                assert_eq!(block_on(PendsOnce { polls: 0 }), 2);
++                Poll::Pending
+             }
+         }
++
++        assert_eq!(block_on(Outer { polls: 0 }), 2);
+     }
+ }
+diff --git a/lib/wasix/src/os/task/thread.rs b/lib/wasix/src/os/task/thread.rs
+index 9516d09..3859b6a 100644
+--- a/lib/wasix/src/os/task/thread.rs
++++ b/lib/wasix/src/os/task/thread.rs
+@@ -258,6 +258,26 @@ struct WasiThreadState {
+ 
+ static NO_MORE_BYTES: [u8; 0] = [0u8; 0];
+ 
++/// The length at which a thread's signal subscription records a debug event
++/// as it grows. A waiter registers its OS thread's waker, which the dedupe
++/// below recognises, so the list holds one entry per waiting thread.
++const SUBSCRIBER_WARNING: usize = 64;
++
++/// Adds `waker` to a thread's signal subscription unless a waker that wakes
++/// the same task is already in it.
++fn subscribe(subscribers: &mut Vec<Waker>, waker: &Waker) {
++    if subscribers.iter().any(|w| w.will_wake(waker)) {
++        return;
++    }
++    subscribers.push(waker.clone());
++    if subscribers.len() == SUBSCRIBER_WARNING {
++        tracing::debug!(
++            wakers = subscribers.len(),
++            "many wakers subscribed to a thread's signals"
++        );
++    }
++}
++
+ impl WasiThread {
+     pub fn new(
+         pid: WasiProcessId,
+@@ -409,9 +429,7 @@ impl WasiThread {
+         std::mem::swap(&mut ret, &mut guard.0);
+         match ret.is_empty() {
+             true => {
+-                if !guard.1.iter().any(|w| w.will_wake(waker)) {
+-                    guard.1.push(waker.clone());
+-                }
++                subscribe(&mut guard.1, waker);
+                 None
+             }
+             false => Some(ret),
+@@ -419,18 +437,15 @@ impl WasiThread {
+     }
+ 
+     pub fn signals_subscribe(&self, waker: &Waker) {
+-        let mut guard = self.state.signals.lock().unwrap();
+-        if !guard.1.iter().any(|w| w.will_wake(waker)) {
+-            guard.1.push(waker.clone());
+-        }
++        subscribe(&mut self.state.signals.lock().unwrap().1, waker);
+     }
+ 
+     /// Returns all the signals that are waiting to be processed
+     pub fn has_signals_or_subscribe(&self, waker: &Waker) -> bool {
+         let mut guard = self.state.signals.lock().unwrap();
+         let has_signals = !guard.0.is_empty();
+-        if !has_signals && !guard.1.iter().any(|w| w.will_wake(waker)) {
+-            guard.1.push(waker.clone());
++        if !has_signals {
++            subscribe(&mut guard.1, waker);
+         }
+         has_signals
+     }
+@@ -683,8 +698,20 @@ impl From<WasiThreadError> for Errno {
+ mod tests {
+     use super::*;
+     use crate::os::task::control_plane::WasiControlPlane;
++    use std::sync::atomic::AtomicUsize;
+     use wasmer_types::ModuleHash;
+ 
++    /// A waker of its own, counting the wakes every one of them receives.
++    fn counting_waker(woken: &Arc<AtomicUsize>) -> Waker {
++        struct Counter(Arc<AtomicUsize>);
++        impl std::task::Wake for Counter {
++            fn wake(self: Arc<Self>) {
++                self.0.fetch_add(1, Ordering::AcqRel);
++            }
++        }
++        Waker::from(Arc::new(Counter(woken.clone())))
++    }
++
+     fn new_thread() -> WasiThreadHandle {
+         let plane = WasiControlPlane::default();
+         let process = plane.new_process(ModuleHash::random()).unwrap();
+@@ -726,6 +753,46 @@ mod tests {
+         assert_eq!(thread.pop_signals(), vec![Signal::Sigusr2]);
+     }
+ 
++    fn subscribers(thread: &WasiThread) -> usize {
++        thread.signals().lock().unwrap().1.len()
++    }
++
++    #[test]
++    fn a_thread_that_waits_over_and_over_subscribes_one_waker() {
++        let handle = new_thread();
++        let thread = handle.as_thread();
++
++        // Through a real wait, so the waker is the one a waiting OS thread
++        // actually hands in.
++        virtual_mio::block_on(std::future::poll_fn(|cx| {
++            for _ in 0..10_000 {
++                assert!(!thread.has_signals_or_subscribe(cx.waker()));
++            }
++            std::task::Poll::Ready(())
++        }));
++        assert_eq!(subscribers(&thread), 1);
++
++        // The subscription still works: the signal wakes it and empties the
++        // list.
++        thread.signal(Signal::Sigusr1);
++        assert_eq!(subscribers(&thread), 0);
++        assert!(thread.has_signals_or_subscribe(Waker::noop()));
++    }
++
++    #[test]
++    fn distinct_wakers_are_all_kept() {
++        let handle = new_thread();
++        let thread = handle.as_thread();
++
++        // Distinct wakers, as a waiter that builds one per poll hands in.
++        let woken = Arc::new(AtomicUsize::new(0));
++        for _ in 0..2 * SUBSCRIBER_WARNING {
++            thread.signals_subscribe(&counting_waker(&woken));
++        }
++        assert_eq!(subscribers(&thread), 2 * SUBSCRIBER_WARNING);
++        assert_eq!(woken.load(Ordering::Acquire), 0);
++    }
++
+     #[test]
+     fn a_finished_thread_is_seen_by_a_join_that_follows() {
+         let handle = new_thread();
