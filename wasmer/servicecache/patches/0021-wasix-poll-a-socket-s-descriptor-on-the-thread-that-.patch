@@ -1,0 +1,972 @@
+Subject: wasix: poll a socket's descriptor on the thread that called
+ poll_oneoff
+
+A guest waiting in poll_oneoff on a socket paid the same handoff through
+the selector thread an epoll wait did, and one thing more: the guard
+that waits for a socket registered it with the selector, permanently and
+edge triggered, and allocated itself on every call.
+
+A read or write subscription on a socket with a host descriptor is now
+polled by the calling thread through `try_suspend_on_pollfd`, in
+`direct_poll_oneoff`. It gets no guard, so it is registered nowhere and
+nothing reads it; clock subscriptions become the deadline; every other
+subscription - a pipe, an event notification, a file, a socket the host
+cannot name - gets its guard exactly as before and joins the same wait
+through the thread's waker. A turn polls each guard once, then waits on
+the descriptors; a wake from either side ends it and both are looked at
+again. A turn whose guards produced events still probes the sockets with
+a deadline that has passed before it answers, so a guard that stays
+ready cannot hide a socket. What a wait reports is what the guest then
+reads, and nothing in between consumes anything.
+
+Nothing is claimed and nothing is kept between calls, because
+poll_oneoff names its descriptors every time, so a call that cannot be
+served this way needs no undoing: it falls through whole to the existing
+path, which builds the guards. That happens for a journalled call, a
+runtime with no descriptor wait, more sockets than one wait accepts
+(`DIRECT_POLL_CAP`, 64), a signal that cannot be delivered, and a
+descriptor that can no longer be named - though a call that has already
+collected events from its guards answers with those, since a subset is a
+legal answer. Every turn runs the pending dynamic link operations first
+and asks whether the thread was finished after capturing its interrupt
+generation, as the epoll loop does, and a call resumed from a deep sleep
+answers with what its wait produced before anything else runs.
+
+A readable descriptor reports one byte, not a count. Of the readers of a
+poll_oneoff answer in wasix-libc, poll() and pselect() use the type and
+hangup flag and never the count, and ioctl(FIONREAD) is what the guests
+test for zero. A peer that has gone away or shut its writing half down
+may have sent a last request first, so on that turn the wait says
+whether bytes are still unread: with some, a read subscription is an
+ordinary readable descriptor; with none it reports no bytes and the
+hangup flag, as a guard reports the end of a file. An error reports a
+code poll() turns into POLLERR. The half-close is asked for as a bit of
+its own rather than folded into hangup, which would tell an epoll set
+that a stream it can still write to has hung up.
+
+diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
+index f250835..0e842db 100644
+--- a/lib/wasix/src/net/socket.rs
++++ b/lib/wasix/src/net/socket.rs
+@@ -1980,6 +1980,27 @@ pub(crate) mod tests {
+     /// only has to be one a backend could answer with.
+     pub(crate) type MockHandlerSlot = Arc<StdMutex<Option<Box<dyn InterestHandler + Send + Sync>>>>;
+ 
++    /// The same socket, with the counter of `poll_read_ready` calls the
++    /// backend has seen: a subscription the waiting thread polls for
++    /// itself must never reach it, because registering the socket with the
++    /// shared selector is one of the two costs being removed.
++    pub(crate) fn watched_host_descriptor_socket()
++    -> (InodeSocket, MockHandlerSlot, Arc<AtomicUsize>) {
++        let handler: MockHandlerSlot = Arc::new(StdMutex::new(None));
++        let reads = Arc::new(AtomicUsize::new(0));
++        let socket = InodeSocket::new(InodeSocketKind::TcpStream {
++            socket: Box::new(MockTcpSocket {
++                handler: handler.clone(),
++                host_fd: Some(3),
++                read_calls: reads.clone(),
++                ..Default::default()
++            }),
++            write_timeout: None,
++            read_timeout: None,
++        });
++        (socket, handler, reads)
++    }
++
+     pub(crate) fn host_descriptor_socket() -> (InodeSocket, MockHandlerSlot) {
+         let handler: MockHandlerSlot = Arc::new(StdMutex::new(None));
+         let socket = InodeSocket::new(InodeSocketKind::TcpStream {
+diff --git a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
+index f239f1a..907b28f 100644
+--- a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
++++ b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
+@@ -272,6 +272,414 @@ impl Future for PollBatch {
+     }
+ }
+ 
++/// What the direct wait did with a `poll_oneoff` call.
++///
++/// Nothing is claimed and nothing is kept: `poll_oneoff` names its
++/// descriptors afresh on every call, so the rule is local to one call - a
++/// socket this call polls for itself is polled by this thread until the
++/// call returns - and `Fallthrough` needs no undoing, because the existing
++/// path builds a guard for every subscription including the sockets, which
++/// is what registers them with the selector.
++#[cfg(all(unix, feature = "direct-waits"))]
++enum DirectPoll {
++    /// The events to report to the guest.
++    Events(Vec<Event>),
++    /// The deadline passed with nothing ready: the clock events.
++    Timeout(Vec<Event>),
++    /// The call ends with this error code, which processing a signal asked
++    /// for.
++    Errno(Errno),
++    /// The existing path runs exactly as it would have.
++    Fallthrough,
++}
++
++/// One subscription the calling thread polls for itself: a read or a write
++/// on a socket the host can name a descriptor for.
++#[cfg(all(unix, feature = "direct-waits"))]
++struct DirectSub {
++    /// The socket, held for the length of the call. Another guest thread
++    /// closing the fd must not leave this one waiting on a descriptor
++    /// number the kernel has since given to something else.
++    socket: Arc<crate::net::socket::InodeSocketInner>,
++    /// The readiness to ask the kernel for.
++    wanted: u16,
++    type_: Eventtype,
++    userdata: Userdata,
++}
++
++/// Whether one subscription is a socket this thread can poll itself, and
++/// the socket if it is.
++///
++/// The rights are checked exactly as `poll_fd_guard` checks them, so a
++/// subscription that would be an error there is not taken over here: it
++/// gets its guard and the existing path answers it as it always has.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_sub(state: &Arc<WasiState>, fd: WasiFd, s: &Subscription) -> Option<DirectSub> {
++    let (requires_access, _) = direct_sub_kind(s.type_)?;
++    let fd_entry = state.fs.get_fd(fd).ok()?;
++    if !(fd_entry.inner.rights.contains(Rights::POLL_FD_READWRITE)
++        && fd_entry.inner.rights.contains(requires_access))
++    {
++        return None;
++    }
++    let inode_guard = fd_entry.inode.read();
++    let Kind::Socket { socket } = inode_guard.deref() else {
++        return None;
++    };
++    direct_sub_for(socket, s)
++}
++
++/// The access one subscription type needs and the readiness it asks the
++/// kernel for. Anything but a read or a write on a descriptor is not a
++/// subscription this path serves.
++///
++/// Hangup and error are reported whether or not they are asked for. The
++/// peer shutting only its writing half down is not: it has to be requested,
++/// and it is what the guard path reports as a read that reached the end of
++/// the file.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_sub_kind(type_: Eventtype) -> Option<(Rights, u16)> {
++    match type_ {
++        Eventtype::FdRead => Some((
++            Rights::FD_READ,
++            wasmer_vm::HOST_POLL_READ | wasmer_vm::HOST_POLL_RDHUP,
++        )),
++        Eventtype::FdWrite => Some((Rights::FD_WRITE, wasmer_vm::HOST_POLL_WRITE)),
++        _ => None,
++    }
++}
++
++/// The same decision once the descriptor has been resolved to a socket:
++/// only a socket whose backend can name a host descriptor is polled by the
++/// waiting thread. Nothing is installed on the socket and nothing is read
++/// from it here - that is the whole point of the path.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_sub_for(socket: &crate::net::socket::InodeSocket, s: &Subscription) -> Option<DirectSub> {
++    let (_, wanted) = direct_sub_kind(s.type_)?;
++    socket.host_fd()?;
++    Some(DirectSub {
++        socket: socket.inner.clone(),
++        wanted,
++        type_: s.type_,
++        userdata: s.userdata,
++    })
++}
++
++/// The deadline a call's clock subscriptions come to, or nothing when the
++/// call cannot be served this way.
++///
++/// A zero timeout asks what is ready now: the deadline it gets has already
++/// passed, so the descriptors are polled once with a zero timeout and the
++/// guards once, and nothing sleeps. No clock at all, or one the existing
++/// path reads as immediate, is no deadline.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_poll_deadline(time_to_sleep: Duration) -> Option<Option<Instant>> {
++    match time_to_sleep {
++        Duration::MAX => Some(None),
++        Duration::ZERO => Some(Some(Instant::now())),
++        timeout => Instant::now().checked_add(timeout).map(Some),
++    }
++}
++
++/// The event one direct subscription's readiness becomes, or nothing when
++/// it reported none that this subscription asked about.
++///
++/// A readable descriptor reports one byte rather than a count, except on
++/// the turn where the count decides the answer: counting on every turn
++/// would cost a syscall for an answer almost nobody reads. Of the three
++/// places wasix-libc reads a `poll_oneoff` answer,
++/// `poll()` and `pselect()` use only the event's type and its hangup flag
++/// and never the count
++/// (`libc-bottom-half/cloudlibc/src/libc/poll/poll.c` and
++/// `.../sys/select/pselect.c`); `ioctl(FIONREAD)` is the one that reads it.
++///
++/// A peer that has shut its writing half down, or gone away, reports that
++/// with whatever it sent last still unread, so on that turn the wait says
++/// whether bytes remain: with some, a read subscription is an ordinary
++/// readable descriptor, as the guard path reported it; with none it is the
++/// end of the stream, no bytes and the hangup flag, which is what the guard
++/// path reports for a read that returns end of file. A write subscription
++/// is hung up either way. An error reports the hangup flag and an error
++/// code, which `poll()` turns into `POLLERR`.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_sub_event(sub: &DirectSub, revents: u16, nbytes: u32) -> Option<Event> {
++    let ended = revents & (wasmer_vm::HOST_POLL_RDHUP | wasmer_vm::HOST_POLL_HUP) != 0;
++    let failed = revents & wasmer_vm::HOST_POLL_ERR != 0;
++    let ready =
++        revents & sub.wanted & (wasmer_vm::HOST_POLL_READ | wasmer_vm::HOST_POLL_WRITE) != 0;
++    if !failed && !ready && !ended {
++        return None;
++    }
++    let unread = sub.type_ == Eventtype::FdRead && nbytes > 0;
++    let (count, error) = if failed {
++        (0, Errno::Io)
++    } else if ended && !unread {
++        (0, Errno::Success)
++    } else {
++        (1, Errno::Success)
++    };
++    Some(Event {
++        userdata: sub.userdata,
++        error,
++        type_: sub.type_,
++        u: EventUnion {
++            fd_readwrite: EventFdReadwrite {
++                nbytes: count,
++                flags: if count == 0 {
++                    Eventrwflags::FD_READWRITE_HANGUP
++                } else {
++                    Eventrwflags::empty()
++                },
++            },
++        },
++    })
++}
++
++/// What a call answers when it can no longer name one of its sockets.
++///
++/// The existing path, which builds a guard for every subscription
++/// including that one - unless this turn's guards have already reported
++/// something. A subset is a legal `poll_oneoff` answer, and throwing one
++/// away would lose the readiness of any guard that consumed it on the
++/// poll; nothing here does today, and nothing should have to.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_poll_answer(events: Vec<Event>) -> DirectPoll {
++    if events.is_empty() {
++        DirectPoll::Fallthrough
++    } else {
++        DirectPoll::Events(events)
++    }
++}
++
++/// The clock events a deadline that passed produces, as the existing
++/// timeout path produces them.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_clock_events(clock_subs: &[(SubscriptionClock, u64)]) -> Vec<Event> {
++    clock_subs
++        .iter()
++        .map(|(_, userdata)| Event {
++            userdata: *userdata,
++            error: Errno::Success,
++            type_: Eventtype::Clock,
++            u: EventUnion { clock: 0 },
++        })
++        .collect()
++}
++
++/// Waits for the call on the guest thread, polling the host descriptors of
++/// its socket subscriptions itself.
++///
++/// A socket polled here is given no guard and is never asked for its read
++/// readiness, so what the guard path does to it does not happen: it is not
++/// registered with the shared selector, where it would stay for the life
++/// of the socket and cost a selector wake on every event. Every other
++/// subscription - a pipe, an event notification, a
++/// file, a socket with no host descriptor - gets its guard exactly as
++/// before and joins the same wait through this thread's waker. Clock
++/// subscriptions are the deadline.
++///
++/// The data a wait reports is still there when the guest reads it: the same
++/// thread does both and nothing between them consumes anything, so the read
++/// that follows succeeds without registering anything either.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_poll_oneoff(
++    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
++    subs: &[(Option<WasiFd>, PollEventSet, Subscription)],
++    clock_subs: &[(SubscriptionClock, u64)],
++    time_to_sleep: Duration,
++) -> Result<DirectPoll, WasiError> {
++    let state = ctx.data().state.clone();
++
++    // Per subscription, at the call.
++    let mut direct: [Option<DirectSub>; DIRECT_POLL_CAP] = std::array::from_fn(|_| None);
++    let mut ndirect = 0;
++    let mut guarded: Vec<InodeValFilePollGuard> = Vec::new();
++    for (fd, peb, s) in subs {
++        let Some(fd) = *fd else {
++            continue;
++        };
++        match direct_sub(&state, fd, s) {
++            Some(_) if ndirect == DIRECT_POLL_CAP => {
++                // More sockets than the host's wait accepts. The call takes
++                // the existing path whole rather than splitting the set,
++                // which is correct and not fast.
++                return Ok(DirectPoll::Fallthrough);
++            }
++            Some(sub) => {
++                direct[ndirect] = Some(sub);
++                ndirect += 1;
++            }
++            None => match poll_fd_guard(&state, *peb, fd, *s) {
++                Ok(guard) => guarded.push(guard),
++                // The existing path reports this refusal the way it always
++                // has.
++                Err(_) => return Ok(DirectPoll::Fallthrough),
++            },
++        }
++    }
++    if ndirect == 0 {
++        return Ok(DirectPoll::Fallthrough);
++    }
++
++    let Some(deadline) = direct_poll_deadline(time_to_sleep) else {
++        return Ok(DirectPoll::Fallthrough);
++    };
++
++    let mut joins: Vec<InodeValFilePollGuardJoin> = guarded
++        .into_iter()
++        .map(InodeValFilePollGuardJoin::new)
++        .collect();
++    let waker = std::task::Waker::from(Arc::new(DirectPollWaker {
++        thread: ctx.data().thread.clone(),
++    }));
++    let mut fds = [wasmer_vm::HostPollFd::default(); DIRECT_POLL_CAP];
++
++    loop {
++        // A dlopen or dlclose in another thread holds the whole guest at a
++        // barrier that only this call reaches, so it is reached on every
++        // turn: the existing path runs it on every wake for the same
++        // reason.
++        WasiEnv::do_pending_link_operations(ctx, false)?;
++
++        // Captured before anything below registers the waker, so that a
++        // producer arriving between the two changes it and the wait returns
++        // at once instead of sleeping through it.
++        let wait_interrupt = ctx.data().thread.wait_interrupt();
++        let mut events = Vec::new();
++
++        // The runtime objects, polled once each. A guard's poll is both the
++        // check and the registration, so register-then-check is inherent.
++        {
++            let mut cx = Context::from_waker(&waker);
++            for join in joins.iter_mut() {
++                if let Poll::Ready(ready) = Pin::new(join).poll(&mut cx) {
++                    events.extend(ready.into_iter().map(|(event, _)| event.into_event()));
++                }
++            }
++        }
++
++        // The descriptors, resolved again on every turn: a fork can replace
++        // the socket behind one.
++        for (index, sub) in direct[..ndirect].iter().flatten().enumerate() {
++            let Some(host_fd) = sub.socket.protected.read().unwrap().host_fd() else {
++                // The socket is gone or is no longer one the host can name.
++                // The existing path builds it a guard, unless this turn's
++                // guards have already reported something.
++                return Ok(direct_poll_answer(events));
++            };
++            fds[index] = wasmer_vm::HostPollFd {
++                fd: host_fd,
++                events: sub.wanted,
++                revents: 0,
++                nbytes: 0,
++            };
++        }
++        // Events from the guards are answered on this turn, but the sockets
++        // are probed first, with a deadline that has passed: a guard that
++        // stays ready would otherwise hide a socket's readiness on every
++        // call. A signal waits for the next call rather than costing these
++        // events, which the guards will not report twice.
++        let probing = !events.is_empty();
++        let turn_deadline = if probing {
++            Some(Instant::now())
++        } else {
++            deadline
++        };
++
++        // A termination moves the interrupt generation without queueing a
++        // signal, so a finished thread is asked about here too: one that
++        // finished before the capture above would otherwise be slept
++        // through.
++        if !probing && (ctx.data().thread.signals_pending() || ctx.data().should_exit().is_some()) {
++            if let Err(errno) = WasiEnv::process_signals_and_exit(ctx)? {
++                return Ok(DirectPoll::Errno(errno));
++            }
++            if ctx.data().thread.signals_pending() {
++                // A signal the runtime cannot deliver right now stays
++                // queued, and looking at it again here would spin.
++                return Ok(DirectPoll::Fallthrough);
++            }
++            continue;
++        }
++
++        let epoch = wasmer_vm::pollfd_epoch();
++        // SAFETY: every descriptor belongs to a socket held in `direct` for
++        // the whole call, and the interrupt word belongs to this thread,
++        // which is the one suspending.
++        let result = unsafe {
++            wasmer_vm::try_suspend_on_pollfd(
++                &mut fds[..ndirect],
++                wait_interrupt.0,
++                wait_interrupt.1,
++                turn_deadline,
++            )
++        };
++        match result {
++            Some(wasmer_vm::HostPollFdResult::Ready) => {
++                for (slot, sub) in fds[..ndirect]
++                    .iter()
++                    .zip(direct[..ndirect].iter().flatten())
++                {
++                    if let Some(event) = direct_sub_event(sub, slot.revents, slot.nbytes) {
++                        events.push(event);
++                    }
++                }
++                // A pipe or a notification may have fired in the same
++                // instant: its waker is what ended the wait, but only
++                // polling its guard produces the event. A probe has already
++                // polled the guards this turn, and a guard that is still
++                // ready would report the same event twice.
++                if !probing {
++                    let mut cx = Context::from_waker(&waker);
++                    for join in joins.iter_mut() {
++                        if let Poll::Ready(ready) = Pin::new(join).poll(&mut cx) {
++                            events.extend(ready.into_iter().map(|(event, _)| event.into_event()));
++                        }
++                    }
++                }
++                if !events.is_empty() {
++                    return Ok(DirectPoll::Events(events));
++                }
++                // A level nothing subscribed to. Round again.
++            }
++            // A signal, a termination, or a producer's waker. The next turn
++            // finds whatever it left, and was told to look; a probe answers
++            // with what its guards found.
++            Some(wasmer_vm::HostPollFdResult::Interrupted) => {
++                if probing {
++                    return Ok(DirectPoll::Events(events));
++                }
++                if let Err(errno) = WasiEnv::process_signals_and_exit(ctx)? {
++                    return Ok(DirectPoll::Errno(errno));
++                }
++            }
++            Some(wasmer_vm::HostPollFdResult::TimedOut) => {
++                if probing {
++                    return Ok(DirectPoll::Events(events));
++                }
++                return Ok(DirectPoll::Timeout(direct_clock_events(clock_subs)));
++            }
++            Some(wasmer_vm::HostPollFdResult::Unavailable) | None => {
++                if probing {
++                    return Ok(DirectPoll::Events(events));
++                }
++                // A fork rebuilt the networking under the wait, so the
++                // descriptors are resolved again rather than given up on.
++                if wasmer_vm::pollfd_epoch() != epoch {
++                    continue;
++                }
++                return Ok(DirectPoll::Fallthrough);
++            }
++        }
++    }
++}
++
++/// One event per `poll_oneoff` call, saying which path answered it and with
++/// what, in the shape `epoll_wait` reports itself.
++fn trace_poll_call(direct: bool, outcome: &'static str, nfds: usize) {
++    tracing::trace!(direct, outcome, nfds, "poll oneoff answered");
++}
++
+ pub(crate) fn poll_fd_guard(
+     state: &Arc<WasiState>,
+     peb: PollEventSet,
+@@ -414,6 +822,101 @@ where
+         };
+     }
+ 
++    let process_timeout = {
++        let clock_subs = clock_subs.clone();
++        |ctx: &FunctionEnvMut<'a, WasiEnv>| {
++            // The timeout has triggered so lets add that event
++            if clock_subs.is_empty() {
++                tracing::warn!("triggered_timeout (without any clock subscriptions)");
++            }
++            let mut evts = Vec::new();
++            for (clock_info, userdata) in clock_subs {
++                let evt = Event {
++                    userdata,
++                    error: Errno::Success,
++                    type_: Eventtype::Clock,
++                    u: EventUnion { clock: 0 },
++                };
++                Span::current().record(
++                    "seen",
++                    format!(
++                        "clock(id={},userdata={})",
++                        clock_info.clock_id as u32, evt.userdata
++                    ),
++                );
++                evts.push(evt);
++            }
++            evts
++        }
++    };
++
++    // We replace the process events callback with another callback
++    // which will interpret the error codes
++    let process_events = {
++        let clock_subs = clock_subs.clone();
++        |ctx: &FunctionEnvMut<'a, WasiEnv>, events: Result<Vec<Event>, Errno>| {
++            // Process the result
++            match events {
++                Ok(evts) => {
++                    // If its a timeout then return an event for it
++                    if evts.len() == 1 {
++                        Span::current().record("seen", format!("{:?}", evts.first().unwrap()));
++                    } else {
++                        Span::current().record("seen", format!("trigger_cnt=({})", evts.len()));
++                    }
++
++                    // Process the events
++                    process_events(ctx, evts)
++                }
++                Err(Errno::Timedout) => process_events(ctx, process_timeout(ctx)),
++                // If nonblocking the Errno::Again needs to be turned into an empty list
++                Err(Errno::Again) => process_events(ctx, Default::default()),
++                // Otherwise process the error
++                Err(err) => {
++                    tracing::warn!("failed to poll during deep sleep - {}", err);
++                    err
++                }
++            }
++        }
++    };
++
++    // A call resumed from a deep sleep answers with what the wait it left
++    // behind produced, before anything else is looked at: a socket that
++    // became eligible for the direct branch since must not start a second
++    // wait in front of an answer already made.
++    if let Some(events) = unsafe { handle_rewind::<M, Result<Vec<EventResult>, Errno>>(&mut ctx) } {
++        let events = events.map(|events| events.into_iter().map(EventResult::into_event).collect());
++        process_events(&ctx, events);
++        return Ok(Errno::Success);
++    }
++
++    // Before any of the machinery below is built, see whether this thread
++    // can poll the call's sockets itself. A journalled call records its
++    // wait through the existing path, and a runtime without the descriptor
++    // wait has nothing to poll with.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    if wasmer_vm::can_suspend_on_pollfd() && !ctx.data().enable_journal {
++        match direct_poll_oneoff(&mut ctx, &subs, &clock_subs, time_to_sleep)? {
++            DirectPoll::Events(events) => {
++                trace_poll_call(true, "events", subs_len);
++                return Ok(process_events(&ctx, Ok(events)));
++            }
++            DirectPoll::Timeout(events) => {
++                trace_poll_call(true, "timeout", subs_len);
++                return Ok(process_events(&ctx, Ok(events)));
++            }
++            DirectPoll::Errno(errno) => {
++                trace_poll_call(true, "errno", subs_len);
++                return Ok(errno);
++            }
++            DirectPoll::Fallthrough => trace_poll_call(false, "fallthrough", subs_len),
++        }
++    }
++    // Taken again: the branch above needs the context for as long as it
++    // waits, and the bindings made before the subscriptions were read
++    // borrow it.
++    let env = ctx.data();
++
+     let mut events_seen: u32 = 0;
+ 
+     let batch = {
+@@ -464,33 +967,6 @@ where
+     };
+ 
+     // Function to process a timeout
+-    let process_timeout = {
+-        let clock_subs = clock_subs.clone();
+-        |ctx: &FunctionEnvMut<'a, WasiEnv>| {
+-            // The timeout has triggered so lets add that event
+-            if clock_subs.is_empty() {
+-                tracing::warn!("triggered_timeout (without any clock subscriptions)");
+-            }
+-            let mut evts = Vec::new();
+-            for (clock_info, userdata) in clock_subs {
+-                let evt = Event {
+-                    userdata,
+-                    error: Errno::Success,
+-                    type_: Eventtype::Clock,
+-                    u: EventUnion { clock: 0 },
+-                };
+-                Span::current().record(
+-                    "seen",
+-                    format!(
+-                        "clock(id={},userdata={})",
+-                        clock_info.clock_id as u32, evt.userdata
+-                    ),
+-                );
+-                evts.push(evt);
+-            }
+-            evts
+-        }
+-    };
+ 
+     #[cfg(feature = "sys")]
+     if env.capabilities.threading.enable_blocking_sleep && subs_len == 1 {
+@@ -501,7 +977,7 @@ where
+         // real-time demands with greater precision.
+         if let Some(timeout) = timeout {
+             std::thread::sleep(timeout);
+-            process_events(&ctx, process_timeout(&ctx));
++            process_events(&ctx, Err(Errno::Timedout));
+             return Ok(Errno::Success);
+         }
+     }
+@@ -524,43 +1000,6 @@ where
+         }
+     };
+ 
+-    // We replace the process events callback with another callback
+-    // which will interpret the error codes
+-    let process_events = {
+-        let clock_subs = clock_subs.clone();
+-        |ctx: &FunctionEnvMut<'a, WasiEnv>, events: Result<Vec<Event>, Errno>| {
+-            // Process the result
+-            match events {
+-                Ok(evts) => {
+-                    // If its a timeout then return an event for it
+-                    if evts.len() == 1 {
+-                        Span::current().record("seen", format!("{:?}", evts.first().unwrap()));
+-                    } else {
+-                        Span::current().record("seen", format!("trigger_cnt=({})", evts.len()));
+-                    }
+-
+-                    // Process the events
+-                    process_events(ctx, evts)
+-                }
+-                Err(Errno::Timedout) => process_events(ctx, process_timeout(ctx)),
+-                // If nonblocking the Errno::Again needs to be turned into an empty list
+-                Err(Errno::Again) => process_events(ctx, Default::default()),
+-                // Otherwise process the error
+-                Err(err) => {
+-                    tracing::warn!("failed to poll during deep sleep - {}", err);
+-                    err
+-                }
+-            }
+-        }
+-    };
+-
+-    // If we are rewound then its time to process them
+-    if let Some(events) = unsafe { handle_rewind::<M, Result<Vec<EventResult>, Errno>>(&mut ctx) } {
+-        let events = events.map(|events| events.into_iter().map(EventResult::into_event).collect());
+-        process_events(&ctx, events);
+-        return Ok(Errno::Success);
+-    }
+-
+     // We use asyncify with a deep sleep to wait on new IO events
+     let res = __asyncify_with_deep_sleep::<M, Result<Vec<EventResult>, Errno>, _>(
+         ctx,
+@@ -572,3 +1011,245 @@ where
+     }
+     Ok(Errno::Success)
+ }
++
++#[cfg(all(test, unix, feature = "direct-waits"))]
++mod direct_tests {
++    use super::*;
++    use crate::net::socket::tests::{close_tracking_socket, watched_host_descriptor_socket};
++    use std::sync::atomic::AtomicUsize;
++    use wasmer_wasix_types::wasi::{SubscriptionFsReadwrite, SubscriptionUnion};
++
++    fn fd_sub(type_: Eventtype, fd: WasiFd, userdata: Userdata) -> Subscription {
++        Subscription {
++            userdata,
++            type_,
++            data: SubscriptionUnion {
++                fd_readwrite: SubscriptionFsReadwrite {
++                    file_descriptor: fd,
++                },
++            },
++        }
++    }
++
++    fn clock_sub() -> Subscription {
++        Subscription {
++            userdata: 7,
++            type_: Eventtype::Clock,
++            data: SubscriptionUnion {
++                clock: SubscriptionClock {
++                    clock_id: Clockid::Monotonic,
++                    timeout: 1,
++                    precision: 0,
++                    flags: Subclockflags::empty(),
++                },
++            },
++        }
++    }
++
++    fn readwrite(event: &Event) -> EventFdReadwrite {
++        unsafe { event.u.fd_readwrite }
++    }
++
++    /// Only a socket whose backend names a host descriptor is polled by the
++    /// waiting thread, and deciding that installs nothing on the socket and
++    /// reads nothing from it: the two things the guard path does, and the
++    /// two costs this path exists to remove.
++    #[test]
++    fn only_a_socket_with_a_host_descriptor_is_polled_by_the_thread() {
++        let (socket, handler, reads) = watched_host_descriptor_socket();
++        let read = direct_sub_for(&socket, &fd_sub(Eventtype::FdRead, 4, 11)).unwrap();
++        assert_eq!(
++            read.wanted,
++            wasmer_vm::HOST_POLL_READ | wasmer_vm::HOST_POLL_RDHUP
++        );
++        assert_eq!(read.userdata, 11);
++        let write = direct_sub_for(&socket, &fd_sub(Eventtype::FdWrite, 4, 12)).unwrap();
++        assert_eq!(write.wanted, wasmer_vm::HOST_POLL_WRITE);
++
++        assert!(handler.lock().unwrap().is_none());
++        assert_eq!(reads.load(Ordering::Relaxed), 0);
++
++        // A clock is the deadline, never a descriptor.
++        assert!(direct_sub_for(&socket, &clock_sub()).is_none());
++        assert!(direct_sub_kind(Eventtype::Clock).is_none());
++
++        // A socket the host cannot name, and so anything that is not a
++        // socket at all, keeps its guard and the selector registration that
++        // guard installs.
++        let opaque = close_tracking_socket(Arc::new(AtomicUsize::new(0)));
++        assert!(direct_sub_for(&opaque, &fd_sub(Eventtype::FdRead, 5, 13)).is_none());
++    }
++
++    /// What the kernel reported becomes the event the guard path would have
++    /// built for the same state: a readable descriptor with bytes, an ended
++    /// stream with the hangup flag and no bytes, and an error with a code
++    /// that `poll()` turns into `POLLERR`. A peer that shut its writing half
++    /// down is told apart from a peer that sent a last request and then shut
++    /// it down by the count the wait measured on that turn.
++    #[test]
++    fn readiness_becomes_the_event_the_guard_path_would_report() {
++        let (socket, _handler, _reads) = watched_host_descriptor_socket();
++        let read = direct_sub_for(&socket, &fd_sub(Eventtype::FdRead, 4, 11)).unwrap();
++        let write = direct_sub_for(&socket, &fd_sub(Eventtype::FdWrite, 4, 12)).unwrap();
++
++        let event = direct_sub_event(&read, wasmer_vm::HOST_POLL_READ, 0).unwrap();
++        assert_eq!(event.type_, Eventtype::FdRead);
++        assert_eq!(event.userdata, 11);
++        assert_eq!(event.error, Errno::Success);
++        assert_eq!(readwrite(&event).nbytes, 1);
++        assert_eq!(readwrite(&event).flags, Eventrwflags::empty());
++
++        // The peer shut its writing half down with nothing left unread, and
++        // a peer that has gone away: no bytes and a hangup, which is what an
++        // end-of-file read reports through a guard.
++        for bits in [
++            wasmer_vm::HOST_POLL_READ | wasmer_vm::HOST_POLL_RDHUP,
++            wasmer_vm::HOST_POLL_HUP,
++        ] {
++            let event = direct_sub_event(&read, bits, 0).unwrap();
++            assert_eq!(event.error, Errno::Success);
++            assert_eq!(readwrite(&event).nbytes, 0);
++            assert_eq!(readwrite(&event).flags, Eventrwflags::FD_READWRITE_HANGUP);
++        }
++
++        // The same shutdown with a request still in the socket is a
++        // readable descriptor: the wait says bytes are still unread, and
++        // one is the count every readable descriptor reports.
++        let event = direct_sub_event(
++            &read,
++            wasmer_vm::HOST_POLL_READ | wasmer_vm::HOST_POLL_RDHUP,
++            1,
++        )
++        .unwrap();
++        assert_eq!(event.error, Errno::Success);
++        assert_eq!(readwrite(&event).nbytes, 1);
++        assert_eq!(readwrite(&event).flags, Eventrwflags::empty());
++
++        // A peer that has gone away with a last request still unread is a
++        // readable descriptor until it is drained, as the guard path
++        // reported it; a write subscription is hung up either way.
++        let event = direct_sub_event(
++            &read,
++            wasmer_vm::HOST_POLL_READ | wasmer_vm::HOST_POLL_RDHUP | wasmer_vm::HOST_POLL_HUP,
++            1,
++        )
++        .unwrap();
++        assert_eq!(readwrite(&event).nbytes, 1);
++        assert_eq!(readwrite(&event).flags, Eventrwflags::empty());
++        let event = direct_sub_event(&write, wasmer_vm::HOST_POLL_HUP, 1).unwrap();
++        assert_eq!(readwrite(&event).nbytes, 0);
++        assert_eq!(readwrite(&event).flags, Eventrwflags::FD_READWRITE_HANGUP);
++
++        let event = direct_sub_event(&read, wasmer_vm::HOST_POLL_ERR, 0).unwrap();
++        assert_eq!(event.error, Errno::Io);
++        assert_eq!(readwrite(&event).nbytes, 0);
++        assert_eq!(readwrite(&event).flags, Eventrwflags::FD_READWRITE_HANGUP);
++
++        let event = direct_sub_event(&write, wasmer_vm::HOST_POLL_WRITE, 0).unwrap();
++        assert_eq!(event.type_, Eventtype::FdWrite);
++        assert_eq!(readwrite(&event).nbytes, 1);
++
++        // A level nobody subscribed to is not an event: producing one would
++        // answer a call with something the guest never asked about.
++        assert!(direct_sub_event(&read, wasmer_vm::HOST_POLL_WRITE, 0).is_none());
++        assert!(direct_sub_event(&write, wasmer_vm::HOST_POLL_READ, 0).is_none());
++        assert!(direct_sub_event(&read, 0, 0).is_none());
++    }
++
++    /// A call that has already collected events from its guards and then
++    /// finds a socket it can no longer name answers with what it has: a
++    /// subset is a legal answer, and discarding it would lose whatever the
++    /// guards reported, because a guard that consumed its readiness on the
++    /// poll would not report it again.
++    #[test]
++    fn events_already_collected_are_not_discarded_by_a_fallthrough() {
++        let (socket, _handler, _reads) = watched_host_descriptor_socket();
++        let read = direct_sub_for(&socket, &fd_sub(Eventtype::FdRead, 4, 11)).unwrap();
++        let collected = direct_sub_event(&read, wasmer_vm::HOST_POLL_READ, 0).unwrap();
++
++        assert!(matches!(
++            direct_poll_answer(Vec::new()),
++            DirectPoll::Fallthrough
++        ));
++        let DirectPoll::Events(events) = direct_poll_answer(vec![collected]) else {
++            panic!("the events the guards reported were discarded");
++        };
++        assert_eq!(events.len(), 1);
++        assert_eq!(events[0].userdata, 11);
++    }
++
++    /// A zero timeout is a probe and never a sleep; no clock is no deadline;
++    /// anything else is the deadline the guest asked for.
++    #[test]
++    fn a_zero_timeout_probes_and_an_absent_clock_never_ends() {
++        let before = Instant::now();
++        assert_eq!(direct_poll_deadline(Duration::MAX), Some(None));
++
++        let probe = direct_poll_deadline(Duration::ZERO).unwrap().unwrap();
++        assert!(probe <= Instant::now());
++
++        let deadline = direct_poll_deadline(Duration::from_millis(50))
++            .unwrap()
++            .unwrap();
++        assert!(deadline >= before + Duration::from_millis(50));
++    }
++
++    /// A deadline that passes answers every clock subscription of the call,
++    /// as the existing timeout path does, and none of the descriptors.
++    #[test]
++    fn a_timeout_answers_every_clock_subscription() {
++        let clock = unsafe { clock_sub().data.clock };
++        let events = direct_clock_events(&[(clock, 21), (clock, 22)]);
++        assert_eq!(events.len(), 2);
++        assert!(events.iter().all(|e| e.type_ == Eventtype::Clock));
++        assert!(events.iter().all(|e| e.error == Errno::Success));
++        assert_eq!(
++            events.iter().map(|e| e.userdata).collect::<Vec<_>>(),
++            vec![21, 22]
++        );
++        assert!(direct_clock_events(&[]).is_empty());
++    }
++
++    #[derive(Default)]
++    struct CountingWaker(AtomicUsize);
++
++    impl std::task::Wake for CountingWaker {
++        fn wake(self: Arc<Self>) {
++            self.0.fetch_add(1, Ordering::SeqCst);
++        }
++        fn wake_by_ref(self: &Arc<Self>) {
++            self.0.fetch_add(1, Ordering::SeqCst);
++        }
++    }
++
++    /// The other half of a mixed call: a pipe keeps its guard, and polling
++    /// that guard with the waiting thread's waker is what registers it, so
++    /// a write to the pipe wakes the thread out of its descriptor wait and
++    /// the next poll of the guard is what produces the event.
++    #[test]
++    fn a_pipe_in_a_mixed_call_wakes_the_thread_and_then_reports() {
++        let (mut tx, rx) = virtual_fs::Pipe::new().split();
++        let kind = Kind::PipeRx { rx };
++        let subscription = fd_sub(Eventtype::FdRead, 6, 31);
++        let guard =
++            InodeValFilePollGuard::new(6, PollEvent::PollIn as PollEventSet, subscription, &kind)
++                .unwrap();
++        let mut join = InodeValFilePollGuardJoin::new(guard);
++
++        let counter = Arc::new(CountingWaker::default());
++        let waker = std::task::Waker::from(counter.clone());
++        let mut cx = Context::from_waker(&waker);
++        assert!(Pin::new(&mut join).poll(&mut cx).is_pending());
++        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
++
++        std::io::Write::write_all(&mut tx, b"x").unwrap();
++        assert!(counter.0.load(Ordering::SeqCst) >= 1);
++
++        let Poll::Ready(events) = Pin::new(&mut join).poll(&mut cx) else {
++            panic!("the pipe's guard reported nothing after a write");
++        };
++        assert_eq!(events.len(), 1);
++        assert_eq!(events[0].0.type_, Eventtype::FdRead);
++        assert_eq!(events[0].0.userdata, 31);
++    }
++}
+diff --git a/lib/wasix/src/syscalls/wasix/epoll_wait.rs b/lib/wasix/src/syscalls/wasix/epoll_wait.rs
+index 75f6213..03ebc41 100644
+--- a/lib/wasix/src/syscalls/wasix/epoll_wait.rs
++++ b/lib/wasix/src/syscalls/wasix/epoll_wait.rs
+@@ -33,24 +33,26 @@ enum DirectEpoll {
+ /// rather than truncated: a truncated wait would sleep through the
+ /// descriptors it dropped.
+ #[cfg(all(unix, feature = "direct-waits"))]
+-const DIRECT_POLL_CAP: usize = wasmer_vm::HOST_POLL_FDS_MAX;
++pub(crate) const DIRECT_POLL_CAP: usize = wasmer_vm::HOST_POLL_FDS_MAX;
+ 
+ /// A `Waker` for a thread inside a direct descriptor wait.
+ ///
+-/// Everything in the set that is not direct-served -- a pipe, an event
+-/// notification, another set's edge dispatched through the registry --
+-/// reports readiness by queueing it and notifying the set, which is where
+-/// this waker is registered. Waking it ends the descriptor wait through the
+-/// thread's interrupt generation, and the waiting thread then looks at the
+-/// whole set again.
++/// Everything a thread waits on that is not a host descriptor -- a pipe, an
++/// event notification, another epoll set's edge dispatched through the
++/// registry -- reports readiness to a waker rather than to the kernel. This
++/// is that waker: waking it ends the descriptor wait through the thread's
++/// interrupt generation, and the thread then looks at everything again. An
++/// epoll set registers it on the set's notifier, which is where every such
++/// producer ends up; a `poll_oneoff` call registers it by polling each
++/// guard with it.
+ ///
+ /// It is safe to wake at any point, including before the thread reaches the
+ /// wait: the generation is captured before the waker is registered, so a
+ /// wake in between is one the wait itself sees and returns on.
+ #[cfg(all(unix, feature = "direct-waits"))]
+ #[derive(Debug)]
+-struct DirectPollWaker {
+-    thread: crate::WasiThread,
++pub(crate) struct DirectPollWaker {
++    pub(crate) thread: crate::WasiThread,
+ }
+ 
+ #[cfg(all(unix, feature = "direct-waits"))]

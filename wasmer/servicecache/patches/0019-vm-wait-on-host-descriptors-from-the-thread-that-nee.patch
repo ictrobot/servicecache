@@ -19,8 +19,8 @@ into a freeze runs no destructor, so its eventfd is closed for it.
 
 The caller reads the result out of the array it handed over: every
 `HostPollFd` carries the events seen, and one that reported a peer's
-half-close also says whether bytes are still unread, which is what tells
-a last request from an end of stream. One wait names at most
+half-close or hangup also says whether bytes are still unread, which is
+what tells a last request from an end of stream. One wait names at most
 `HOST_POLL_FDS_MAX` (64) descriptors and refuses a larger set rather
 than truncating it. A wait suspended across a fork is refused too:
 `POLLFD_EPOCH` moves when the coroutines are resurrected in a child
@@ -172,10 +172,10 @@ index a0d4454..2d4ef8b 100644
  #[cfg(feature = "baremetal")]
 diff --git a/lib/vm/src/trap/pollfd.rs b/lib/vm/src/trap/pollfd.rs
 new file mode 100644
-index 0000000..eef66b9
+index 0000000..98a1155
 --- /dev/null
 +++ b/lib/vm/src/trap/pollfd.rs
-@@ -0,0 +1,1083 @@
+@@ -0,0 +1,1118 @@
 +// SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
 +// Copyright (c) 2026 Ethan Jones
 +
@@ -613,7 +613,7 @@ index 0000000..eef66b9
 +                // and asks no descriptor again.
 +                for (slot, out) in poll_fds[1..].iter().zip(fds.iter_mut()) {
 +                    out.revents = host_revents(slot.revents);
-+                    out.nbytes = if out.revents & HOST_POLL_RDHUP != 0 {
++                    out.nbytes = if out.revents & (HOST_POLL_RDHUP | HOST_POLL_HUP) != 0 {
 +                        still_readable(slot.fd)
 +                    } else {
 +                        0
@@ -630,11 +630,11 @@ index 0000000..eef66b9
 +    }
 +
 +    /// One when the descriptor still holds bytes and zero when it does not,
-+    /// for the one answer that needs to know: a peer that has shut its
-+    /// writing half down reports the same readiness whether or not it sent
-+    /// a last request first. One byte peeked tells the two apart and takes
-+    /// nothing out of the kernel; a descriptor that cannot answer reads as
-+    /// the end of the stream.
++    /// for the answers that need to know: a peer that has shut its writing
++    /// half down, or gone away altogether, reports the same readiness
++    /// whether or not what it sent last is still unread. One byte peeked
++    /// tells the two apart and takes nothing out of the kernel; a
++    /// descriptor that cannot answer reads as the end of the stream.
 +    fn still_readable(fd: RawFd) -> u32 {
 +        let mut probe = 0u8;
 +        // SAFETY: `MSG_PEEK` copies at most one byte into `probe` and
@@ -1081,6 +1081,41 @@ index 0000000..eef66b9
 +            drop(d);
 +        }
 +
++        /// A peer that has gone away is a hangup, and the same question is
++        /// asked on that turn: a last request may still be unread behind
++        /// it, and only once it is drained is the hangup the whole answer.
++        #[test]
++        fn a_hangup_says_whether_bytes_are_still_unread() {
++            enable();
++            let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let words = Words::new();
++            b.write_all(b"hello").unwrap();
++            b.shutdown(std::net::Shutdown::Write).unwrap();
++            a.shutdown(std::net::Shutdown::Write).unwrap();
++
++            let mut fds = [read_fd(a.as_raw_fd())];
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents & HOST_POLL_HUP, HOST_POLL_HUP);
++            assert_eq!(fds[0].nbytes, 1);
++
++            let mut buffer = [0u8; 5];
++            std::io::Read::read_exact(&mut &a, &mut buffer).unwrap();
++            let mut fds = [read_fd(a.as_raw_fd())];
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents & HOST_POLL_HUP, HOST_POLL_HUP);
++            assert_eq!(fds[0].nbytes, 0);
++        }
++
 +        /// A thread that retires into a freeze leaves through the raw exit
 +        /// syscall and runs no destructor, so the descriptor it made is
 +        /// closed for it. Leaving it open costs one descriptor per waiting
@@ -1260,7 +1295,7 @@ index 0000000..eef66b9
 +
 +pub(crate) use linux::{supported, thread_retiring, wait, wake};
 diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
-index c3dcab5..27ae096 100644
+index c3dcab5..82aee4b 100644
 --- a/lib/vm/src/trap/suspend.rs
 +++ b/lib/vm/src/trap/suspend.rs
 @@ -59,6 +59,9 @@ pub enum WasmYield {
@@ -1273,7 +1308,7 @@ index c3dcab5..27ae096 100644
  }
  
  /// The result of a host futex wait.
-@@ -101,6 +104,111 @@ pub(crate) struct HostFutexWait {
+@@ -101,6 +104,112 @@ pub(crate) struct HostFutexWait {
      /// The guest futex word and its expected value, when the wait has one;
      /// a wait without one ends only by interrupt or deadline.
      pub futex: Option<(*const u32, u32)>,
@@ -1308,10 +1343,11 @@ index c3dcab5..27ae096 100644
 +    /// The events the host saw, as `HOST_POLL_*` bits. Written by the wait.
 +    pub revents: u16,
 +    /// One when the descriptor still holds bytes, written by the wait
-+    /// alongside a `revents` carrying [`HOST_POLL_RDHUP`] and zero on every
-+    /// other descriptor. A peer that has shut its writing half down reports
-+    /// the same readiness whether or not it sent a last request first, and
-+    /// a byte peeked on that turn tells the two apart.
++    /// alongside a `revents` carrying [`HOST_POLL_RDHUP`] or [`HOST_POLL_HUP`]
++    /// and zero on every other descriptor. A peer that has shut its writing
++    /// half down or gone away reports the same readiness whether or not what
++    /// it sent last is still unread, and a byte peeked on that turn tells
++    /// the two apart.
 +    pub nbytes: u32,
 +}
 +
@@ -1385,7 +1421,7 @@ index c3dcab5..27ae096 100644
      /// Per-guest-thread interrupt generation.
      pub interrupt: *const u32,
      /// Expected interrupt generation.
-@@ -113,6 +221,23 @@ pub(crate) struct HostFutexWait {
+@@ -113,6 +222,23 @@ pub(crate) struct HostFutexWait {
      pub deadline: Option<Instant>,
  }
  
@@ -1409,7 +1445,7 @@ index c3dcab5..27ae096 100644
  /// A direct futex wait retained while its coroutine is suspended.
  #[derive(Clone, Copy, Debug)]
  pub struct SuspendedFutex {
-@@ -160,6 +285,15 @@ pub type SleepHook = fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send + Sy
+@@ -160,6 +286,15 @@ pub type SleepHook = fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send + Sy
  static ENABLED: AtomicBool = AtomicBool::new(false);
  static SLEEP_HOOK: OnceLock<SleepHook> = OnceLock::new();
  
@@ -1425,7 +1461,7 @@ index c3dcab5..27ae096 100644
  /// Enables suspension process-wide: host imports run on the coroutine stack
  /// and blocking waits suspend the coroutine. `sleep` supplies timers for the
  /// waits wasmer-vm implements itself. Irreversible.
-@@ -173,6 +307,116 @@ pub fn enabled() -> bool {
+@@ -173,6 +308,116 @@ pub fn enabled() -> bool {
      ENABLED.load(Ordering::Relaxed)
  }
  
@@ -1542,7 +1578,7 @@ index c3dcab5..27ae096 100644
  /// Wakes at most `count` direct futex waiters on `address`, returning how
  /// many woke.
  ///
-@@ -386,6 +630,68 @@ fn wait_futex(wait: SuspendedFutex, gate: Option<&mut dyn TopLevelCoro>) {
+@@ -386,6 +631,68 @@ fn wait_futex(wait: SuspendedFutex, gate: Option<&mut dyn TopLevelCoro>) {
      }
  }
  
@@ -1611,7 +1647,7 @@ index c3dcab5..27ae096 100644
  impl SuspendedFutex {
      fn result(self) -> Option<HostFutexResult> {
          match unsafe { self.result.as_ref() }.load(Ordering::Acquire) {
-@@ -464,6 +770,7 @@ struct Fused<'a, F: Future> {
+@@ -464,6 +771,7 @@ struct Fused<'a, F: Future> {
  enum PendingWait {
      Future(BlockedFuture),
      Futex(SuspendedFutex),
@@ -1619,7 +1655,7 @@ index c3dcab5..27ae096 100644
  }
  
  impl<F: Future> Future for Fused<'_, F> {
-@@ -558,6 +865,9 @@ impl<T: 'static> GuestCoro<T> {
+@@ -558,6 +866,9 @@ impl<T: 'static> GuestCoro<T> {
              CoroutineResult::Yield(WasmYield::Futex(wait)) => {
                  self.pending = Some(PendingWait::Futex(*wait));
              }
@@ -1629,7 +1665,7 @@ index c3dcab5..27ae096 100644
              _ => {}
          }
          result
-@@ -628,6 +938,15 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+@@ -628,6 +939,15 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
                  }
                  None => wait_futex(wait, None),
              },
@@ -1645,7 +1681,7 @@ index c3dcab5..27ae096 100644
              CoroutineResult::Return(result) => break result,
          }
      };
-@@ -705,6 +1024,9 @@ impl<T: 'static> TopLevelCoro for GuestCoro<T> {
+@@ -705,6 +1025,9 @@ impl<T: 'static> TopLevelCoro for GuestCoro<T> {
              CoroutineResult::Yield(WasmYield::Futex(wait)) => {
                  Step::Blocked(PendingWait::Futex(wait))
              }
@@ -1655,7 +1691,7 @@ index c3dcab5..27ae096 100644
              CoroutineResult::Yield(WasmYield::Unwind(_)) => {
                  // SAFETY: as in `run_wasm_call`: `unwind_with` guarantees only
                  // Wasm frames on the stack.
-@@ -817,6 +1139,7 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<PendingWait>) {
+@@ -817,6 +1140,7 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<PendingWait>) {
              match wait {
                  PendingWait::Future(fut) => wait_ready(fut, Some(coro)),
                  PendingWait::Futex(wait) => wait_futex(wait, Some(coro)),
@@ -1663,7 +1699,7 @@ index c3dcab5..27ae096 100644
              }
          }
          if !try_enter(coro.started()) {
-@@ -846,6 +1169,11 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<PendingWait>) {
+@@ -846,6 +1170,11 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<PendingWait>) {
  fn retire(coro: &mut dyn TopLevelCoro) -> ! {
      log!(trace, id = coro.id(), "retiring: the gate is closed");
      coro.capture_thread_state();
@@ -1675,7 +1711,7 @@ index c3dcab5..27ae096 100644
      HOST_LOOPS.fetch_sub(1, Ordering::SeqCst);
      exit_current_thread()
  }
-@@ -873,6 +1201,12 @@ pub fn close_gate() {
+@@ -873,6 +1202,12 @@ pub fn close_gate() {
      GATE_CLOSED.store(true, Ordering::SeqCst);
      GATE_EPOCH.fetch_add(1, Ordering::SeqCst);
      let _ = wake_host_futex((&GATE_EPOCH as *const AtomicU32).cast(), u32::MAX);
@@ -1688,7 +1724,7 @@ index c3dcab5..27ae096 100644
      log!(debug, "gate closed");
  }
  
-@@ -1032,6 +1366,9 @@ pub fn resurrect_all(
+@@ -1032,6 +1367,9 @@ pub fn resurrect_all(
          }
      }
      log!(debug, coroutines = entries.len(), "resurrecting");

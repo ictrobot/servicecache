@@ -68,10 +68,10 @@ index 2d4ef8b..15f3cfe 100644
  };
  pub use trap::{Trap, UnwindReason};
 diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
-index 27ae096..891272b 100644
+index 82aee4b..7562ba1 100644
 --- a/lib/vm/src/trap/suspend.rs
 +++ b/lib/vm/src/trap/suspend.rs
-@@ -317,6 +317,18 @@ pub fn wake_host_pollfd(address: *const u32) {
+@@ -318,6 +318,18 @@ pub fn wake_host_pollfd(address: *const u32) {
      super::pollfd::wake(address);
  }
  
