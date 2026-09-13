@@ -1,31 +1,36 @@
-Subject: wasix: suspend on interruptible host futexes
+Subject: wasix: wait on an interruptible host futex
 
-A guest futex wait went through the async path: a logical waiter in
-the futex table, a Tokio timer for the timeout, and the coroutine
-suspended on a future for the host loop to poll. For a guest whose
-idle threads wait on futexes with short timeouts, that machinery was
-most of the host's remaining CPU.
+A guest futex wait went through the async path: a logical waiter in the
+futex table, a Tokio timer for the timeout, and the coroutine suspended
+on a future for the host loop to poll. For a guest whose idle threads
+wait on futexes with short timeouts, that machinery was most of the
+host's remaining CPU.
 
-Let an embedder do the wait in the kernel instead. Its hooks take a
-wait on the WASI thread's interrupt generation and the freeze-gate
-generation until an absolute deadline, and on a guest futex word with
-its expected value when the caller has one. A process-local futex in a
-linear memory whose base cannot move is handed over that way. The
-kernel checks the values and enqueues the waiter atomically, so no
-logical waiter is registered. A signal or a termination bumps and
-wakes the thread's generation, and closing the freeze gate bumps and
-wakes the gate's; either returns the wait as interrupted, and the
-syscall falls through to the existing path for the full signal and
-termination processing. A wake goes to direct waiters first and to a
-logical waiter only when none woke.
+Do the wait in the kernel instead. The runtime waits atomically on the
+WASI thread's interrupt generation and the freeze-gate generation until
+an absolute deadline, and on a guest futex word with its expected value
+when the caller has one. A process-local futex in a linear memory whose
+base cannot move is handed over that way. The kernel checks the values
+and enqueues the waiter atomically, so no logical waiter is registered.
+A signal or a termination bumps and wakes the thread's generation, and
+closing the freeze gate bumps and wakes the gate's; either returns the
+wait as interrupted, and the syscall falls through to the existing path
+for the full signal and termination processing. A wake goes to direct
+waiters first and to a logical waiter only when none woke.
+
+futex_waitv arrived in Linux 5.16, so it is called through `syscall`
+and probed once, on the first wait that asks for it; elsewhere, and on
+a kernel that does not have it, every wait stays on the async path. So
+does every wait in a process started with DISABLE_FUTEX_WAITV set,
+which is logged at warning level, and every wait after one that could
+not interpret its own result.
 
 Shared-file futexes and dynamic memories keep the async path, since a
-direct wait needs a word whose address cannot change. A coroutine
-frozen in a direct wait retains it, so a resurrected child resumes the
-same wait against its own gate generation. The hooks live behind
-wasix's host-futex feature, which every native configuration enables,
-and nothing changes until an embedder installs them and enables
-suspension.
+direct wait needs a word whose address cannot change. A coroutine frozen
+in a direct wait retains it, so a resurrected child resumes the same
+wait against its own gate generation. The wait lives behind wasix's
+host-futex feature, which every native configuration enables, and
+nothing changes until suspension is enabled.
 
 diff --git a/Cargo.lock b/Cargo.lock
 index 7a39208..ce1d729 100644
@@ -148,26 +153,433 @@ index 6dc2c61..5fa8a97 100644
  
              Ok(Self {
                  mmap,
+diff --git a/lib/vm/src/trap/futex.rs b/lib/vm/src/trap/futex.rs
+new file mode 100644
+index 0000000..a8c49f5
+--- /dev/null
++++ b/lib/vm/src/trap/futex.rs
+@@ -0,0 +1,392 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
++// Copyright (c) 2026 Ethan Jones
++
++//! The kernel wait behind a direct guest futex wait, on Linux.
++//!
++//! `futex_waitv` arrived in Linux 5.16, so it is invoked through `syscall`
++//! and probed at runtime. This keeps the executable's libc requirements
++//! unchanged and lets older kernels retain the async wait path.
++//!
++//! Nothing here is reached until a guest futex wait asks for it: the probe
++//! runs on the first question and its answer decides every later one.
++
++use super::suspend::{HostFutexResult, HostFutexWait};
++
++#[cfg(target_os = "linux")]
++mod linux {
++    use std::io;
++    use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
++    use std::time::Instant;
++
++    use super::{HostFutexResult, HostFutexWait};
++
++    /// The backend's state: not yet probed, in use, never available on this
++    /// host (the probe failed or `DISABLE_FUTEX_WAITV` is set), or turned
++    /// off after a wait this code could not interpret. The last two differ
++    /// only in that a waiter may still be parked in the kernel after DISABLED.
++    const UNKNOWN: u8 = 0;
++    const SUPPORTED: u8 = 1;
++    const UNAVAILABLE: u8 = 2;
++    const DISABLED: u8 = 3;
++    const FUTEX_32: u32 = 2;
++    /// `futex_waitv` takes no flags of its own.
++    const NO_FLAGS: libc::c_uint = 0;
++    const FUTEX_WAITV_PRIVATE: u32 = FUTEX_32 | libc::FUTEX_PRIVATE_FLAG as u32;
++
++    static SUPPORT: AtomicU8 = AtomicU8::new(UNKNOWN);
++
++    #[repr(C)]
++    struct Waiter {
++        value: u64,
++        address: u64,
++        flags: u32,
++        reserved: u32,
++    }
++
++    impl Waiter {
++        fn new(address: *const u32, value: u32) -> Self {
++            Self {
++                value: u64::from(value),
++                address: address as usize as u64,
++                flags: FUTEX_WAITV_PRIVATE,
++                reserved: 0,
++            }
++        }
++    }
++
++    /// Whether a direct wait can be attempted, probing the kernel once.
++    pub(crate) fn supported() -> bool {
++        match SUPPORT.load(Ordering::Acquire) {
++            UNKNOWN => probe(),
++            state => state == SUPPORTED,
++        }
++    }
++
++    #[cold]
++    fn probe() -> bool {
++        let supported = if std::env::var_os("DISABLE_FUTEX_WAITV").is_some() {
++            #[cfg(feature = "tracing")]
++            tracing::warn!("DISABLE_FUTEX_WAITV is set; disabling the direct futex wait");
++            false
++        } else {
++            probe_futex_waitv()
++        };
++        let state = if supported { SUPPORTED } else { UNAVAILABLE };
++        // Only a state still unknown is decided here: a wait that gave up on
++        // the backend has already answered and its answer stands.
++        let _ = SUPPORT.compare_exchange(UNKNOWN, state, Ordering::AcqRel, Ordering::Acquire);
++        let decided = SUPPORT.load(Ordering::Acquire) == SUPPORTED;
++        #[cfg(feature = "tracing")]
++        tracing::debug!(supported, decided, "futex_waitv probed");
++        decided
++    }
++
++    fn probe_futex_waitv() -> bool {
++        let word = AtomicU32::new(0);
++        let waiter = [Waiter::new((&raw const word).cast(), 1)];
++        matches!(call_waitv(&waiter, None), Err(libc::EAGAIN))
++    }
++
++    pub(crate) fn wait(request: HostFutexWait) -> HostFutexResult {
++        // The generations first, so a wake index below `futex` is an
++        // interrupt whether or not the wait has a guest word. The third slot
++        // is passed to the kernel only when there is a word for it.
++        let (futex_address, futex_expected) = request.futex.unwrap_or((std::ptr::null(), 0));
++        let waiters = [
++            Waiter::new(request.interrupt, request.interrupt_expected),
++            Waiter::new(request.gate, request.gate_expected),
++            Waiter::new(futex_address, futex_expected),
++        ];
++        let waiters = &waiters[..if request.futex.is_some() { 3 } else { 2 }];
++        let futex = request.futex.map(|_| 2);
++        loop {
++            match call_waitv(waiters, request.deadline) {
++                Ok(index) if Some(index) == futex => return HostFutexResult::Woken,
++                Ok(0 | 1) => return HostFutexResult::Interrupted,
++                Err(libc::ETIMEDOUT) => return HostFutexResult::TimedOut,
++                Err(libc::EAGAIN) => {
++                    if load(request.gate) != request.gate_expected
++                        || load(request.interrupt) != request.interrupt_expected
++                    {
++                        return HostFutexResult::Interrupted;
++                    }
++                    if let Some((address, expected)) = request.futex
++                        && load(address) != expected
++                    {
++                        return HostFutexResult::Woken;
++                    }
++                    if request
++                        .deadline
++                        .is_some_and(|deadline| Instant::now() >= deadline)
++                    {
++                        return HostFutexResult::TimedOut;
++                    }
++                }
++                // A Unix signal can interrupt the host syscall independently
++                // of a WASIX signal. Retry after rechecking the generations.
++                Err(libc::EINTR) => {
++                    if load(request.gate) != request.gate_expected
++                        || load(request.interrupt) != request.interrupt_expected
++                    {
++                        return HostFutexResult::Interrupted;
++                    }
++                }
++                other => return disable_after_error(other),
++            }
++        }
++    }
++
++    /// Gives up on the backend for the rest of the process after a result
++    /// the wait cannot interpret: an errno it does not handle, or a woken
++    /// index beyond the words it passed. The guest falls back to the async
++    /// wait, and every later wait does the same without asking. Only the
++    /// wait that turns the backend off says so.
++    fn disable_after_error(result: Result<usize, i32>) -> HostFutexResult {
++        if SUPPORT.swap(DISABLED, Ordering::AcqRel) == SUPPORTED {
++            report_giving_up(result);
++        }
++        HostFutexResult::Unavailable
++    }
++
++    #[cfg(feature = "tracing")]
++    fn report_giving_up(result: Result<usize, i32>) {
++        match result {
++            Ok(index) => tracing::warn!(
++                index,
++                "futex_waitv woke an unknown word; disabling the direct futex wait"
++            ),
++            Err(errno) => tracing::warn!(
++                errno,
++                error = %io::Error::from_raw_os_error(errno),
++                "futex_waitv failed; disabling the direct futex wait"
++            ),
++        }
++    }
++
++    #[cfg(not(feature = "tracing"))]
++    fn report_giving_up(_result: Result<usize, i32>) {}
++
++    fn load(address: *const u32) -> u32 {
++        // SAFETY: the caller supplies a live and aligned 32-bit word.
++        unsafe { AtomicU32::from_ptr(address.cast_mut()) }.load(Ordering::Acquire)
++    }
++
++    fn call_waitv(waiters: &[Waiter], deadline: Option<Instant>) -> Result<usize, i32> {
++        let timeout = deadline.map(absolute_timeout).transpose()?;
++        let timeout = timeout
++            .as_ref()
++            .map_or(std::ptr::null(), std::ptr::from_ref);
++        let waiter_count = libc::c_uint::try_from(waiters.len()).map_err(|_| libc::EOVERFLOW)?;
++        // SAFETY: every pointer is live for this call, the array has the
++        // kernel ABI layout above, and the timeout uses CLOCK_MONOTONIC.
++        let result = unsafe {
++            libc::syscall(
++                libc::SYS_futex_waitv,
++                waiters.as_ptr(),
++                waiter_count,
++                NO_FLAGS,
++                timeout,
++                libc::CLOCK_MONOTONIC,
++            )
++        };
++        if result >= 0 {
++            usize::try_from(result).map_err(|_| libc::EOVERFLOW)
++        } else {
++            Err(io::Error::last_os_error()
++                .raw_os_error()
++                .unwrap_or(libc::EIO))
++        }
++    }
++
++    fn absolute_timeout(deadline: Instant) -> Result<libc::timespec, i32> {
++        let remaining = deadline.saturating_duration_since(Instant::now());
++        let mut now = libc::timespec {
++            tv_sec: 0,
++            tv_nsec: 0,
++        };
++        // SAFETY: `now` is a valid output pointer.
++        let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
++        if result != 0 {
++            return Err(io::Error::last_os_error()
++                .raw_os_error()
++                .unwrap_or(libc::EIO));
++        }
++        let seconds = libc::time_t::try_from(remaining.as_secs()).unwrap_or(libc::time_t::MAX);
++        let nanos = libc::c_long::from(remaining.subsec_nanos());
++        now.tv_sec = now.tv_sec.saturating_add(seconds);
++        now.tv_nsec += nanos;
++        if now.tv_nsec >= 1_000_000_000 {
++            now.tv_sec = now.tv_sec.saturating_add(1);
++            now.tv_nsec -= 1_000_000_000;
++        }
++        Ok(now)
++    }
++
++    /// Wakes at most `count` waiters on one word, returning how many woke.
++    pub(crate) fn wake(address: *const u32, count: u32) -> u32 {
++        // Without futex_waitv no direct waiter was ever parked, so there is
++        // nothing to wake and no syscall to spend on it. A backend nobody
++        // has asked about yet has parked nobody either.
++        let state = SUPPORT.load(Ordering::Acquire);
++        if count == 0 || state == UNAVAILABLE || state == UNKNOWN {
++            return 0;
++        }
++        let count = libc::c_int::try_from(count).unwrap_or(libc::c_int::MAX);
++        // SAFETY: the caller supplies a live and aligned word.
++        //
++        // FUTEX_WAKE predates futex_waitv by many years, so this still works
++        // once the backend is disabled, when a waiter parked before that may
++        // need it.
++        let result = unsafe {
++            libc::syscall(
++                libc::SYS_futex,
++                address,
++                libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
++                count,
++            )
++        };
++        u32::try_from(result).unwrap_or(0)
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use super::*;
++        use std::sync::Arc;
++        use std::thread;
++        use std::time::Duration;
++
++        #[repr(C)]
++        struct Words {
++            guest: AtomicU32,
++            interrupt: AtomicU32,
++            gate: AtomicU32,
++        }
++
++        fn request(words: &Words, futex: bool, deadline: Option<Instant>) -> HostFutexWait {
++            HostFutexWait {
++                futex: futex.then(|| ((&raw const words.guest).cast(), 0)),
++                interrupt: (&raw const words.interrupt).cast(),
++                interrupt_expected: 0,
++                gate: (&raw const words.gate).cast(),
++                gate_expected: 0,
++                deadline,
++            }
++        }
++
++        /// The wake below is what a parked waiter needs, and it answers
++        /// nothing at all while the backend has never been asked about.
++        fn woken_by(word: &AtomicU32) {
++            word.fetch_add(1, Ordering::Release);
++            if SUPPORT.load(Ordering::Acquire) == UNKNOWN {
++                SUPPORT.store(SUPPORTED, Ordering::Release);
++            }
++            wake(std::ptr::from_ref(word).cast(), 1);
++        }
++
++        #[test]
++        fn probe_is_repeatable() {
++            assert_eq!(probe_futex_waitv(), probe_futex_waitv());
++        }
++
++        #[test]
++        fn vector_wait_observes_each_word_and_timeout() {
++            if !probe_futex_waitv() {
++                return;
++            }
++            for (index, expected) in [
++                (0, HostFutexResult::Woken),
++                (1, HostFutexResult::Interrupted),
++                (2, HostFutexResult::Interrupted),
++            ] {
++                let words = Arc::new(Words {
++                    guest: AtomicU32::new(0),
++                    interrupt: AtomicU32::new(0),
++                    gate: AtomicU32::new(0),
++                });
++                let waiter_words = words.clone();
++                let waiter = thread::spawn(move || {
++                    wait(request(
++                        &waiter_words,
++                        true,
++                        Some(Instant::now() + Duration::from_secs(2)),
++                    ))
++                });
++                thread::sleep(Duration::from_millis(10));
++                woken_by([&words.guest, &words.interrupt, &words.gate][index]);
++                assert_eq!(waiter.join().unwrap(), expected);
++            }
++
++            let words = Words {
++                guest: AtomicU32::new(0),
++                interrupt: AtomicU32::new(0),
++                gate: AtomicU32::new(0),
++            };
++            assert_eq!(
++                wait(request(
++                    &words,
++                    true,
++                    Some(Instant::now() + Duration::from_millis(10)),
++                )),
++                HostFutexResult::TimedOut
++            );
++        }
++
++        #[test]
++        fn wait_without_a_guest_word_observes_each_generation_and_timeout() {
++            if !probe_futex_waitv() {
++                return;
++            }
++            for index in 0..2 {
++                let words = Arc::new(Words {
++                    guest: AtomicU32::new(0),
++                    interrupt: AtomicU32::new(0),
++                    gate: AtomicU32::new(0),
++                });
++                let waiter_words = words.clone();
++                let waiter = thread::spawn(move || {
++                    wait(request(
++                        &waiter_words,
++                        false,
++                        Some(Instant::now() + Duration::from_secs(2)),
++                    ))
++                });
++                thread::sleep(Duration::from_millis(10));
++                woken_by([&words.interrupt, &words.gate][index]);
++                assert_eq!(waiter.join().unwrap(), HostFutexResult::Interrupted);
++            }
++
++            let words = Words {
++                guest: AtomicU32::new(0),
++                interrupt: AtomicU32::new(0),
++                gate: AtomicU32::new(0),
++            };
++            assert_eq!(
++                wait(request(
++                    &words,
++                    false,
++                    Some(Instant::now() + Duration::from_millis(10)),
++                )),
++                HostFutexResult::TimedOut
++            );
++        }
++    }
++}
++
++#[cfg(not(target_os = "linux"))]
++mod linux {
++    use super::{HostFutexResult, HostFutexWait};
++
++    pub(crate) fn supported() -> bool {
++        false
++    }
++
++    pub(crate) fn wait(_request: HostFutexWait) -> HostFutexResult {
++        HostFutexResult::Unavailable
++    }
++
++    pub(crate) fn wake(_address: *const u32, _count: u32) -> u32 {
++        0
++    }
++}
++
++pub(crate) use linux::{supported, wait, wake};
 diff --git a/lib/vm/src/trap/mod.rs b/lib/vm/src/trap/mod.rs
-index 83cd32f..a220418 100644
+index 83cd32f..a0d4454 100644
 --- a/lib/vm/src/trap/mod.rs
 +++ b/lib/vm/src/trap/mod.rs
-@@ -22,9 +22,11 @@ mod traphandlers;
+@@ -10,6 +10,8 @@
+ use crate::vmcontext::{VMFunctionContext, VMTrampoline};
+ use crate::{VMContext, VMFunctionBody};
+ 
++#[cfg(not(feature = "baremetal"))]
++mod futex;
+ #[cfg(not(feature = "baremetal"))]
+ pub mod suspend;
+ #[allow(clippy::module_inception)]
+@@ -22,9 +24,10 @@ mod traphandlers;
  
  #[cfg(not(feature = "baremetal"))]
  pub use suspend::{
 -    BlockedFuture, FreezeError, Quiescence, Resurrected, SleepHook, ThreadStateHooks, WasmYield,
-+    BlockedFuture, FreezeError, HostFutexHooks, HostFutexResult, HostFutexWait, Quiescence,
-+    Resurrected, SleepHook, SuspendedFutex, ThreadStateHooks, WasmYield, can_suspend_on_futex,
-     exit_current_thread, on_host_stack_for_import, resurrect_all, run_guest_thread,
+-    exit_current_thread, on_host_stack_for_import, resurrect_all, run_guest_thread,
 -    set_thread_state_hooks, try_suspend_on_block,
-+    set_host_futex_hooks, set_thread_state_hooks, try_suspend_on_block, try_suspend_on_futex,
-+    wake_host_futex,
++    BlockedFuture, FreezeError, HostFutexResult, Quiescence, Resurrected, SleepHook,
++    SuspendedFutex, ThreadStateHooks, WasmYield, can_suspend_on_futex, exit_current_thread,
++    on_host_stack_for_import, resurrect_all, run_guest_thread, set_thread_state_hooks,
++    try_suspend_on_block, try_suspend_on_futex, wake_host_futex,
  };
  pub use trap::{Trap, UnwindReason};
  #[cfg(feature = "baremetal")]
 diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
-index 8e2355f..38ffa51 100644
+index 8e2355f..c3dcab5 100644
 --- a/lib/vm/src/trap/suspend.rs
 +++ b/lib/vm/src/trap/suspend.rs
 @@ -34,7 +34,7 @@ use std::future::Future;
@@ -179,7 +591,7 @@ index 8e2355f..38ffa51 100644
  use std::sync::{Arc, Mutex, OnceLock};
  use std::task::{Context, Poll, Wake, Waker};
  use std::thread::Thread;
-@@ -56,8 +56,88 @@ pub enum WasmYield {
+@@ -56,8 +56,77 @@ pub enum WasmYield {
      /// The guest is blocked in a host wait. The loop polls the future to
      /// completion, parking between polls, and then resumes the coroutine.
      Blocked(BlockedFuture),
@@ -218,13 +630,13 @@ index 8e2355f..38ffa51 100644
 +
 +const FUTEX_PENDING: u8 = 0;
 +
-+/// One direct wait as presented to an embedder.
++/// One direct futex wait, as handed to the kernel backend.
 +///
 +/// Every address points to an aligned, live 32-bit word for the duration of
-+/// `HostFutexHooks::wait`. The wait must atomically wait for all of them to
-+/// retain their expected values, or return `Unavailable` without blocking.
++/// the wait, which waits atomically for all of them to retain their
++/// expected values or answers `Unavailable` without blocking.
 +#[derive(Clone, Copy, Debug)]
-+pub struct HostFutexWait {
++pub(crate) struct HostFutexWait {
 +    /// The guest futex word and its expected value, when the wait has one;
 +    /// a wait without one ends only by interrupt or deadline.
 +    pub futex: Option<(*const u32, u32)>,
@@ -238,17 +650,6 @@ index 8e2355f..38ffa51 100644
 +    pub gate_expected: u32,
 +    /// Absolute monotonic deadline, if any.
 +    pub deadline: Option<Instant>,
-+}
-+
-+/// Host operations for direct, interruptible futex waits.
-+#[derive(Clone, Copy)]
-+pub struct HostFutexHooks {
-+    /// Whether a direct wait can currently be attempted.
-+    pub supported: fn() -> bool,
-+    /// Waits atomically on the guest, thread-interrupt and freeze-gate words.
-+    pub wait: fn(HostFutexWait) -> HostFutexResult,
-+    /// Wakes at most `count` waiters on one word, returning how many woke.
-+    pub wake: fn(*const u32, u32) -> u32,
 +}
 +
 +/// A direct futex wait retained while its coroutine is suspended.
@@ -268,30 +669,18 @@ index 8e2355f..38ffa51 100644
  /// A fused, `()`-returning future pinned on a suspended coroutine's stack.
  ///
  /// The pointer stays valid until the coroutine is resumed: the frame holding
-@@ -90,6 +170,7 @@ pub type SleepHook = fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send + Sy
- 
- static ENABLED: AtomicBool = AtomicBool::new(false);
- static SLEEP_HOOK: OnceLock<SleepHook> = OnceLock::new();
-+static FUTEX_HOOKS: OnceLock<HostFutexHooks> = OnceLock::new();
- 
- /// Enables suspension process-wide: host imports run on the coroutine stack
- /// and blocking waits suspend the coroutine. `sleep` supplies timers for the
-@@ -104,6 +185,80 @@ pub fn enabled() -> bool {
+@@ -104,6 +173,75 @@ pub fn enabled() -> bool {
      ENABLED.load(Ordering::Relaxed)
  }
  
-+/// Installs direct host-futex operations. Only the first installation takes
-+/// effect, and no direct wait is attempted until suspension is enabled too.
-+pub fn set_host_futex_hooks(hooks: HostFutexHooks) {
-+    let _ = FUTEX_HOOKS.set(hooks);
-+}
-+
-+/// Wakes direct host-futex waiters on `address`, if hooks are installed.
++/// Wakes at most `count` direct futex waiters on `address`, returning how
++/// many woke.
 +///
-+/// This is deliberately also callable when `supported` is false: a host can
-+/// use a widely available single-futex wake while a vector wait is absent.
-+pub fn wake_host_futex(address: *const u32, count: u32) -> Option<u32> {
-+    FUTEX_HOOKS.get().map(|hooks| (hooks.wake)(address, count))
++/// This is deliberately also callable once the vector wait has been given
++/// up on: the single-futex wake is far older and still reaches a waiter
++/// parked before that.
++pub fn wake_host_futex(address: *const u32, count: u32) -> u32 {
++    super::futex::wake(address, count)
 +}
 +
 +/// Whether the current coroutine can directly wait, on this guest word if
@@ -299,7 +688,7 @@ index 8e2355f..38ffa51 100644
 +pub fn can_suspend_on_futex(address: Option<*const u32>) -> bool {
 +    enabled()
 +        && yielder_get().is_some()
-+        && FUTEX_HOOKS.get().is_some_and(|hooks| (hooks.supported)())
++        && super::futex::supported()
 +        && address.is_none_or(crate::memory::stable_futex_address)
 +}
 +
@@ -328,7 +717,6 @@ index 8e2355f..38ffa51 100644
 +    if !can_suspend_on_futex(futex.map(|(address, _)| address)) {
 +        return None;
 +    }
-+    FUTEX_HOOKS.get()?;
 +    let yielder = yielder_get()?;
 +    let futex = match futex {
 +        Some((address, expected)) => Some((NonNull::new(address.cast_mut())?, expected)),
@@ -357,7 +745,7 @@ index 8e2355f..38ffa51 100644
  /// Runs a host import: on the coroutine stack when suspension is enabled, so
  /// that a wait inside it can suspend the coroutine; on the OS thread's stack
  /// (stock behaviour, `on_host_stack`) otherwise.
-@@ -140,6 +295,10 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+@@ -140,6 +278,10 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
  /// Closed: no coroutine that has already started may be resumed or polled.
  static GATE_CLOSED: AtomicBool = AtomicBool::new(false);
  
@@ -368,7 +756,7 @@ index 8e2355f..38ffa51 100644
  /// Registers the caller as active unless the gate is closed and `started`.
  ///
  /// With sequentially consistent ordering either this thread sees the closed
-@@ -206,6 +365,65 @@ fn wait_ready(fut: BlockedFuture, gate: Option<&mut dyn TopLevelCoro>) {
+@@ -206,6 +348,62 @@ fn wait_ready(fut: BlockedFuture, gate: Option<&mut dyn TopLevelCoro>) {
      }
  }
  
@@ -388,9 +776,6 @@ index 8e2355f..38ffa51 100644
 +            leave();
 +            retire(gate.expect("a closed gate only retires a gated loop"));
 +        }
-+        let hooks = FUTEX_HOOKS
-+            .get()
-+            .expect("a futex wait was yielded without host hooks");
 +        let request = HostFutexWait {
 +            futex: wait
 +                .futex
@@ -404,7 +789,7 @@ index 8e2355f..38ffa51 100644
 +        // The atomic vector wait itself must not count as active: the gate
 +        // generation makes closing the gate race-free while it is asleep.
 +        leave();
-+        let result = (hooks.wait)(request);
++        let result = super::futex::wait(request);
 +        if gate.is_some() && GATE_CLOSED.load(Ordering::SeqCst) {
 +            retire(gate.expect("a closed gate only retires a gated loop"));
 +        }
@@ -434,7 +819,7 @@ index 8e2355f..38ffa51 100644
  /// Suspends the calling coroutine until the host loop has polled `fut` to
  /// completion, possibly on another OS thread. Returns `false`, without
  /// polling, when suspension is disabled or the caller is not on a coroutine.
-@@ -261,6 +479,13 @@ struct Fused<'a, F: Future> {
+@@ -261,6 +459,13 @@ struct Fused<'a, F: Future> {
      done: bool,
  }
  
@@ -448,7 +833,7 @@ index 8e2355f..38ffa51 100644
  impl<F: Future> Future for Fused<'_, F> {
      type Output = ();
  
-@@ -322,7 +547,7 @@ struct GuestCoro<T> {
+@@ -322,7 +527,7 @@ struct GuestCoro<T> {
      /// one crashes the process as it would anywhere else.
      with_trap_context: bool,
      /// The wait the coroutine is suspended in, if any.
@@ -457,7 +842,7 @@ index 8e2355f..38ffa51 100644
      /// The OS thread currently driving a registered coroutine, for unparking.
      thread: Mutex<Option<Thread>>,
      /// Per-thread state captured by the last driving thread when it retired.
-@@ -346,8 +571,14 @@ impl<T: 'static> GuestCoro<T> {
+@@ -346,8 +551,14 @@ impl<T: 'static> GuestCoro<T> {
          } else {
              self.coro.resume(())
          };
@@ -474,7 +859,7 @@ index 8e2355f..38ffa51 100644
          }
          result
      }
-@@ -408,6 +639,15 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+@@ -408,6 +619,15 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
                  }
                  None => wait_ready(fut, None),
              },
@@ -490,7 +875,7 @@ index 8e2355f..38ffa51 100644
              CoroutineResult::Return(result) => break result,
          }
      };
-@@ -448,7 +688,7 @@ pub fn set_thread_state_hooks(hooks: ThreadStateHooks) {
+@@ -448,7 +668,7 @@ pub fn set_thread_state_hooks(hooks: ThreadStateHooks) {
  }
  
  enum Step {
@@ -499,7 +884,7 @@ index 8e2355f..38ffa51 100644
      Done,
  }
  
-@@ -456,7 +696,7 @@ enum Step {
+@@ -456,7 +676,7 @@ enum Step {
  trait TopLevelCoro: Send {
      fn id(&self) -> u64;
      fn started(&self) -> bool;
@@ -508,7 +893,7 @@ index 8e2355f..38ffa51 100644
      fn step(&mut self) -> Step;
      fn set_thread(&self, thread: Thread);
      fn unpark(&self);
-@@ -473,13 +713,18 @@ impl<T: 'static> TopLevelCoro for GuestCoro<T> {
+@@ -473,13 +693,18 @@ impl<T: 'static> TopLevelCoro for GuestCoro<T> {
          self.coro.started()
      }
  
@@ -529,7 +914,7 @@ index 8e2355f..38ffa51 100644
              CoroutineResult::Yield(WasmYield::Unwind(_)) => {
                  // SAFETY: as in `run_wasm_call`: `unwind_with` guarantees only
                  // Wasm frames on the stack.
-@@ -579,7 +824,7 @@ pub fn run_guest_thread<F: FnOnce() + Send + 'static>(stack_size: usize, f: F) {
+@@ -579,7 +804,7 @@ pub fn run_guest_thread<F: FnOnce() + Send + 'static>(stack_size: usize, f: F) {
  }
  
  /// Drives a registered coroutine to completion on the calling thread.
@@ -538,7 +923,7 @@ index 8e2355f..38ffa51 100644
      HOST_LOOPS.fetch_add(1, Ordering::SeqCst);
      // SAFETY: the registry owns the box behind `ptr` and only this loop drives
      // it; the freezer touches it through `&self` methods only while no loop
-@@ -588,8 +833,11 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<BlockedFuture>)
+@@ -588,8 +813,11 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<BlockedFuture>)
      coro.set_thread(std::thread::current());
      CURRENT_COROUTINE.with(|current| current.set(coro.id()));
      loop {
@@ -552,7 +937,7 @@ index 8e2355f..38ffa51 100644
          }
          if !try_enter(coro.started()) {
              retire(coro);
-@@ -643,6 +891,8 @@ pub fn exit_current_thread() -> ! {
+@@ -643,6 +871,8 @@ pub fn exit_current_thread() -> ! {
  /// thread spawn in flight completes and the spawner drains to its own wait.
  pub fn close_gate() {
      GATE_CLOSED.store(true, Ordering::SeqCst);
@@ -562,7 +947,7 @@ index 8e2355f..38ffa51 100644
  }
  
 diff --git a/lib/wasix/Cargo.toml b/lib/wasix/Cargo.toml
-index 33725f6..674456d 100644
+index 33725f6..69a804a 100644
 --- a/lib/wasix/Cargo.toml
 +++ b/lib/wasix/Cargo.toml
 @@ -162,6 +162,7 @@ windows-sys = { workspace = true, features = [
@@ -594,8 +979,8 @@ index 33725f6..674456d 100644
  test-js = ["js", "wasmer/wat"]
  
  host-vnet = ["virtual-net/host-net"]
-+# Direct, interruptible kernel waits through hooks an embedder installs in
-+# wasmer-vm; every native configuration has it.
++# Direct, interruptible kernel waits, made by wasmer-vm; every native
++# configuration has it.
 +host-futex = ["dep:wasmer-vm"]
  host-threads = []
  host-reqwest = ["reqwest"]
@@ -780,10 +1165,10 @@ index b60a2e5..9890bb5 100644
          Span::current().record("poller_idx", poller_idx);
          FutexPoller {
 diff --git a/lib/wasix/src/syscalls/wasix/futex_wake.rs b/lib/wasix/src/syscalls/wasix/futex_wake.rs
-index 2c150d1..fb61849 100644
+index 2c150d1..42b2637 100644
 --- a/lib/wasix/src/syscalls/wasix/futex_wake.rs
 +++ b/lib/wasix/src/syscalls/wasix/futex_wake.rs
-@@ -22,25 +22,42 @@ pub fn futex_wake<M: MemorySize>(
+@@ -22,25 +22,41 @@ pub fn futex_wake<M: MemorySize>(
      let (owner, futex_idx) = futex_owner(env, pointer);
      Span::current().record("futex_idx", futex_idx);
  
@@ -803,8 +1188,7 @@ index 2c150d1..fb61849 100644
 +        usize::try_from(pointer)
 +            .ok()
 +            .map(|pointer| unsafe { memory.data_ptr().add(pointer) }.cast::<u32>())
-+            .and_then(|address| wasmer_vm::wake_host_futex(address, 1))
-+            .unwrap_or(0)
++            .map_or(0, |address| wasmer_vm::wake_host_futex(address, 1))
 +    } else {
 +        0
 +    };
