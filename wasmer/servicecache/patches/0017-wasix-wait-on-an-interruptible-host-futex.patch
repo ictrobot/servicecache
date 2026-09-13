@@ -29,7 +29,7 @@ Shared-file futexes and dynamic memories keep the async path, since a
 direct wait needs a word whose address cannot change. A coroutine frozen
 in a direct wait retains it, so a resurrected child resumes the same
 wait against its own gate generation. The wait lives behind wasix's
-host-futex feature, which every native configuration enables, and
+direct-waits feature, which the host and the CLI enable, and
 nothing changes until suspension is enabled.
 
 diff --git a/Cargo.lock b/Cargo.lock
@@ -44,6 +44,18 @@ index 6c6e944..efc1a0f 100644
   "wasmer-wasix-types",
   "wasmparser 0.256.0",
   "wcgi",
+diff --git a/lib/cli/Cargo.toml b/lib/cli/Cargo.toml
+index ef6b0f2..9c2b252 100644
+--- a/lib/cli/Cargo.toml
++++ b/lib/cli/Cargo.toml
+@@ -144,6 +144,7 @@ wasmer-wasix = { path = "../wasix", version = "=0.703.0", features = [
+   "host-fs",
+   "ctrlc",
+   "sys",
++  "direct-waits",
+ ], default-features = false }
+ wasmer-wast = { version = "=7.3.0", path = "../../tests/lib/wast", optional = true }
+ wasmer-types = { version = "=7.3.0", path = "../types", features = [
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
 index 6dc2c61..5fa8a97 100644
 --- a/lib/vm/src/memory.rs
@@ -947,7 +959,7 @@ index 8e2355f..c3dcab5 100644
  }
  
 diff --git a/lib/wasix/Cargo.toml b/lib/wasix/Cargo.toml
-index 33725f6..69a804a 100644
+index 33725f6..d3b1680 100644
 --- a/lib/wasix/Cargo.toml
 +++ b/lib/wasix/Cargo.toml
 @@ -162,6 +162,7 @@ windows-sys = { workspace = true, features = [
@@ -958,35 +970,18 @@ index 33725f6..69a804a 100644
  
  [dev-dependencies]
  wasmer = { path = "../api", version = "=7.3.0", default-features = false, features = [
-@@ -215,7 +216,7 @@ default = ["sys-default"]
- time = ["tokio/time"]
- ctrlc = ["tokio/signal"]
- # the minimal sys implementation
--sys-minimal = ["wasmer/sys", "sys-thread", "tokio/fs"]
-+sys-minimal = ["wasmer/sys", "sys-thread", "tokio/fs", "host-futex"]
- sys = [
-   "webc/mmap",
-   "time",
-@@ -234,6 +235,7 @@ sys = [
-   "wasmer/sys",
-   # We must ensure at least one compiler backend (or `headless`) is enabled for `wasmer/sys`.
-   "wasmer/headless",
-+  "host-futex",
- ]
- sys-default = ["sys"]
- sys-poll = []
-@@ -265,6 +267,9 @@ js-default = ["js"]
+@@ -265,6 +266,9 @@ js-default = ["js"]
  test-js = ["js", "wasmer/wat"]
  
  host-vnet = ["virtual-net/host-net"]
-+# Direct, interruptible kernel waits, made by wasmer-vm; every native
-+# configuration has it.
-+host-futex = ["dep:wasmer-vm"]
++# Direct kernel waits made by wasmer-vm, for a guest futex and for a
++# socket's host descriptor; without it every wait takes the async path.
++direct-waits = ["dep:wasmer-vm"]
  host-threads = []
  host-reqwest = ["reqwest"]
  host-fs = ["virtual-fs/host-fs"]
 diff --git a/lib/wasix/src/os/task/thread.rs b/lib/wasix/src/os/task/thread.rs
-index 3859b6a..b7e2793 100644
+index 3859b6a..b8b4f71 100644
 --- a/lib/wasix/src/os/task/thread.rs
 +++ b/lib/wasix/src/os/task/thread.rs
 @@ -10,7 +10,7 @@ use crate::{
@@ -1040,7 +1035,7 @@ index 3859b6a..b7e2793 100644
 +
 +    fn interrupt_waits(&self) {
 +        self.state.wait_interrupt.fetch_add(1, Ordering::SeqCst);
-+        #[cfg(feature = "host-futex")]
++        #[cfg(feature = "direct-waits")]
 +        let _ = wasmer_vm::wake_host_futex(
 +            (&self.state.wait_interrupt as *const AtomicU32).cast(),
 +            u32::MAX,
@@ -1066,7 +1061,7 @@ index baca648..0cbf189 100644
  
  pub(crate) fn futex_owner(env: &WasiEnv, address: u64) -> (FutexOwner, u64) {
 diff --git a/lib/wasix/src/syscalls/wasix/futex_wait.rs b/lib/wasix/src/syscalls/wasix/futex_wait.rs
-index b60a2e5..9890bb5 100644
+index b60a2e5..79bd2ad 100644
 --- a/lib/wasix/src/syscalls/wasix/futex_wait.rs
 +++ b/lib/wasix/src/syscalls/wasix/futex_wait.rs
 @@ -77,9 +77,13 @@ pub fn futex_wait<M: MemorySize + 'static>(
@@ -1105,7 +1100,7 @@ index b60a2e5..9890bb5 100644
 +    // A stable, process-local linear-memory word can be handed directly to
 +    // ServiceCache's host wait. The kernel checks the value and enqueues the
 +    // waiter atomically, so this path needs no logical waker registration.
-+    #[cfg(feature = "host-futex")]
++    #[cfg(feature = "direct-waits")]
 +    if owner.supports_host_futex()
 +        && (timeout.is_none() || deadline.is_some())
 +        && let Ok(pointer) = usize::try_from(pointer)
@@ -1165,7 +1160,7 @@ index b60a2e5..9890bb5 100644
          Span::current().record("poller_idx", poller_idx);
          FutexPoller {
 diff --git a/lib/wasix/src/syscalls/wasix/futex_wake.rs b/lib/wasix/src/syscalls/wasix/futex_wake.rs
-index 2c150d1..42b2637 100644
+index 2c150d1..187f58f 100644
 --- a/lib/wasix/src/syscalls/wasix/futex_wake.rs
 +++ b/lib/wasix/src/syscalls/wasix/futex_wake.rs
 @@ -22,25 +22,41 @@ pub fn futex_wake<M: MemorySize>(
@@ -1183,7 +1178,7 @@ index 2c150d1..42b2637 100644
 -            }
 -            if futex.wakers.is_empty() {
 -                guard.futexes.remove(&futex_idx);
-+    #[cfg(feature = "host-futex")]
++    #[cfg(feature = "direct-waits")]
 +    let native_woken = if owner.supports_host_futex() && pointer % 4 == 0 {
 +        usize::try_from(pointer)
 +            .ok()
@@ -1192,7 +1187,7 @@ index 2c150d1..42b2637 100644
 +    } else {
 +        0
 +    };
-+    #[cfg(not(feature = "host-futex"))]
++    #[cfg(not(feature = "direct-waits"))]
 +    let native_woken = 0;
 +
 +    // Do not wake a logical fallback waiter as well when the one requested
@@ -1229,7 +1224,7 @@ index 2c150d1..42b2637 100644
  
      let woken = match woken {
 diff --git a/lib/wasix/src/syscalls/wasix/futex_wake_all.rs b/lib/wasix/src/syscalls/wasix/futex_wake_all.rs
-index c074546..7f3fd72 100644
+index c074546..f7de4dd 100644
 --- a/lib/wasix/src/syscalls/wasix/futex_wake_all.rs
 +++ b/lib/wasix/src/syscalls/wasix/futex_wake_all.rs
 @@ -20,8 +20,16 @@ pub fn futex_wake_all<M: MemorySize>(
@@ -1238,7 +1233,7 @@ index c074546..7f3fd72 100644
  
 -    let mut woken = false;
 -    let woken = owner.with_state(|guard| {
-+    #[cfg(feature = "host-futex")]
++    #[cfg(feature = "direct-waits")]
 +    if owner.supports_host_futex()
 +        && pointer % 4 == 0
 +        && let Ok(pointer) = usize::try_from(pointer)

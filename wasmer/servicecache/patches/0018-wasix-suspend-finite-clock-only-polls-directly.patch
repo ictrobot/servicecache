@@ -3,27 +3,27 @@ Subject: wasix: suspend finite clock-only polls directly
 A poll_oneoff with one finite clock subscription and nothing else is a
 sleep, and the commonest wait in a guest whose threads pace themselves
 with short timeouts. It went through the general polling path: the
-subscriptions parsed into vectors, a batch of descriptor guards, a
-Tokio timer, the future selecting between them and a waker, built and
-torn down for every sleep.
+subscriptions parsed into vectors, a batch of descriptor guards, a Tokio
+timer, the future selecting between them and a waker, built and torn
+down for every sleep.
 
-Suspend such a call directly instead, before any of that, as the wait
-a futex takes but with no guest word: the coroutine yields it to its
-host loop, which blocks in the embedder's hook on the WASI thread's
+Suspend such a call directly instead, before any of that, as the wait a
+futex takes but with no guest word: the coroutine yields it to its host
+loop, which blocks in wasmer-vm's direct futex wait on the WASI thread's
 interrupt generation and the freeze-gate generation until the absolute
-deadline. Reaching the deadline completes the poll with its clock
-event. Anything else falls through to the general path, which handles
-it as before: an interrupt finishes the sleep there with the full
-signal and termination processing, and a host without the direct wait
-never leaves it.
+deadline. Reaching the deadline completes the poll with its clock event.
+Anything else falls through to the general path, which handles it as
+before: an interrupt finishes the sleep there with the full signal and
+termination processing, and a host without the direct wait never leaves
+it.
 
-Journaled calls keep the general path, since a replayed poll_oneoff
-must first consume its recorded result through handle_rewind. Polls
-that mix a clock with descriptors, immediate polls and infinite waits
-are unchanged.
+Journaled calls keep the general path, since a replayed poll_oneoff must
+first consume its recorded result through handle_rewind. Polls that mix
+a clock with descriptors, immediate polls and infinite waits are
+unchanged.
 
 diff --git a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
-index 73a96d6..0b6c726 100644
+index 73a96d6..f239f1a 100644
 --- a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
 +++ b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
 @@ -92,6 +92,87 @@ pub fn poll_oneoff<M: MemorySize + 'static>(
@@ -40,7 +40,7 @@ index 73a96d6..0b6c726 100644
 +    // without the direct wait, a journaled call that must first consume its
 +    // serialized result through `handle_rewind`, or a clock the general path
 +    // treats as immediate (see its reading of `timeout`).
-+    #[cfg(feature = "host-futex")]
++    #[cfg(feature = "direct-waits")]
 +    if nsubscriptions_usize == 1 && !ctx.data().enable_journal {
 +        let subscription = {
 +            let env = ctx.data();

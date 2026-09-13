@@ -33,7 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 wasmer = { version = "=7.3.0", default-features = false, features = ["cranelift"] }
 wasmer-types = "=7.3.0"
 wasmer-vm = { version = "=7.3.0", features = ["tracing"] }
-wasmer-wasix = { version = "=0.703.0", default-features = false, features = ["host-fs", "host-vnet", "sys-minimal"] }
+wasmer-wasix = { version = "=0.703.0", default-features = false, features = ["host-fs", "host-vnet", "sys-minimal", "direct-waits"] }
 virtual-fs = { version = "=0.703.0", default-features = false, features = ["host-fs"] }
 virtual-mio = { version = "=0.703.0", default-features = false, features = ["sys"] }
 virtual-net = { version = "=0.703.0", default-features = false, features = ["host-net"] }

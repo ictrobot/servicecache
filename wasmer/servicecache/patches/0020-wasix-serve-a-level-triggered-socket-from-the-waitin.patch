@@ -1,0 +1,1911 @@
+Subject: wasix: serve a level-triggered socket from the waiting thread
+
+A guest blocked in epoll_wait on a socket is woken twice over: the
+kernel wakes the shared selector's poll thread, which dispatches into
+the set and then wakes the guest thread. This is the first user of the
+direct descriptor wait: the thread that waits on the set polls the
+sockets' descriptors itself, and the selector is not involved.
+
+A level-triggered subscription on a socket with a host descriptor is
+claimed by `claim_direct_serving` when it is registered: it takes its
+place in the epoll registry but installs no handler on the socket.
+`direct_epoll_wait` polls that descriptor through
+`try_suspend_on_pollfd` and queues what the kernel reported, exactly as
+the selector's dispatch would have; a guest that does not drain its
+socket is told again on the next call, which is what level triggering
+means. Edge-triggered and one-shot subscriptions, sockets without a
+descriptor, pipes and event notifications register and report exactly as
+before, and a set that mixes the two waits on both.
+
+The existing blocking wait is never entered while a direct-served
+subscription exists, because nothing would be watching its socket. Every
+way out of the direct loop other than answering the call demotes the set
+first (`demote_direct` installs the skipped registrations), and a thread
+entering the existing path counts itself in with `enter_blocking` and
+demotes what it finds; a subscription registered while that count is not
+zero is not claimed. The count is held by the wait future, so a deep
+sleep does not release it early, and a call resumed from one answers
+with its result before looking at the set. A demotion that cannot
+install its registration reports the subscription broken rather than
+leaving a wait to sleep on it.
+
+The loop demotes and falls through when the runtime has no descriptor
+wait, the call is journalled, the deadline overflows, the set exceeds
+`DIRECT_POLL_CAP` (64), a socket can no longer be named, a signal cannot
+be delivered, the wait answers unavailable for a reason other than a
+fork, or a thread is already in the existing path. A fork is not a
+failure: `POLLFD_EPOCH` says so, and the loop resolves its descriptors
+again.
+
+A number is not an identity. A subscription is polled on the socket it
+named when it was claimed; `produce` queues readiness only while that
+subscription is still the set's for the number; and a demotion attaches
+it only to that socket, reporting it broken otherwise. A turn compares
+the set's `direct_generation` once it is registered to be woken, so a
+change another waiter was notified of is not slept through, and asks
+`should_exit` after capturing its interrupt generation, because a
+termination moves that generation without queueing a signal.
+
+A zero-timeout call is answered by the loop rather than passed on, so a
+non-blocking call can see a socket nothing else is watching. Every turn
+runs the pending dynamic link operations first, as the existing path
+does. One trace event per call, a debug event per demotion and per
+claim. The loop's working arrays live on the frame, sized by
+`DIRECT_POLL_CAP`, the notifier future is pinned there, and the waker is
+built once per call, so a turn allocates only the events it returns.
+
+diff --git a/lib/vm/src/trap/mod.rs b/lib/vm/src/trap/mod.rs
+index 2d4ef8b..15f3cfe 100644
+--- a/lib/vm/src/trap/mod.rs
++++ b/lib/vm/src/trap/mod.rs
+@@ -30,7 +30,7 @@ pub use suspend::{
+     HOST_POLL_READ, HOST_POLL_WRITE, HostFutexResult, HostPollFd, HostPollFdResult, Quiescence,
+     Resurrected, SleepHook, SuspendedFutex, SuspendedPollFd, ThreadStateHooks, WasmYield,
+     can_suspend_on_futex, can_suspend_on_pollfd, exit_current_thread, on_host_stack_for_import,
+-    resurrect_all, run_guest_thread, set_thread_state_hooks, try_suspend_on_block,
++    pollfd_epoch, resurrect_all, run_guest_thread, set_thread_state_hooks, try_suspend_on_block,
+     try_suspend_on_futex, try_suspend_on_pollfd, wake_host_futex, wake_host_pollfd,
+ };
+ pub use trap::{Trap, UnwindReason};
+diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
+index 27ae096..891272b 100644
+--- a/lib/vm/src/trap/suspend.rs
++++ b/lib/vm/src/trap/suspend.rs
+@@ -317,6 +317,18 @@ pub fn wake_host_pollfd(address: *const u32) {
+     super::pollfd::wake(address);
+ }
+ 
++/// The generation of this process's descriptor numbering.
++///
++/// A caller resolves descriptors, waits on them and may be answered
++/// `Unavailable` for two different reasons: the host cannot perform the wait
++/// at all, or a fork rebuilt the networking under it. Comparing this value
++/// from before the wait with this value after tells them apart, so that the
++/// second only costs the caller a fresh resolution rather than its whole
++/// direct path.
++pub fn pollfd_epoch() -> u64 {
++    POLLFD_EPOCH.load(Ordering::SeqCst)
++}
++
+ /// Whether a direct wait on host descriptors can be made at all.
+ ///
+ /// It does not depend on suspension: a coroutine that can suspend hands the
+diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
+index 7232756..f250835 100644
+--- a/lib/wasix/src/net/socket.rs
++++ b/lib/wasix/src/net/socket.rs
+@@ -1932,7 +1932,7 @@ pub(crate) mod tests {
+         net::{Ipv4Addr, Shutdown, SocketAddr},
+         pin::Pin,
+         sync::{
+-            Arc,
++            Arc, Mutex as StdMutex,
+             atomic::{AtomicUsize, Ordering},
+         },
+         task::{Context, Poll},
+@@ -1951,6 +1951,47 @@ pub(crate) mod tests {
+         write_calls: Arc<AtomicUsize>,
+         close_calls: Arc<AtomicUsize>,
+         status: Arc<AtomicUsize>,
++        /// The handler last installed on this socket, which a test that
++        /// cares whether one was installed at all reads, and one that
++        /// wants the selector's dispatch calls.
++        handler: Arc<StdMutex<Option<Box<dyn InterestHandler + Send + Sync>>>>,
++        /// What the backend answers as its host descriptor. A mock has no
++        /// real one, so a test that needs a socket a direct wait would take
++        /// says so here.
++        host_fd: Option<std::os::fd::RawFd>,
++    }
++
++    impl Default for MockTcpSocket {
++        fn default() -> Self {
++            Self {
++                read_calls: Arc::new(AtomicUsize::new(0)),
++                write_calls: Arc::new(AtomicUsize::new(0)),
++                close_calls: Arc::new(AtomicUsize::new(0)),
++                status: Arc::new(AtomicUsize::new(MOCK_STATUS_OPENED)),
++                handler: Arc::new(StdMutex::new(None)),
++                host_fd: None,
++            }
++        }
++    }
++
++    /// The handler slot of a socket, and a stream socket that names a host
++    /// descriptor: what a subscription a direct wait would take is built on.
++    /// Nothing ever waits on the descriptor in these tests, so the number
++    /// only has to be one a backend could answer with.
++    pub(crate) type MockHandlerSlot = Arc<StdMutex<Option<Box<dyn InterestHandler + Send + Sync>>>>;
++
++    pub(crate) fn host_descriptor_socket() -> (InodeSocket, MockHandlerSlot) {
++        let handler: MockHandlerSlot = Arc::new(StdMutex::new(None));
++        let socket = InodeSocket::new(InodeSocketKind::TcpStream {
++            socket: Box::new(MockTcpSocket {
++                handler: handler.clone(),
++                host_fd: Some(3),
++                ..Default::default()
++            }),
++            write_timeout: None,
++            read_timeout: None,
++        });
++        (socket, handler)
+     }
+ 
+     const MOCK_STATUS_OPENING: usize = 0;
+@@ -1997,8 +2038,9 @@ pub(crate) mod tests {
+ 
+         fn set_handler(
+             &mut self,
+-            _handler: Box<dyn InterestHandler + Send + Sync>,
++            handler: Box<dyn InterestHandler + Send + Sync>,
+         ) -> NetResult<()> {
++            *self.handler.lock().unwrap() = Some(handler);
+             Ok(())
+         }
+     }
+@@ -2031,6 +2073,11 @@ pub(crate) mod tests {
+     }
+ 
+     impl VirtualTcpSocket for MockTcpSocket {
++        #[cfg(unix)]
++        fn host_fd(&self) -> Option<std::os::fd::RawFd> {
++            self.host_fd
++        }
++
+         fn set_recv_buf_size(&mut self, _size: usize) -> NetResult<()> {
+             Ok(())
+         }
+@@ -2121,10 +2168,8 @@ pub(crate) mod tests {
+     pub(crate) fn close_tracking_socket(close_calls: Arc<AtomicUsize>) -> InodeSocket {
+         InodeSocket::new(InodeSocketKind::TcpStream {
+             socket: Box::new(MockTcpSocket {
+-                read_calls: Arc::new(AtomicUsize::new(0)),
+-                write_calls: Arc::new(AtomicUsize::new(0)),
+                 close_calls,
+-                status: Arc::new(AtomicUsize::new(MOCK_STATUS_OPENED)),
++                ..Default::default()
+             }),
+             write_timeout: None,
+             read_timeout: None,
+@@ -2194,8 +2239,8 @@ pub(crate) mod tests {
+             socket: Box::new(MockTcpSocket {
+                 read_calls: read_calls.clone(),
+                 write_calls: write_calls.clone(),
+-                close_calls: Arc::new(AtomicUsize::new(0)),
+                 status,
++                ..Default::default()
+             }),
+             write_timeout: None,
+             read_timeout: None,
+@@ -2215,10 +2260,8 @@ pub(crate) mod tests {
+         let status = Arc::new(AtomicUsize::new(MOCK_STATUS_OPENING));
+         let inode = InodeSocket::new(InodeSocketKind::TcpStream {
+             socket: Box::new(MockTcpSocket {
+-                read_calls: Arc::new(AtomicUsize::new(0)),
+-                write_calls: Arc::new(AtomicUsize::new(0)),
+-                close_calls: Arc::new(AtomicUsize::new(0)),
+                 status: status.clone(),
++                ..Default::default()
+             }),
+             write_timeout: None,
+             read_timeout: None,
+diff --git a/lib/wasix/src/os/epoll/mod.rs b/lib/wasix/src/os/epoll/mod.rs
+index f4227c9..44c0ced 100644
+--- a/lib/wasix/src/os/epoll/mod.rs
++++ b/lib/wasix/src/os/epoll/mod.rs
+@@ -283,6 +283,23 @@ impl Drop for EpollJoinGuard {
+     }
+ }
+ 
++/// Counts a thread into a set's general, blocking wait for as long as it
++/// is held. A subscription registered while one exists is not direct-served:
++/// nothing would report its readiness to a thread that is already asleep
++/// somewhere else.
++#[cfg(all(unix, feature = "direct-waits"))]
++#[derive(Debug)]
++pub struct BlockingWaitGuard {
++    epoll_state: Arc<EpollState>,
++}
++
++#[cfg(all(unix, feature = "direct-waits"))]
++impl Drop for BlockingWaitGuard {
++    fn drop(&mut self) {
++        self.epoll_state.blocking.fetch_sub(1, Ordering::SeqCst);
++    }
++}
++
+ #[derive(Debug)]
+ pub struct EpollState {
+     /// Active subscriptions keyed by watched fd.
+@@ -291,6 +308,17 @@ pub struct EpollState {
+     ready: StdMutex<VecDeque<ReadyItem>>,
+     /// Wake primitive for blocked `epoll_wait`.
+     notify: Notify,
++    /// How many threads are inside the general, blocking wait on this set.
++    /// Read when a subscription is registered: see `claim_direct_serving`.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    blocking: std::sync::atomic::AtomicUsize,
++    /// Moved by every change to what a direct-served wait polls: a
++    /// subscription added, changed or removed, or one claimed or demoted.
++    /// A waiting thread reads it before it lists the descriptors and again
++    /// after it has registered to be woken, so a change in between is
++    /// caught even when another waiter took the notification for it.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    direct_generation: AtomicU64,
+ }
+ 
+ impl Default for EpollState {
+@@ -306,12 +334,28 @@ impl EpollState {
+             subscriptions: StdMutex::new(FnvHashMap::default()),
+             ready: StdMutex::new(VecDeque::new()),
+             notify: Notify::new(),
++            #[cfg(all(unix, feature = "direct-waits"))]
++            blocking: std::sync::atomic::AtomicUsize::new(0),
++            #[cfg(all(unix, feature = "direct-waits"))]
++            direct_generation: AtomicU64::new(0),
+         }
+     }
+ 
++    /// The generation of what a direct-served wait polls; see the field.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    pub(crate) fn direct_generation(&self) -> u64 {
++        self.direct_generation.load(Ordering::SeqCst)
++    }
++
++    fn bump_direct_generation(&self) {
++        #[cfg(all(unix, feature = "direct-waits"))]
++        self.direct_generation.fetch_add(1, Ordering::SeqCst);
++    }
++
+     #[cfg(test)]
+     fn insert_subscription(&self, fd: WasiFd, state: Arc<EpollSubState>) {
+         self.subscriptions.lock().unwrap().insert(fd, state);
++        self.bump_direct_generation();
+     }
+ 
+     fn restore_subscription(&self, fd: WasiFd, previous: Option<Arc<EpollSubState>>) {
+@@ -320,6 +364,7 @@ impl EpollState {
+         if let Some(previous) = previous {
+             subscriptions.insert(fd, previous);
+         }
++        self.bump_direct_generation();
+     }
+ 
+     fn subscription(&self, fd: WasiFd) -> Option<Arc<EpollSubState>> {
+@@ -343,6 +388,201 @@ impl EpollState {
+         self.notify.notified().await;
+     }
+ 
++    /// A future that completes when a producer enqueues readiness. Polling
++    /// it registers the caller's waker, and the registration lasts as long
++    /// as the future is kept alive.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
++        self.notify.notified()
++    }
++
++    /// Whether anything is queued for the consumer to drain. Checked after
++    /// registering a waker, never before, so that readiness arriving in
++    /// between is not missed.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    pub(crate) fn has_ready(&self) -> bool {
++        !self.ready.lock().unwrap().is_empty()
++    }
++
++    /// Every direct-served subscription as a waiting thread needs it. Re-read
++    /// on every turn of that wait, because a subscription can be added,
++    /// removed or demoted under it.
++    ///
++    /// Written into the caller's array rather than a fresh one, because a
++    /// waiting thread asks for this on every turn of its loop and a set
++    /// small enough to poll is small enough to keep on the stack. The
++    /// answer is how many subscriptions there are, which may be more than
++    /// the array holds: a caller that cannot poll them all says so itself.
++    /// A slot left empty inside that count is a subscription whose socket
++    /// has gone, which the caller cannot poll and must demote.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    pub(crate) fn watched_direct_into(&self, out: &mut [Option<DirectWatch>]) -> usize {
++        let mut total = 0;
++        for (fd, sub_state) in self.subscriptions.lock().unwrap().iter() {
++            if !sub_state.is_direct() {
++                continue;
++            }
++            if let Some(slot) = out.get_mut(total) {
++                *slot = sub_state.direct_socket().map(|socket| DirectWatch {
++                    fd: *fd,
++                    events: sub_state.fd_meta().events(),
++                    socket,
++                    sub_state: sub_state.clone(),
++                });
++            }
++            total += 1;
++        }
++        total
++    }
++
++    /// The same list as an owned vector, for tests.
++    #[cfg(all(test, unix, feature = "direct-waits"))]
++    pub(crate) fn watched_direct(&self) -> Vec<(WasiFd, EpollType)> {
++        self.subscriptions
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(_, sub_state)| sub_state.is_direct())
++            .map(|(fd, sub_state)| (*fd, sub_state.fd_meta().events()))
++            .collect()
++    }
++
++    /// Whether any subscription in this set is direct-served.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    pub(crate) fn has_direct(&self) -> bool {
++        self.subscriptions
++            .lock()
++            .unwrap()
++            .values()
++            .any(|sub_state| sub_state.is_direct())
++    }
++
++    /// Reports readiness for a watched fd, as a producer does: the same
++    /// steps as `EpollHandler::push_interest`, from a thread that read the
++    /// readiness off the descriptor itself rather than from the selector's
++    /// dispatch. Bits the subscription did not ask for are the caller's to
++    /// filter; what arrives here is queued, but only while `sub_state` is
++    /// still the set's subscription for `fd`: a subscription deleted and
++    /// added again under a wait must not be handed the old socket's
++    /// readiness under its own userdata.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    pub(crate) fn produce(&self, fd: WasiFd, sub_state: &Arc<EpollSubState>, readiness: EpollType) {
++        if !self
++            .subscription(fd)
++            .is_some_and(|current| Arc::ptr_eq(&current, sub_state))
++        {
++            return;
++        }
++        let mut bits = 0u8;
++        for flag in [
++            EpollType::EPOLLIN,
++            EpollType::EPOLLOUT,
++            EpollType::EPOLLHUP,
++            EpollType::EPOLLERR,
++        ] {
++            if readiness.contains(flag)
++                && let Some(bit) = epoll_type_to_pending_bit(flag)
++            {
++                bits |= bit;
++            }
++        }
++        if bits == 0 {
++            return;
++        }
++        sub_state.set_pending(bits);
++        if sub_state.mark_enqueued() {
++            self.enqueue_ready(fd, sub_state.generation());
++        }
++    }
++
++    /// Counts a thread into the general, blocking wait until the guard is
++    /// dropped.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    pub(crate) fn enter_blocking(self: &Arc<Self>) -> BlockingWaitGuard {
++        self.blocking.fetch_add(1, Ordering::SeqCst);
++        BlockingWaitGuard {
++            epoll_state: self.clone(),
++        }
++    }
++
++    #[cfg(all(unix, feature = "direct-waits"))]
++    fn blocking_waiters(&self) -> usize {
++        self.blocking.load(Ordering::SeqCst)
++    }
++
++    /// Gives every direct-served subscription the selector registration it
++    /// went without, so that the set can be waited on by something that
++    /// does not poll descriptors itself.
++    ///
++    /// This is what keeps the invariant that the general, blocking wait is
++    /// never entered while a subscription is direct-served: everything that
++    /// leaves the direct wait for it comes through here first.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    ///
++    /// Answers how many subscriptions it moved, which is what the caller
++    /// reports along with the reason it had for asking.
++    pub(crate) fn demote_direct(self: &Arc<Self>, state: &Arc<WasiState>) -> usize {
++        self.demote_direct_with(|event, sub_state| {
++            // Installing the registration resolves the number again. A
++            // guest that closed the watched descriptor and reused its
++            // number has moved it to another socket, and the subscription
++            // is then reported broken rather than attached to that one.
++            let expected = sub_state.direct_socket();
++            register_epoll_handler_inner(
++                state,
++                event,
++                self.clone(),
++                sub_state.clone(),
++                false,
++                expected.as_ref(),
++            )
++        })
++    }
++
++    /// The body of `demote_direct`, with the registration it installs left
++    /// to the caller.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    fn demote_direct_with<F>(&self, mut install: F) -> usize
++    where
++        F: FnMut(&EpollFd, &Arc<EpollSubState>) -> Result<Option<EpollJoinGuard>, Errno>,
++    {
++        let direct: Vec<(WasiFd, Arc<EpollSubState>)> = self
++            .subscriptions
++            .lock()
++            .unwrap()
++            .iter()
++            .filter(|(_, sub_state)| sub_state.is_direct())
++            .map(|(fd, sub_state)| (*fd, sub_state.clone()))
++            .collect();
++        let mut moved = 0;
++        for (fd, sub_state) in direct {
++            let event = sub_state.fd_meta();
++            // The guard a direct-served subscription holds carries its
++            // registry entry and nothing on the source, so it is replaced
++            // rather than added to: registering again as registration does
++            // installs the dispatcher and keeps one entry per subscription.
++            sub_state.detach_joins();
++            match install(&event, &sub_state) {
++                Ok(Some(join)) => sub_state.add_join(join),
++                Ok(None) => {}
++                Err(err) => {
++                    tracing::debug!(fd, ?err, "failed to demote a direct epoll subscription");
++                    // The subscription now has neither a registration nor a
++                    // thread polling it, which is the one state the
++                    // invariant forbids. Saying it is broken is what keeps
++                    // the wait that follows from sleeping on it for ever.
++                    self.produce(fd, &sub_state, EpollType::EPOLLERR | EpollType::EPOLLHUP);
++                }
++            }
++            // Cleared last: until the registration is in place a waiter
++            // must still poll the descriptor itself.
++            sub_state.clear_direct();
++            self.bump_direct_generation();
++            moved += 1;
++        }
++        moved
++    }
++
+     pub(crate) fn prepare_add(
+         &self,
+         fd: WasiFd,
+@@ -355,6 +595,7 @@ impl EpollState {
+ 
+         let (epoll_fd, sub_state) = self.build_pending_subscription(fd, event, 1);
+         subscriptions.insert(fd, sub_state.clone());
++        self.bump_direct_generation();
+         Ok((epoll_fd, sub_state))
+     }
+ 
+@@ -372,6 +613,7 @@ impl EpollState {
+         let (epoll_fd, sub_state) =
+             self.build_pending_subscription(fd, event, previous.next_generation());
+         subscriptions.insert(fd, sub_state.clone());
++        self.bump_direct_generation();
+         Ok((epoll_fd, sub_state, previous))
+     }
+ 
+@@ -382,6 +624,7 @@ impl EpollState {
+             .unwrap()
+             .remove(&fd)
+             .ok_or(Errno::Noent)?;
++        self.bump_direct_generation();
+         removed.detach_joins();
+         Ok(())
+     }
+@@ -422,6 +665,31 @@ pub struct EpollSubState {
+     enqueued: AtomicBool,
+     /// Generation used to invalidate stale queue entries after DEL/MOD.
+     generation: AtomicU64,
++    /// Whether the thread that waits on this set reports this
++    /// subscription's readiness itself, from its socket's host descriptor,
++    /// instead of the shared selector reporting it.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    direct: AtomicBool,
++    /// The socket that thread polls, taken at the claim from the very
++    /// guard this subscription goes on to hold, and not from the fd table.
++    /// Closing a watched fd does not remove its subscription, so the number
++    /// can come to name a socket the set never subscribed to, while the
++    /// guard still names the one it did.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    direct_socket: StdMutex<Option<Arc<crate::net::socket::InodeSocketInner>>>,
++}
++
++/// One direct-served subscription as a waiting thread needs it: the fd it
++/// reports under, the events it asked for, and the socket whose descriptor
++/// it polls.
++#[cfg(all(unix, feature = "direct-waits"))]
++pub(crate) struct DirectWatch {
++    pub(crate) fd: WasiFd,
++    pub(crate) events: EpollType,
++    pub(crate) socket: Arc<crate::net::socket::InodeSocketInner>,
++    /// The subscription itself, so that what the poll reports is queued
++    /// only while this is still the set's subscription for `fd`.
++    pub(crate) sub_state: Arc<EpollSubState>,
+ }
+ 
+ impl EpollSubState {
+@@ -433,6 +701,10 @@ impl EpollSubState {
+             pending_bits: AtomicU8::new(0),
+             enqueued: AtomicBool::new(false),
+             generation: AtomicU64::new(generation),
++            #[cfg(all(unix, feature = "direct-waits"))]
++            direct: AtomicBool::new(false),
++            #[cfg(all(unix, feature = "direct-waits"))]
++            direct_socket: StdMutex::new(None),
+         }
+     }
+ 
+@@ -457,6 +729,34 @@ impl EpollSubState {
+         self.generation.load(Ordering::Acquire)
+     }
+ 
++    /// Whether this subscription is served by the waiting thread's own
++    /// poll of the socket's host descriptor rather than by the selector.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    pub(crate) fn is_direct(&self) -> bool {
++        self.direct.load(Ordering::SeqCst)
++    }
++
++    /// Marks the subscription direct-served and names the socket the
++    /// waiting thread polls. The socket is stored first, so that a thread
++    /// that sees the flag finds the socket that goes with it.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    fn set_direct(&self, socket: Arc<crate::net::socket::InodeSocketInner>) {
++        *self.direct_socket.lock().unwrap() = Some(socket);
++        self.direct.store(true, Ordering::SeqCst);
++    }
++
++    #[cfg(all(unix, feature = "direct-waits"))]
++    fn clear_direct(&self) {
++        self.direct.store(false, Ordering::SeqCst);
++        *self.direct_socket.lock().unwrap() = None;
++    }
++
++    /// The socket a direct-served subscription is polled on.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    fn direct_socket(&self) -> Option<Arc<crate::net::socket::InodeSocketInner>> {
++        self.direct_socket.lock().unwrap().clone()
++    }
++
+     pub(crate) fn fd_meta(&self) -> EpollFd {
+         self.fd_meta.lock().unwrap().clone()
+     }
+@@ -704,6 +1004,163 @@ impl InterestHandler for EpollHandler {
+     }
+ }
+ 
++/// Whether a subscription could be served by the thread that waits on it,
++/// polling the socket's host descriptor, leaving everything to do with it
++/// out of the shared selector.
++///
++/// Only a socket the backend can name a descriptor for, and only
++/// level-triggered: `poll(2)` reports a level, so an edge-triggered or
++/// one-shot subscription is not what it answers and keeps the selector's
++/// registration and the pending-bit approximation that goes with it.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_candidate(
++    mode: &InodeValFilePollGuardMode,
++    events: EpollType,
++) -> Option<Arc<crate::net::socket::InodeSocketInner>> {
++    let InodeValFilePollGuardMode::Socket { inner, .. } = mode else {
++        return None;
++    };
++    if events.intersects(EpollType::EPOLLET | EpollType::EPOLLONESHOT) {
++        return None;
++    }
++    inner.protected.read().unwrap().host_fd()?;
++    Some(inner.clone())
++}
++
++/// Decides whether this subscription is direct-served and marks it if so.
++///
++/// The runtime must be one that can perform the wait at all, which is what
++/// keeps a platform without it on exactly the path it had before.
++///
++/// The marking happens before the count of threads in the general wait is
++/// read, and a thread entering that wait counts itself in before it reads
++/// these flags. Of those two orders one must see the other, so a
++/// subscription cannot become direct-served behind the back of a thread
++/// already asleep in a wait that nothing would wake for it.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn claim_direct_serving(
++    epoll_state: &EpollState,
++    sub_state: &EpollSubState,
++    mode: &InodeValFilePollGuardMode,
++    events: EpollType,
++) -> bool {
++    claim_direct_serving_when(
++        wasmer_vm::can_suspend_on_pollfd(),
++        epoll_state,
++        sub_state,
++        mode,
++        events,
++    )
++}
++
++/// The body of `claim_direct_serving`, with the wait's availability passed
++/// in rather than asked for, so that a test can drive both answers.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn claim_direct_serving_when(
++    available: bool,
++    epoll_state: &EpollState,
++    sub_state: &EpollSubState,
++    mode: &InodeValFilePollGuardMode,
++    events: EpollType,
++) -> bool {
++    // A subscription restored after a failed change comes back through
++    // here already carrying the flag from the registration it had before.
++    // Only the decision below may set it, so it starts from nothing: a
++    // subscription left flagged and registered with the selector would be
++    // polled for a descriptor it no longer has.
++    sub_state.clear_direct();
++    if !available {
++        return false;
++    }
++    let Some(socket) = direct_candidate(mode, events) else {
++        return false;
++    };
++    sub_state.set_direct(socket);
++    if epoll_state.blocking_waiters() == 0 {
++        // A thread already polling this set's descriptors is polling the
++        // ones it resolved before this subscription existed, so it is told
++        // to look again: the generation catches a thread between listing
++        // and registering, and the notification wakes one already asleep.
++        // Nobody waiting leaves a permit, which costs the next wait one
++        // turn round its loop.
++        epoll_state.bump_direct_generation();
++        epoll_state.notify.notify_one();
++        tracing::debug!(
++            set = std::ptr::from_ref(epoll_state) as usize,
++            fd = sub_state.fd_meta().fd(),
++            "epoll subscription is served by the waiting thread"
++        );
++        return true;
++    }
++    sub_state.clear_direct();
++    tracing::debug!(
++        set = std::ptr::from_ref(epoll_state) as usize,
++        fd = sub_state.fd_meta().fd(),
++        reason = "blocking-waiter",
++        "epoll subscription refused direct serving"
++    );
++    false
++}
++
++/// Puts one epoll registration in the registry and, unless the subscription
++/// is direct-served, the registry's dispatcher on the watched source.
++///
++/// A direct-served subscription is the one case that keeps its place in the
++/// registry without putting anything on the source: the thread that waits
++/// polls the descriptor itself, and a registration here would put the
++/// socket into the shared selector, which is the cost being removed. It
++/// stays in the registry so that another set's registration on the same
++/// source still reaches it, and so that unsubscribing, popping and testing
++/// interest work as they do for every other subscription.
++fn install_epoll_handler(
++    registry: &Arc<EpollInterestRegistry>,
++    mode: &InodeValFilePollGuardMode,
++    handler: Box<dyn InterestHandler>,
++    direct: bool,
++) -> Result<u64, Errno> {
++    let registry_for_error = registry.clone();
++    registry.subscribe(handler, |handler| -> Result<(), Errno> {
++        match mode {
++            InodeValFilePollGuardMode::Socket { inner, .. } => {
++                if direct {
++                    return Ok(());
++                }
++                let mut inner = inner.protected.write().unwrap();
++                // Drop the previous registration before installing, so the
++                // source registers afresh and snapshots its current
++                // readiness: a handler swap alone replays nothing, and a
++                // registration arriving on a live descriptor — an interest
++                // switch after a request — must see the level-triggered
++                // state it joined.
++                inner.remove_handler();
++                if let Err(error) = inner.set_handler(handler) {
++                    // The old registration is already gone; leave a
++                    // dispatcher behind on a best-effort basis so the
++                    // failure deafens only this subscription, not every
++                    // registration on the descriptor.
++                    let _ = inner.set_handler(Box::new(EpollInterestDispatcher::new(
++                        registry_for_error.clone(),
++                    )));
++                    return Err(net_error_into_io_err(error).into());
++                }
++            }
++            InodeValFilePollGuardMode::EventNotifications(inner) => {
++                inner.set_interest_handler(handler)
++            }
++            InodeValFilePollGuardMode::DuplexPipe { pipe } => {
++                pipe.write().unwrap().set_interest_handler(handler)
++            }
++            InodeValFilePollGuardMode::PipeRx { rx } => {
++                rx.write().unwrap().set_interest_handler(handler)
++            }
++            InodeValFilePollGuardMode::File(_) | InodeValFilePollGuardMode::PipeTx { .. } => {
++                unreachable!("unsupported epoll source passed the initial mode check")
++            }
++        }
++        Ok(())
++    })
++}
++
+ /// Registers an epoll interest handler on the watched fd and returns a guard.
+ ///
+ /// `None` means the fd kind does not support handler attachment for epoll.
+@@ -712,6 +1169,32 @@ pub(crate) fn register_epoll_handler(
+     event: &EpollFd,
+     epoll_state: Arc<EpollState>,
+     sub_state: Arc<EpollSubState>,
++) -> Result<Option<EpollJoinGuard>, Errno> {
++    register_epoll_handler_inner(state, event, epoll_state, sub_state, true, None)
++}
++
++/// Whether the guard resolved a number to `expected`, which a demotion
++/// asks before it installs a registration: the subscription was polled on
++/// `expected`, and a number that now names another socket must not carry
++/// the subscription over to it.
++fn same_socket(
++    mode: &InodeValFilePollGuardMode,
++    expected: &Arc<crate::net::socket::InodeSocketInner>,
++) -> bool {
++    matches!(mode, InodeValFilePollGuardMode::Socket { inner } if Arc::ptr_eq(inner, expected))
++}
++
++/// The body of `register_epoll_handler`, with the choice of serving the
++/// subscription directly left to the caller: demotion registers through
++/// here with the choice refused, so that what it installs is exactly what
++/// registration installs for everything else.
++fn register_epoll_handler_inner(
++    state: &Arc<WasiState>,
++    event: &EpollFd,
++    epoll_state: Arc<EpollState>,
++    sub_state: Arc<EpollSubState>,
++    allow_direct: bool,
++    expected_socket: Option<&Arc<crate::net::socket::InodeSocketInner>>,
+ ) -> Result<Option<EpollJoinGuard>, Errno> {
+     let registry = state.fs.get_fd_inode(event.fd())?.epoll_interest.clone();
+     let mut type_ = Eventtype::FdRead;
+@@ -739,6 +1222,11 @@ pub(crate) fn register_epoll_handler(
+     };
+ 
+     let fd_guard = poll_fd_guard(state, peb.build(), event.fd(), s)?;
++    if let Some(expected) = expected_socket
++        && !same_socket(&fd_guard.mode, expected)
++    {
++        return Err(Errno::Badf);
++    }
+     let handler = EpollHandler::new(event.fd(), epoll_state.clone(), sub_state.clone());
+ 
+     match &fd_guard.mode {
+@@ -756,44 +1244,16 @@ pub(crate) fn register_epoll_handler(
+         _ => {}
+     }
+ 
+-    let registry_for_error = registry.clone();
+-    let registration = registry.subscribe(handler, |handler| -> Result<(), Errno> {
+-        match &fd_guard.mode {
+-            InodeValFilePollGuardMode::Socket { inner, .. } => {
+-                let mut inner = inner.protected.write().unwrap();
+-                // Drop the previous registration before installing, so the
+-                // source registers afresh and snapshots its current
+-                // readiness: a handler swap alone replays nothing, and a
+-                // registration arriving on a live descriptor — an interest
+-                // switch after a request — must see the level-triggered
+-                // state it joined.
+-                inner.remove_handler();
+-                if let Err(error) = inner.set_handler(handler) {
+-                    // The old registration is already gone; leave a
+-                    // dispatcher behind on a best-effort basis so the
+-                    // failure deafens only this subscription, not every
+-                    // registration on the descriptor.
+-                    let _ = inner.set_handler(Box::new(EpollInterestDispatcher::new(
+-                        registry_for_error.clone(),
+-                    )));
+-                    return Err(net_error_into_io_err(error).into());
+-                }
+-            }
+-            InodeValFilePollGuardMode::EventNotifications(inner) => {
+-                inner.set_interest_handler(handler)
+-            }
+-            InodeValFilePollGuardMode::DuplexPipe { pipe } => {
+-                pipe.write().unwrap().set_interest_handler(handler)
+-            }
+-            InodeValFilePollGuardMode::PipeRx { rx } => {
+-                rx.write().unwrap().set_interest_handler(handler)
+-            }
+-            InodeValFilePollGuardMode::File(_) | InodeValFilePollGuardMode::PipeTx { .. } => {
+-                unreachable!("unsupported epoll source passed the initial mode check")
+-            }
+-        }
+-        Ok(())
+-    })?;
++    #[cfg(all(unix, feature = "direct-waits"))]
++    let direct = allow_direct
++        && claim_direct_serving(&epoll_state, &sub_state, &fd_guard.mode, event.events());
++    #[cfg(not(all(unix, feature = "direct-waits")))]
++    let direct = {
++        let _ = allow_direct;
++        false
++    };
++
++    let registration = install_epoll_handler(&registry, &fd_guard.mode, handler, direct)?;
+ 
+     prime_immediate_writable_if_applicable(event, &fd_guard, &epoll_state, &sub_state);
+ 
+@@ -845,6 +1305,500 @@ mod tests {
+         (epoll_state, sub_state, handler)
+     }
+ 
++    fn test_sub_state_for(fd: WasiFd, events: EpollType) -> Arc<EpollSubState> {
++        Arc::new(EpollSubState::new(EpollFd::new(events, 0, fd, 0, 0), 1))
++    }
++
++    /// A subscription already marked direct-served on a socket of its own,
++    /// which is returned so that the caller keeps it alive.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    fn test_direct_sub_state(
++        fd: WasiFd,
++        events: EpollType,
++    ) -> (Arc<EpollSubState>, crate::net::socket::InodeSocket) {
++        let (socket, _handler) = crate::net::socket::tests::host_descriptor_socket();
++        let sub_state = test_sub_state_for(fd, events);
++        sub_state.set_direct(socket.inner.clone());
++        (sub_state, socket)
++    }
++
++    /// The mode of a subscription on a socket the host can name a
++    /// descriptor for, and the socket's handler slot.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    fn test_socket_mode() -> (
++        InodeValFilePollGuardMode,
++        crate::net::socket::tests::MockHandlerSlot,
++        crate::net::socket::InodeSocket,
++    ) {
++        let (socket, handler) = crate::net::socket::tests::host_descriptor_socket();
++        let mode = InodeValFilePollGuardMode::Socket {
++            inner: socket.inner.clone(),
++        };
++        (mode, handler, socket)
++    }
++
++    /// A direct-served subscription puts nothing on the socket: the thread
++    /// that waits polls the descriptor itself, and a handler here would put
++    /// the socket back into the shared selector. It still takes its place
++    /// in the registry, so that everything else about the subscription
++    /// works as it does for any other.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn a_direct_served_subscription_installs_no_handler() {
++        let (mode, slot, _socket) = test_socket_mode();
++        let epoll_state = Arc::new(EpollState::new());
++        let sub_state = test_sub_state_for(4, EpollType::EPOLLIN);
++        epoll_state.insert_subscription(4, sub_state.clone());
++        let handler = EpollHandler::new(4, epoll_state.clone(), sub_state);
++        let registry = Arc::new(EpollInterestRegistry::default());
++
++        install_epoll_handler(&registry, &mode, handler, true).unwrap();
++
++        assert!(slot.lock().unwrap().is_none());
++        assert_eq!(registry.handler_count(), 1);
++    }
++
++    /// The same registration without the direct serving is the one main
++    /// makes: the dispatcher goes on the socket.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn a_selector_served_subscription_installs_the_handler() {
++        let (mode, slot, _socket) = test_socket_mode();
++        let epoll_state = Arc::new(EpollState::new());
++        let sub_state = test_sub_state_for(4, EpollType::EPOLLIN);
++        epoll_state.insert_subscription(4, sub_state.clone());
++        let handler = EpollHandler::new(4, epoll_state.clone(), sub_state);
++        let registry = Arc::new(EpollInterestRegistry::default());
++
++        install_epoll_handler(&registry, &mode, handler, false).unwrap();
++
++        assert!(slot.lock().unwrap().is_some());
++        assert_eq!(registry.handler_count(), 1);
++    }
++
++    /// What a waiting thread reports off a descriptor reaches the guest as
++    /// the events the subscription asked for, hangup and error among them.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn produced_readiness_drains_as_events() {
++        let epoll_state = Arc::new(EpollState::new());
++        let sub_state = test_sub_state_for(
++            4,
++            EpollType::EPOLLIN | EpollType::EPOLLOUT | EpollType::EPOLLHUP | EpollType::EPOLLERR,
++        );
++        epoll_state.insert_subscription(4, sub_state.clone());
++        assert!(epoll_state.watched_direct().is_empty());
++        let (socket, _handler) = crate::net::socket::tests::host_descriptor_socket();
++        sub_state.set_direct(socket.inner.clone());
++        assert_eq!(
++            epoll_state.watched_direct(),
++            vec![(
++                4,
++                EpollType::EPOLLIN
++                    | EpollType::EPOLLOUT
++                    | EpollType::EPOLLHUP
++                    | EpollType::EPOLLERR
++            )]
++        );
++
++        epoll_state.produce(4, &sub_state, EpollType::EPOLLIN);
++        assert!(epoll_state.has_ready());
++        let events = drain_ready_events(&epoll_state, 8);
++        assert_eq!(events.len(), 1);
++        assert_eq!(events[0].0.fd(), 4);
++        assert_eq!(events[0].1, EpollType::EPOLLIN);
++
++        epoll_state.produce(4, &sub_state, EpollType::EPOLLHUP | EpollType::EPOLLERR);
++        let events = drain_ready_events(&epoll_state, 8);
++        assert_eq!(events.len(), 1);
++        assert_eq!(events[0].1, EpollType::EPOLLHUP | EpollType::EPOLLERR);
++
++        // Nothing produced is nothing queued, and a fd the set does not
++        // watch is not a subscription to report.
++        epoll_state.produce(4, &sub_state, EpollType::empty());
++        epoll_state.produce(9, &sub_state, EpollType::EPOLLIN);
++        assert!(!epoll_state.has_ready());
++    }
++
++    /// Readiness is queued only while the subscription that was polled is
++    /// still the set's subscription for that number: a delete and add of the
++    /// same number under a wait must not hand the old socket's readiness to
++    /// the new subscription under its userdata.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn readiness_for_a_replaced_subscription_is_dropped() {
++        let epoll_state = Arc::new(EpollState::new());
++        let old = test_sub_state_for(4, EpollType::EPOLLIN);
++        epoll_state.insert_subscription(4, old.clone());
++        let new = test_sub_state_for(4, EpollType::EPOLLIN);
++        epoll_state.insert_subscription(4, new.clone());
++
++        epoll_state.produce(4, &old, EpollType::EPOLLIN);
++        assert!(!epoll_state.has_ready());
++        epoll_state.produce(4, &new, EpollType::EPOLLIN);
++        assert!(epoll_state.has_ready());
++    }
++
++    /// Every change to what a waiting thread polls moves the generation it
++    /// compares after registering: a claim, a demotion, and an add, change
++    /// or delete of a subscription.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn every_change_to_the_watched_set_moves_the_generation() {
++        let (mode, _slot, _socket) = test_socket_mode();
++        let epoll_state = Arc::new(EpollState::new());
++        let before = epoll_state.direct_generation();
++
++        let (_, sub_state) = epoll_state
++            .prepare_add(4, &test_epoll_event_ctl(4))
++            .unwrap();
++        let after_add = epoll_state.direct_generation();
++        assert!(after_add > before);
++
++        assert!(claim_direct_serving_when(
++            true,
++            &epoll_state,
++            &sub_state,
++            &mode,
++            EpollType::EPOLLIN
++        ));
++        let after_claim = epoll_state.direct_generation();
++        assert!(after_claim > after_add);
++
++        assert_eq!(epoll_state.demote_direct_with(|_, _| Ok(None)), 1);
++        let after_demote = epoll_state.direct_generation();
++        assert!(after_demote > after_claim);
++
++        epoll_state
++            .prepare_mod(4, &test_epoll_event_ctl(4))
++            .unwrap();
++        let after_mod = epoll_state.direct_generation();
++        assert!(after_mod > after_demote);
++
++        epoll_state.apply_del(4).unwrap();
++        assert!(epoll_state.direct_generation() > after_mod);
++    }
++
++    /// A demotion installs its registration on the socket the subscription
++    /// was polled on and no other: a number that has come to name a
++    /// different socket fails the check, which reports the subscription
++    /// broken instead of attaching it to that socket.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn a_demotion_checks_the_number_still_names_its_socket() {
++        let (polled, _handler) = crate::net::socket::tests::host_descriptor_socket();
++        let (other, _other_handler) = crate::net::socket::tests::host_descriptor_socket();
++        let same = InodeValFilePollGuardMode::Socket {
++            inner: polled.inner.clone(),
++        };
++        let replaced = InodeValFilePollGuardMode::Socket {
++            inner: other.inner.clone(),
++        };
++        assert!(same_socket(&same, &polled.inner));
++        assert!(!same_socket(&replaced, &polled.inner));
++    }
++
++    /// Demotion gives the subscription the registration it went without and
++    /// clears the flag, and the selector's dispatch then reaches the set
++    /// exactly as it does for every other subscription.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn demotion_installs_the_handler_and_clears_the_flag() {
++        let (mode, slot, _socket) = test_socket_mode();
++        let epoll_state = Arc::new(EpollState::new());
++        let (sub_state, _sub_socket) = test_direct_sub_state(4, EpollType::EPOLLIN);
++        epoll_state.insert_subscription(4, sub_state.clone());
++        let registry = Arc::new(EpollInterestRegistry::default());
++        assert!(epoll_state.has_direct());
++
++        epoll_state.demote_direct_with(|event, sub_state| {
++            let handler = EpollHandler::new(event.fd(), epoll_state.clone(), sub_state.clone());
++            let registration = install_epoll_handler(&registry, &mode, handler, false)?;
++            Ok(Some(EpollJoinGuard::new(
++                test_poll_guard(event.fd()),
++                registry.clone(),
++                registration,
++            )))
++        });
++
++        assert!(!sub_state.is_direct());
++        assert!(!epoll_state.has_direct());
++        assert!(epoll_state.watched_direct().is_empty());
++
++        slot.lock()
++            .unwrap()
++            .as_mut()
++            .unwrap()
++            .push_interest(InterestType::Readable);
++        let events = drain_ready_events(&epoll_state, 8);
++        assert_eq!(events.len(), 1);
++        assert_eq!(events[0].0.fd(), 4);
++        assert!(events[0].1.contains(EpollType::EPOLLIN));
++    }
++
++    /// A demotion that cannot install the registration leaves the
++    /// subscription with nothing watching it at all, which is the one
++    /// state the invariant forbids. It is reported broken instead, so that
++    /// the general wait the caller is on its way into answers rather than
++    /// sleeps.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn a_demotion_that_fails_reports_the_subscription_broken() {
++        let epoll_state = Arc::new(EpollState::new());
++        let (sub_state, _socket) = test_direct_sub_state(4, EpollType::EPOLLIN);
++        epoll_state.insert_subscription(4, sub_state.clone());
++
++        assert_eq!(epoll_state.demote_direct_with(|_, _| Err(Errno::Badf)), 1);
++
++        assert!(!sub_state.is_direct());
++        let events = drain_ready_events(&epoll_state, 8);
++        assert_eq!(events.len(), 1);
++        assert_eq!(events[0].0.fd(), 4);
++        assert_eq!(events[0].1, EpollType::EPOLLERR | EpollType::EPOLLHUP);
++    }
++
++    /// A subscription restored after a failed change comes back through
++    /// the claim already carrying the flag from the registration it had.
++    /// A refused claim clears it, so it cannot end up flagged and
++    /// registered with the selector at the same time.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn a_refused_claim_clears_a_flag_the_subscription_arrived_with() {
++        let (mode, _slot, socket) = test_socket_mode();
++        let epoll_state = Arc::new(EpollState::new());
++        let sub_state = test_sub_state_for(4, EpollType::EPOLLIN);
++
++        // Without the wait: a restored subscription must not keep the
++        // flag either.
++        sub_state.set_direct(socket.inner.clone());
++        assert!(!claim_direct_serving_when(
++            false,
++            &epoll_state,
++            &sub_state,
++            &mode,
++            EpollType::EPOLLIN
++        ));
++        assert!(!sub_state.is_direct());
++
++        // With the wait, but on something that is not a candidate.
++        sub_state.set_direct(socket.inner.clone());
++        assert!(!claim_direct_serving_when(
++            true,
++            &epoll_state,
++            &sub_state,
++            &mode,
++            EpollType::EPOLLIN | EpollType::EPOLLET
++        ));
++        assert!(!sub_state.is_direct());
++        assert!(epoll_state.watched_direct().is_empty());
++    }
++
++    /// `poll(2)` reports a level, which is not what an edge-triggered or a
++    /// one-shot subscription asked for, so those keep the selector's
++    /// registration and the pending-bit approximation that goes with it.
++    /// Nor is anything but a socket with a host descriptor a candidate.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn only_a_level_triggered_host_socket_is_a_candidate() {
++        let (mode, _slot, socket) = test_socket_mode();
++        // The socket a claim would poll is the one the guard names, not
++        // whatever the fd table says the number means now.
++        assert!(Arc::ptr_eq(
++            &direct_candidate(&mode, EpollType::EPOLLIN).unwrap(),
++            &socket.inner
++        ));
++        assert!(direct_candidate(&mode, EpollType::EPOLLIN | EpollType::EPOLLOUT).is_some());
++        assert!(direct_candidate(&mode, EpollType::EPOLLIN | EpollType::EPOLLET).is_none());
++        assert!(direct_candidate(&mode, EpollType::EPOLLIN | EpollType::EPOLLONESHOT).is_none());
++
++        // A socket with no host descriptor behind it, and a pipe, which has
++        // none at all.
++        let socket = crate::net::socket::tests::close_tracking_socket(Arc::new(
++            std::sync::atomic::AtomicUsize::new(0),
++        ));
++        let no_fd = InodeValFilePollGuardMode::Socket {
++            inner: socket.inner.clone(),
++        };
++        assert!(direct_candidate(&no_fd, EpollType::EPOLLIN).is_none());
++        let (_tx, rx) = Pipe::new().split();
++        let pipe = InodeValFilePollGuardMode::PipeRx {
++            rx: Arc::new(RwLock::new(Box::new(rx))),
++        };
++        assert!(direct_candidate(&pipe, EpollType::EPOLLIN).is_none());
++    }
++
++    /// A runtime whose descriptor wait is not there serves nothing
++    /// directly, whatever the subscription looks like: a platform without
++    /// the wait, and a host that has turned it off, both take that path.
++    /// The subscription is a candidate in every other respect, so the
++    /// wait's absence is the whole of the refusal.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn nothing_is_direct_served_without_the_wait() {
++        let (mode, _slot, _socket) = test_socket_mode();
++        let epoll_state = Arc::new(EpollState::new());
++        let sub_state = test_sub_state_for(4, EpollType::EPOLLIN);
++
++        assert!(direct_candidate(&mode, EpollType::EPOLLIN).is_some());
++        assert!(!claim_direct_serving_when(
++            false,
++            &epoll_state,
++            &sub_state,
++            &mode,
++            EpollType::EPOLLIN
++        ));
++        assert!(!sub_state.is_direct());
++    }
++
++    /// A thread already inside the general wait cannot be woken by a
++    /// direct-served subscription, because nothing would report its
++    /// readiness, so one registered while a thread is there is not served
++    /// directly. This is one half of the invariant; the other is that a
++    /// thread entering the general wait demotes what it finds.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn a_subscription_added_during_the_general_wait_is_not_direct_served() {
++        let (mode, _slot, _socket) = test_socket_mode();
++        let epoll_state = Arc::new(EpollState::new());
++        let sub_state = test_sub_state_for(4, EpollType::EPOLLIN);
++
++        let blocking = epoll_state.enter_blocking();
++        assert!(!claim_direct_serving_when(
++            true,
++            &epoll_state,
++            &sub_state,
++            &mode,
++            EpollType::EPOLLIN
++        ));
++        assert!(!sub_state.is_direct());
++
++        drop(blocking);
++        assert!(claim_direct_serving_when(
++            true,
++            &epoll_state,
++            &sub_state,
++            &mode,
++            EpollType::EPOLLIN
++        ));
++        assert!(sub_state.is_direct());
++    }
++
++    /// The list a waiting thread polls is answered into the caller's array,
++    /// reporting a set larger than that array rather than filling it.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn the_watched_list_is_answered_into_the_callers_array() {
++        let (mode, _slot, socket) = test_socket_mode();
++        let epoll_state = Arc::new(EpollState::new());
++        let sub_state = test_sub_state_for(4, EpollType::EPOLLIN);
++        epoll_state.insert_subscription(4, sub_state.clone());
++        assert!(claim_direct_serving_when(
++            true,
++            &epoll_state,
++            &sub_state,
++            &mode,
++            EpollType::EPOLLIN
++        ));
++
++        let mut watched: [Option<DirectWatch>; 4] = std::array::from_fn(|_| None);
++        assert_eq!(epoll_state.watched_direct_into(&mut watched), 1);
++        let watch = watched[0].as_ref().unwrap();
++        assert_eq!(watch.fd, 4);
++        assert_eq!(watch.events, EpollType::EPOLLIN);
++        // The socket named is the guard's, which is what a waiting thread
++        // polls instead of resolving the fd number afresh.
++        assert!(Arc::ptr_eq(&watch.socket, &socket.inner));
++        assert_eq!(epoll_state.watched_direct_into(&mut watched[..0]), 1);
++
++        assert_eq!(epoll_state.demote_direct_with(|_, _| Ok(None)), 1);
++        assert!(!sub_state.is_direct());
++    }
++
++    #[derive(Default)]
++    struct CountingWaker(std::sync::atomic::AtomicUsize);
++
++    impl std::task::Wake for CountingWaker {
++        fn wake(self: Arc<Self>) {
++            self.wake_by_ref();
++        }
++
++        fn wake_by_ref(self: &Arc<Self>) {
++            self.0.fetch_add(1, Ordering::SeqCst);
++        }
++    }
++
++    /// The set a direct wait is built for: a socket the waiting thread
++    /// polls itself and a pipe that has no descriptor at all. The pipe's
++    /// write from another thread reaches the set's notifier, which is where
++    /// the waiting thread's waker is registered, so it is what ends the
++    /// wait; the drain that follows reports the pipe and nothing else.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn a_pipe_in_a_mixed_set_ends_the_wait_and_is_drained() {
++        let epoll_state = Arc::new(EpollState::new());
++        let (socket_sub, _socket) = test_direct_sub_state(4, EpollType::EPOLLIN);
++        let pipe_sub = test_sub_state_for(9, EpollType::EPOLLIN);
++        epoll_state.insert_subscription(4, socket_sub);
++        epoll_state.insert_subscription(9, pipe_sub.clone());
++
++        let (mut tx, rx) = Pipe::new().split();
++        let rx = Arc::new(RwLock::new(Box::new(rx)));
++        rx.write().unwrap().set_interest_handler(EpollHandler::new(
++            9,
++            epoll_state.clone(),
++            pipe_sub,
++        ));
++
++        // The order the direct wait uses: register on the notifier, then
++        // look at what is already queued.
++        let counter = Arc::new(CountingWaker::default());
++        let waker = std::task::Waker::from(counter.clone());
++        let mut cx = std::task::Context::from_waker(&waker);
++        let mut notified = Box::pin(epoll_state.notified());
++        assert!(std::future::Future::poll(notified.as_mut(), &mut cx).is_pending());
++        assert!(!epoll_state.has_ready());
++
++        std::thread::spawn(move || std::io::Write::write_all(&mut tx, b"latch"))
++            .join()
++            .unwrap()
++            .unwrap();
++
++        assert!(counter.0.load(Ordering::SeqCst) >= 1);
++        assert!(epoll_state.has_ready());
++        let events = drain_ready_events(&epoll_state, 8);
++        assert_eq!(events.len(), 1);
++        assert_eq!(events[0].0.fd(), 9);
++        assert!(events[0].1.contains(EpollType::EPOLLIN));
++        drop(rx);
++    }
++
++    /// A notification left by a producer with no waiter is a permit, and
++    /// polling the future takes it rather than registering anything. A
++    /// direct wait that ignored that would sleep with nothing registered to
++    /// wake it, so it must go round again instead.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    #[test]
++    fn a_waiting_notification_completes_the_future_instead_of_registering() {
++        let (epoll_state, sub_state, mut handler) = test_epoll_handler(4);
++        epoll_state.insert_subscription(4, sub_state);
++
++        // A producer that arrived while nobody was waiting: the queue entry
++        // is drained by someone else, and only the permit is left.
++        handler.push_interest(InterestType::Readable);
++        let _ = drain_ready_events(&epoll_state, 8);
++        assert!(!epoll_state.has_ready());
++
++        let counter = Arc::new(CountingWaker::default());
++        let waker = std::task::Waker::from(counter);
++        let mut cx = std::task::Context::from_waker(&waker);
++        let mut notified = Box::pin(epoll_state.notified());
++        assert!(std::future::Future::poll(notified.as_mut(), &mut cx).is_ready());
++
++        // And with nothing left, the next future registers instead.
++        let mut notified = Box::pin(epoll_state.notified());
++        assert!(std::future::Future::poll(notified.as_mut(), &mut cx).is_pending());
++    }
++
+     fn test_poll_guard(fd: WasiFd) -> InodeValFilePollGuard {
+         let (tx, _rx) = Pipe::new().split();
+         InodeValFilePollGuard {
+diff --git a/lib/wasix/src/os/task/thread.rs b/lib/wasix/src/os/task/thread.rs
+index ef4c5e5..dbca714 100644
+--- a/lib/wasix/src/os/task/thread.rs
++++ b/lib/wasix/src/os/task/thread.rs
+@@ -409,6 +409,14 @@ impl WasiThread {
+         self.state.signals_pending.load(Ordering::Acquire)
+     }
+ 
++    /// Ends this thread's waits without queueing a signal: readiness a
++    /// direct descriptor wait cannot see for itself has arrived, and the
++    /// wait must return so that its caller looks at everything again.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    pub(crate) fn interrupt_direct_wait(&self) {
++        self.interrupt_waits();
++    }
++
+     fn interrupt_waits(&self) {
+         self.state.wait_interrupt.fetch_add(1, Ordering::SeqCst);
+         #[cfg(feature = "direct-waits")]
+diff --git a/lib/wasix/src/syscalls/wasix/epoll_wait.rs b/lib/wasix/src/syscalls/wasix/epoll_wait.rs
+index d1b56a3..75f6213 100644
+--- a/lib/wasix/src/syscalls/wasix/epoll_wait.rs
++++ b/lib/wasix/src/syscalls/wasix/epoll_wait.rs
+@@ -1,16 +1,371 @@
+ use wasmer_wasix_types::wasi::{EpollData, EpollEvent, EpollType, SubscriptionClock, Userdata};
+ 
+ use super::*;
++#[cfg(all(unix, feature = "direct-waits"))]
++use crate::os::epoll::DirectWatch;
+ use crate::{
+     WasiInodes,
+     fs::{InodeValFilePollGuard, InodeValFilePollGuardJoin},
+-    os::epoll::{EpollFd, drain_ready_events},
++    os::epoll::{EpollFd, EpollState, drain_ready_events},
+     state::PollEventSet,
+     syscalls::*,
+ };
+ 
+ const TIMEOUT_FOREVER: u64 = u64::MAX;
+ 
++/// What the direct wait did with the call.
++#[cfg(all(unix, feature = "direct-waits"))]
++enum DirectEpoll {
++    /// The events to report to the guest, which an elapsed deadline leaves
++    /// empty.
++    Events(Vec<(EpollFd, EpollType)>),
++    /// The call ends with this error code, which processing a signal asked
++    /// for.
++    Errno(Errno),
++    /// Nothing in the set is direct-served, or everything in it has just
++    /// been demoted: the existing path runs exactly as it would have.
++    Fallthrough,
++}
++
++/// The most descriptors one call polls for itself, which is what the host's
++/// wait accepts alongside its own interrupt descriptor. A set with more
++/// direct-served subscriptions than this is demoted to the selector
++/// rather than truncated: a truncated wait would sleep through the
++/// descriptors it dropped.
++#[cfg(all(unix, feature = "direct-waits"))]
++const DIRECT_POLL_CAP: usize = wasmer_vm::HOST_POLL_FDS_MAX;
++
++/// A `Waker` for a thread inside a direct descriptor wait.
++///
++/// Everything in the set that is not direct-served -- a pipe, an event
++/// notification, another set's edge dispatched through the registry --
++/// reports readiness by queueing it and notifying the set, which is where
++/// this waker is registered. Waking it ends the descriptor wait through the
++/// thread's interrupt generation, and the waiting thread then looks at the
++/// whole set again.
++///
++/// It is safe to wake at any point, including before the thread reaches the
++/// wait: the generation is captured before the waker is registered, so a
++/// wake in between is one the wait itself sees and returns on.
++#[cfg(all(unix, feature = "direct-waits"))]
++#[derive(Debug)]
++struct DirectPollWaker {
++    thread: crate::WasiThread,
++}
++
++#[cfg(all(unix, feature = "direct-waits"))]
++impl std::task::Wake for DirectPollWaker {
++    fn wake(self: Arc<Self>) {
++        self.wake_by_ref();
++    }
++
++    fn wake_by_ref(self: &Arc<Self>) {
++        self.thread.interrupt_direct_wait();
++    }
++}
++
++/// The events to ask a host descriptor for. Hangup and error are reported
++/// whether or not they are asked for, which is also how epoll delivers
++/// them, so only the two that must be requested are named here.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_wanted(events: EpollType) -> u16 {
++    let mut wanted = 0;
++    if events.contains(EpollType::EPOLLIN) {
++        wanted |= wasmer_vm::HOST_POLL_READ;
++    }
++    if events.contains(EpollType::EPOLLOUT) {
++        wanted |= wasmer_vm::HOST_POLL_WRITE;
++    }
++    wanted
++}
++
++/// What readiness bits off a host descriptor mean to a subscription.
++///
++/// Readable and writable are filtered by what the subscription asked for,
++/// as the drain filters them: producing a bit the subscription does not
++/// want would queue an entry that drains to no event, and the wait would
++/// find the same level again on its next turn and never finish. Hangup and
++/// error are reported whatever was asked for, exactly as the drain reports
++/// them.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_readiness(bits: u16, events: EpollType) -> EpollType {
++    let mut readiness = EpollType::empty();
++    if bits & wasmer_vm::HOST_POLL_READ != 0 && events.contains(EpollType::EPOLLIN) {
++        readiness |= EpollType::EPOLLIN;
++    }
++    if bits & wasmer_vm::HOST_POLL_WRITE != 0 && events.contains(EpollType::EPOLLOUT) {
++        readiness |= EpollType::EPOLLOUT;
++    }
++    if bits & wasmer_vm::HOST_POLL_HUP != 0 {
++        readiness |= EpollType::EPOLLHUP;
++    }
++    if bits & wasmer_vm::HOST_POLL_ERR != 0 {
++        readiness |= EpollType::EPOLLERR;
++    }
++    readiness
++}
++
++/// One event per call, saying which path answered it and with what.
++///
++/// Scalar fields only, and not recorded on the span: the fields are not
++/// built unless something is listening, so a run with tracing off pays a
++/// level check per call. `outcome` is `events`, `timeout`, `errno`, or
++/// `fallthrough` for the direct branch handing the call to the existing
++/// path - the one case that logs twice, once for the demotion and once for
++/// the answer that follows it.
++fn trace_epoll_call(epfd: WasiFd, direct: bool, outcome: &'static str, nevents: usize) {
++    tracing::trace!(epfd, direct, outcome, nevents, "epoll wait answered");
++}
++
++/// How an answer reads as an outcome for `trace_epoll_call`.
++fn epoll_outcome(events: &Result<Vec<(EpollFd, EpollType)>, Errno>) -> (&'static str, usize) {
++    match events {
++        Ok(events) if events.is_empty() => ("timeout", 0),
++        Ok(events) => ("events", events.len()),
++        Err(Errno::Timedout) => ("timeout", 0),
++        Err(_) => ("errno", 0),
++    }
++}
++
++/// Hands every direct-served subscription in the set back to the selector
++/// and says why, so that a run that stopped serving itself can be told from
++/// one that never started.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn demote_with_reason(
++    epoll_state: &Arc<EpollState>,
++    state: &Arc<WasiState>,
++    epfd: WasiFd,
++    reason: &'static str,
++) {
++    let demoted = epoll_state.demote_direct(state);
++    tracing::debug!(
++        epfd,
++        reason,
++        demoted,
++        "epoll subscriptions demoted to the selector"
++    );
++}
++
++/// The host descriptor a direct-served subscription is polled on.
++///
++/// The socket comes from the subscription itself, which named it when it
++/// was claimed: resolving the fd number again would take whatever socket
++/// that number means now, and a guest that closes a watched fd leaves the
++/// subscription behind for the next socket to inherit.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_target(socket: &crate::net::socket::InodeSocketInner) -> Option<std::os::fd::RawFd> {
++    socket.protected.read().unwrap().host_fd()
++}
++
++/// Waits for the set on the guest thread, polling the host descriptors of
++/// its direct-served subscriptions itself.
++///
++/// A direct-served subscription has no registration in the shared selector
++/// (see `os::epoll::claim_direct_serving`), so this loop is the only thing
++/// that can report its readiness: nothing else is watching the descriptor.
++/// That is what the invariant below protects.
++///
++/// **Invariant.** The existing path's blocking wait is never entered while
++/// a direct-served subscription exists in the set. Every way out of this
++/// loop either answers the call or demotes the whole set first, and a
++/// subscription cannot become direct-served while a thread is in the
++/// existing path, so there is no state in which a socket has neither a
++/// selector registration nor a thread polling it.
++///
++/// The deadline is the guest's own, and an elapsed one is what a
++/// zero-timeout call gets: the loop then reports the readiness the
++/// descriptors hold right now and answers with no events rather than
++/// sleeping.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn direct_epoll_wait(
++    ctx: &mut FunctionEnvMut<'_, WasiEnv>,
++    epoll_state: &Arc<EpollState>,
++    epfd: WasiFd,
++    maxevents: usize,
++    timeout: Timestamp,
++) -> Result<DirectEpoll, WasiError> {
++    let state = ctx.data().state.clone();
++    // A journalled call records its wait through the existing path, and a
++    // runtime without the wait has nothing to poll with.
++    if !wasmer_vm::can_suspend_on_pollfd() {
++        demote_with_reason(epoll_state, &state, epfd, "wait-unavailable");
++        return Ok(DirectEpoll::Fallthrough);
++    }
++    if ctx.data().enable_journal {
++        demote_with_reason(epoll_state, &state, epfd, "journal");
++        return Ok(DirectEpoll::Fallthrough);
++    }
++    // Computed once: recomputing it each turn would push the guest's
++    // deadline forward every time the wait went round.
++    let deadline = if timeout == TIMEOUT_FOREVER {
++        None
++    } else {
++        match Instant::now().checked_add(Duration::from_nanos(timeout)) {
++            Some(deadline) => Some(deadline),
++            None => {
++                demote_with_reason(epoll_state, &state, epfd, "deadline-overflow");
++                return Ok(DirectEpoll::Fallthrough);
++            }
++        }
++    };
++
++    // Built once for the call, not once per turn: it names this thread,
++    // which does not change, and an `Arc` for every turn of every wait was
++    // an allocation on the request path.
++    let waker = std::task::Waker::from(Arc::new(DirectPollWaker {
++        thread: ctx.data().thread.clone(),
++    }));
++
++    // Rebuilt from nothing on every turn. `watched` keeps each socket alive
++    // while its descriptor is in a wait, so a guest thread closing the fd
++    // cannot leave this one blocked on a number the kernel has reused.
++    let mut watched: [Option<DirectWatch>; DIRECT_POLL_CAP] = std::array::from_fn(|_| None);
++    let mut fds = [wasmer_vm::HostPollFd::default(); DIRECT_POLL_CAP];
++
++    loop {
++        // A dlopen or dlclose in another thread holds the whole guest at a
++        // barrier that only this call reaches, so it is reached on every
++        // turn: the existing path runs it on every wake for the same
++        // reason.
++        WasiEnv::do_pending_link_operations(ctx, false)?;
++
++        let events = drain_ready_events(epoll_state, maxevents);
++        if !events.is_empty() {
++            return Ok(DirectEpoll::Events(events));
++        }
++
++        // Resolved afresh every turn: subscriptions come and go, and the
++        // socket behind one can be replaced by a fork. The generation read
++        // first is compared once this thread is registered to be woken, so
++        // a change that lands in between - one whose notification another
++        // waiter may have taken - sends this turn round again.
++        let generation = epoll_state.direct_generation();
++        let count = epoll_state.watched_direct_into(&mut watched);
++        if count == 0 {
++            return Ok(DirectEpoll::Fallthrough);
++        }
++        if count > DIRECT_POLL_CAP {
++            // The host's wait refuses a set this size rather than truncate
++            // it, so refusing it here reaches the same place without the
++            // call.
++            demote_with_reason(epoll_state, &state, epfd, "set-too-large");
++            return Ok(DirectEpoll::Fallthrough);
++        }
++        // Anything the last turn held past `count` is let go here rather
++        // than at the end of the call.
++        for slot in watched[count..].iter_mut() {
++            *slot = None;
++        }
++        for (slot, watch) in fds[..count].iter_mut().zip(watched[..count].iter()) {
++            let host_fd = watch
++                .as_ref()
++                .and_then(|watch| direct_target(&watch.socket));
++            let (Some(watch), Some(host_fd)) = (watch.as_ref(), host_fd) else {
++                // The socket is gone or is no longer one the host can name
++                // a descriptor for. Nothing here can report its readiness,
++                // so the whole set goes back to the selector.
++                demote_with_reason(epoll_state, &state, epfd, "descriptor-unresolvable");
++                return Ok(DirectEpoll::Fallthrough);
++            };
++            *slot = wasmer_vm::HostPollFd {
++                fd: host_fd,
++                events: direct_wanted(watch.events),
++                revents: 0,
++                nbytes: 0,
++            };
++        }
++
++        // Captured before the checks below and before registering, so
++        // anything arriving in between changes it and the wait returns at
++        // once. A termination moves it without queueing a signal, which is
++        // why a finished thread is asked about here too.
++        let wait_interrupt = ctx.data().thread.wait_interrupt();
++        if ctx.data().thread.signals_pending() || ctx.data().should_exit().is_some() {
++            if let Err(errno) = WasiEnv::process_signals_and_exit(ctx)? {
++                return Ok(DirectEpoll::Errno(errno));
++            }
++            if ctx.data().thread.signals_pending() {
++                // A signal the runtime cannot deliver right now stays
++                // queued, and looking at it again here would spin.
++                demote_with_reason(epoll_state, &state, epfd, "signal-undeliverable");
++                return Ok(DirectEpoll::Fallthrough);
++            }
++            continue;
++        }
++
++        let epoch = wasmer_vm::pollfd_epoch();
++        // Register on the notifier, then look: a producer arriving in
++        // between wakes this thread instead of being slept through. A
++        // notification already waiting completes the future and is consumed
++        // by that, so that case goes round rather than sleeping unregistered.
++        let mut cx = Context::from_waker(&waker);
++        let mut notified = std::pin::pin!(epoll_state.notified());
++        if notified.as_mut().poll(&mut cx).is_ready()
++            || epoll_state.has_ready()
++            || epoll_state.direct_generation() != generation
++        {
++            continue;
++        }
++        // SAFETY: every descriptor belongs to a socket held in `watched`
++        // for the whole call, and the interrupt word belongs to this
++        // thread, which is the one suspending.
++        let result = unsafe {
++            wasmer_vm::try_suspend_on_pollfd(
++                &mut fds[..count],
++                wait_interrupt.0,
++                wait_interrupt.1,
++                deadline,
++            )
++        };
++        match result {
++            // The wait answered for every descriptor, so what fired is read
++            // out of the array rather than off the sockets again.
++            Some(wasmer_vm::HostPollFdResult::Ready) => {
++                let mut any = false;
++                for (entry, watch) in fds[..count].iter().zip(watched[..count].iter()) {
++                    let Some(watch) = watch.as_ref() else {
++                        continue;
++                    };
++                    let readiness = direct_readiness(entry.revents, watch.events);
++                    if !readiness.is_empty() {
++                        epoll_state.produce(watch.fd, &watch.sub_state, readiness);
++                        any = true;
++                    }
++                }
++                // Drained here rather than by another turn, which would
++                // rebuild the list only to find what this one queued.
++                // Answering the call is an exit the invariant allows; when
++                // nothing drains, the loop goes round as before.
++                if any {
++                    let events = drain_ready_events(epoll_state, maxevents);
++                    if !events.is_empty() {
++                        return Ok(DirectEpoll::Events(events));
++                    }
++                }
++            }
++            // A signal, a termination, or a producer's waker. The next turn
++            // finds whatever it left, and was told to look.
++            Some(wasmer_vm::HostPollFdResult::Interrupted) => {
++                if let Err(errno) = WasiEnv::process_signals_and_exit(ctx)? {
++                    return Ok(DirectEpoll::Errno(errno));
++                }
++            }
++            Some(wasmer_vm::HostPollFdResult::TimedOut) => {
++                return Ok(DirectEpoll::Events(Vec::new()));
++            }
++            Some(wasmer_vm::HostPollFdResult::Unavailable) | None => {
++                // A fork rebuilt the networking under the wait, so the
++                // descriptors are resolved again rather than given up on.
++                if wasmer_vm::pollfd_epoch() != epoch {
++                    continue;
++                }
++                demote_with_reason(epoll_state, &state, epfd, "host-unavailable");
++                return Ok(DirectEpoll::Fallthrough);
++            }
++        }
++    }
++}
++
+ /// ### `epoll_wait()`
+ /// Wait for an I/O event on an epoll file descriptor
+ #[instrument(level = "trace", skip_all, fields(timeout_ms = field::Empty, fd_guards = field::Empty, seen = field::Empty), ret)]
+@@ -46,42 +401,6 @@ pub fn epoll_wait<M: MemorySize + 'static>(
+         }
+     };
+ 
+-    // We enter a controlled loop that will continuously poll and react to
+-    // epoll events until something of interest needs to be returned to the
+-    // caller or a timeout happens
+-    let work = {
+-        async move {
+-            // Loop until some events of interest are returned
+-            loop {
+-                let ret = drain_ready_events(&epoll_state, maxevents);
+-                if !ret.is_empty() {
+-                    return Ok(ret);
+-                }
+-
+-                epoll_state.wait().await;
+-            }
+-        }
+-    };
+-
+-    // Build the trigger using the timeout
+-    let trigger = {
+-        let timeout = if timeout == TIMEOUT_FOREVER {
+-            None
+-        } else {
+-            Some(ctx.data().tasks().sleep_now(Duration::from_nanos(timeout)))
+-        };
+-        async move {
+-            if let Some(timeout) = timeout {
+-                tokio::select! {
+-                    res = work => res,
+-                    _ = timeout => Err(Errno::Timedout)
+-                }
+-            } else {
+-                work.await
+-            }
+-        }
+-    };
+-
+     // We replace the process events callback with another callback
+     // which will interpret the error codes
+     let process_events = {
+@@ -136,21 +455,108 @@ pub fn epoll_wait<M: MemorySize + 'static>(
+         }
+     };
+ 
+-    // If we are rewound then its time to process them
++    // A call resumed from a deep sleep answers with what the wait it left
++    // behind produced, before anything else is looked at: that wait has
++    // released its count in the set by now, and a subscription claimed
++    // since must not start a second wait in front of an answer already
++    // made.
+     if let Some(events) =
+         unsafe { handle_rewind::<M, Result<Vec<(EpollFd, EpollType)>, Errno>>(&mut ctx) }
+     {
++        let (outcome, nevents) = epoll_outcome(&events);
++        trace_epoll_call(epfd, false, outcome, nevents);
+         return Ok(process_events(&ctx, events));
+     }
+ 
++    // Before any of the machinery below is built, see whether this thread
++    // can wait on the set's descriptors itself.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    if epoll_state.has_direct() {
++        match direct_epoll_wait(&mut ctx, &epoll_state, epfd, maxevents, timeout)? {
++            DirectEpoll::Events(events) => {
++                let outcome = if events.is_empty() {
++                    "timeout"
++                } else {
++                    "events"
++                };
++                trace_epoll_call(epfd, true, outcome, events.len());
++                return Ok(process_events(&ctx, Ok(events)));
++            }
++            DirectEpoll::Errno(errno) => {
++                trace_epoll_call(epfd, true, "errno", 0);
++                return Ok(errno);
++            }
++            DirectEpoll::Fallthrough => trace_epoll_call(epfd, false, "fallthrough", 0),
++        }
++    }
++
++    // Counted into the set before the flags are read, and held by the wait
++    // below for as long as it is pending - the future owns the guard, so a
++    // deep sleep that unwinds this frame does not end it - a subscription
++    // registered from another thread from here on is not direct-served,
++    // and one that became direct-served while this thread was on its way
++    // here is demoted before it can block. Either way the wait is never
++    // the only thing watching a socket that nothing reports readiness for.
++    #[cfg(all(unix, feature = "direct-waits"))]
++    let blocking = {
++        let blocking = epoll_state.enter_blocking();
++        if epoll_state.has_direct() {
++            let state = ctx.data().state.clone();
++            demote_with_reason(&epoll_state, &state, epfd, "blocking-waiter");
++        }
++        blocking
++    };
++
++    // We enter a controlled loop that will continuously poll and react to
++    // epoll events until something of interest needs to be returned to the
++    // caller or a timeout happens
++    let work = {
++        async move {
++            #[cfg(all(unix, feature = "direct-waits"))]
++            let _blocking = blocking;
++            // Loop until some events of interest are returned
++            loop {
++                let ret = drain_ready_events(&epoll_state, maxevents);
++                if !ret.is_empty() {
++                    return Ok(ret);
++                }
++
++                epoll_state.wait().await;
++            }
++        }
++    };
++
++    // Build the trigger using the timeout
++    let trigger = {
++        let timeout = if timeout == TIMEOUT_FOREVER {
++            None
++        } else {
++            Some(ctx.data().tasks().sleep_now(Duration::from_nanos(timeout)))
++        };
++        async move {
++            if let Some(timeout) = timeout {
++                tokio::select! {
++                    res = work => res,
++                    _ = timeout => Err(Errno::Timedout)
++                }
++            } else {
++                work.await
++            }
++        }
++    };
++
+     // We use asyncify with a deep sleep to wait on new IO events
+     let res = __asyncify_with_deep_sleep::<M, Result<Vec<(EpollFd, EpollType)>, Errno>, _>(
+         ctx,
+         Box::pin(trigger),
+     )?;
+     if let AsyncifyAction::Finish(mut ctx, events) = res {
++        let (outcome, nevents) = epoll_outcome(&events);
++        trace_epoll_call(epfd, false, outcome, nevents);
+         Ok(process_events(&ctx, events))
+     } else {
++        // The call has suspended; it is answered, and reported, when it is
++        // rewound above.
+         Ok(Errno::Success)
+     }
+ }

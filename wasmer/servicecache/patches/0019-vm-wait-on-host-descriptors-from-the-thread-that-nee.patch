@@ -1,0 +1,1830 @@
+Subject: vm: wait on host descriptors from the thread that needs them
+
+A guest thread blocked on a socket is woken through the shared event
+selector: the kernel wakes the selector's poll thread, which then wakes
+the guest thread, so one readiness event requires a handoff through the
+selector thread. This adds a wait that lets the thread block on the
+descriptors itself; no syscall uses it yet, so every guest behaves
+exactly as it did.
+
+`try_suspend_on_pollfd` in lib/vm/src/trap/suspend.rs is the descriptor
+counterpart of the direct futex wait: `ppoll(2)` in
+lib/vm/src/trap/pollfd.rs over the descriptors the caller named plus one
+interrupt eventfd per thread, on the caller's own OS thread whether or
+not it can suspend. The wait sits outside the active section, so it
+holds no freeze off; the interrupt and freeze-gate generations end it,
+and whoever changes one calls `wake_host_pollfd`, because a thread in
+the kernel sees neither a changed word nor a waker. A thread retiring
+into a freeze runs no destructor, so its eventfd is closed for it.
+
+The caller reads the result out of the array it handed over: every
+`HostPollFd` carries the events seen, and one that reported a peer's
+half-close also says whether bytes are still unread, which is what tells
+a last request from an end of stream. One wait names at most
+`HOST_POLL_FDS_MAX` (64) descriptors and refuses a larger set rather
+than truncating it. A wait suspended across a fork is refused too:
+`POLLFD_EPOCH` moves when the coroutines are resurrected in a child
+whose networking was rebuilt, and the caller resolves its descriptors
+again.
+
+Every socket backend gains `host_fd()`: a connected stream, a listener
+and a bound datagram socket answer with their descriptor, everything
+else with `None`. The kernel is the only place readiness lives, so a
+wait on the descriptor sees everything there is.
+
+The wait is available on Linux, unless the process started with
+DISABLE_DIRECT_POLL set, logged at warning level on the first wait, or a
+wait could not interpret its own result and turned it off for good;
+elsewhere every wait takes the existing path.
+
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index 31c50e7..e675886 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -433,6 +433,11 @@ impl LocalTcpListener {
+ }
+ 
+ impl VirtualTcpListener for LocalTcpListener {
++    #[cfg(unix)]
++    fn host_fd(&self) -> Option<RawFd> {
++        Some(self.stream.as_raw_fd())
++    }
++
+     fn try_accept(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
+         self.try_accept_local()
+             .map(|(socket, addr)| (Box::new(socket) as Box<dyn VirtualTcpSocket + Sync>, addr))
+@@ -797,6 +802,11 @@ impl VirtualTcpSocket for LocalTcpStream {
+     fn is_closed(&self) -> bool {
+         self.shutdown == Some(Shutdown::Both)
+     }
++
++    #[cfg(unix)]
++    fn host_fd(&self) -> Option<RawFd> {
++        Some(self.stream.as_raw_fd())
++    }
+ }
+ 
+ impl VirtualConnectedSocket for LocalTcpStream {
+@@ -1171,6 +1181,11 @@ impl LocalUdpSocket {
+ }
+ 
+ impl VirtualUdpSocket for LocalUdpSocket {
++    #[cfg(unix)]
++    fn host_fd(&self) -> Option<RawFd> {
++        Some(self.socket.as_raw_fd())
++    }
++
+     fn set_broadcast(&mut self, broadcast: bool) -> Result<()> {
+         self.socket
+             .set_broadcast(broadcast)
+@@ -1692,6 +1707,8 @@ mod tests {
+         let waker = std::task::Waker::noop();
+         let mut cx = std::task::Context::from_waker(waker);
+ 
++        let fd = stream.host_fd();
++        assert!(fd.is_some());
+         assert!(matches!(stream.poll_read_ready(&mut cx), Poll::Pending));
+ 
+         client.write_all(b"hello").unwrap();
+@@ -1702,6 +1719,7 @@ mod tests {
+                 other => panic!("unexpected readiness {other:?}"),
+             }
+         }
++        assert_eq!(stream.host_fd(), fd);
+ 
+         // Asking did not take the bytes: the receive that follows gets all
+         // of them, and the socket is then not ready again.
+diff --git a/lib/virtual-net/src/lib.rs b/lib/virtual-net/src/lib.rs
+index 769e6e8..2d261f4 100644
+--- a/lib/virtual-net/src/lib.rs
++++ b/lib/virtual-net/src/lib.rs
+@@ -255,6 +255,13 @@ pub trait VirtualTcpListener: VirtualIoSource + fmt::Debug + Send + Sync + 'stat
+ 
+     /// Returns the maximum number of network hops before packets are dropped
+     fn ttl(&self) -> Result<u8>;
++
++    /// The raw host descriptor whose kernel readiness is this socket's
++    /// readiness, or `None` for a backend with no host descriptor.
++    #[cfg(unix)]
++    fn host_fd(&self) -> Option<std::os::fd::RawFd> {
++        None
++    }
+ }
+ 
+ pub trait VirtualTcpBoundSocket: fmt::Debug + Send + Sync + 'static {
+@@ -679,6 +686,13 @@ pub trait VirtualTcpSocket: VirtualConnectedSocket + fmt::Debug + Send + Sync +
+ 
+     /// Return true if the socket is closed
+     fn is_closed(&self) -> bool;
++
++    /// The raw host descriptor whose kernel readiness is this socket's
++    /// readiness, or `None` for a backend with no host descriptor.
++    #[cfg(unix)]
++    fn host_fd(&self) -> Option<std::os::fd::RawFd> {
++        None
++    }
+ }
+ 
+ #[cfg(feature = "tokio")]
+@@ -805,6 +819,13 @@ pub trait VirtualUdpSocket:
+     /// Returns the remote address of this UDP socket if it has been
+     /// connected to a specific target destination address
+     fn addr_peer(&self) -> Result<Option<SocketAddr>>;
++
++    /// The raw host descriptor whose kernel readiness is this socket's
++    /// readiness, or `None` for a backend with no host descriptor.
++    #[cfg(unix)]
++    fn host_fd(&self) -> Option<std::os::fd::RawFd> {
++        None
++    }
+ }
+ 
+ #[derive(Debug, Default)]
+diff --git a/lib/vm/src/trap/mod.rs b/lib/vm/src/trap/mod.rs
+index a0d4454..2d4ef8b 100644
+--- a/lib/vm/src/trap/mod.rs
++++ b/lib/vm/src/trap/mod.rs
+@@ -13,6 +13,8 @@ use crate::{VMContext, VMFunctionBody};
+ #[cfg(not(feature = "baremetal"))]
+ mod futex;
+ #[cfg(not(feature = "baremetal"))]
++mod pollfd;
++#[cfg(not(feature = "baremetal"))]
+ pub mod suspend;
+ #[allow(clippy::module_inception)]
+ mod trap;
+@@ -24,10 +26,12 @@ mod traphandlers;
+ 
+ #[cfg(not(feature = "baremetal"))]
+ pub use suspend::{
+-    BlockedFuture, FreezeError, HostFutexResult, Quiescence, Resurrected, SleepHook,
+-    SuspendedFutex, ThreadStateHooks, WasmYield, can_suspend_on_futex, exit_current_thread,
+-    on_host_stack_for_import, resurrect_all, run_guest_thread, set_thread_state_hooks,
+-    try_suspend_on_block, try_suspend_on_futex, wake_host_futex,
++    BlockedFuture, FreezeError, HOST_POLL_ERR, HOST_POLL_FDS_MAX, HOST_POLL_HUP, HOST_POLL_RDHUP,
++    HOST_POLL_READ, HOST_POLL_WRITE, HostFutexResult, HostPollFd, HostPollFdResult, Quiescence,
++    Resurrected, SleepHook, SuspendedFutex, SuspendedPollFd, ThreadStateHooks, WasmYield,
++    can_suspend_on_futex, can_suspend_on_pollfd, exit_current_thread, on_host_stack_for_import,
++    resurrect_all, run_guest_thread, set_thread_state_hooks, try_suspend_on_block,
++    try_suspend_on_futex, try_suspend_on_pollfd, wake_host_futex, wake_host_pollfd,
+ };
+ pub use trap::{Trap, UnwindReason};
+ #[cfg(feature = "baremetal")]
+diff --git a/lib/vm/src/trap/pollfd.rs b/lib/vm/src/trap/pollfd.rs
+new file mode 100644
+index 0000000..eef66b9
+--- /dev/null
++++ b/lib/vm/src/trap/pollfd.rs
+@@ -0,0 +1,1083 @@
++// SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception
++// Copyright (c) 2026 Ethan Jones
++
++//! Waiting on host descriptors from the guest thread that needs them.
++//!
++//! A guest thread blocked on a socket goes through the shared event
++//! selector: the kernel wakes the selector's poll thread, which then wakes
++//! the guest thread, so one readiness event requires a handoff through the
++//! selector thread. A wait that names nothing but kernel descriptors does
++//! not need that. When a syscall hands descriptors here, the wait blocks
++//! in `ppoll(2)` on the calling thread, which is the guest thread itself,
++//! so the kernel wakes exactly the thread that wants the event and the
++//! wait reports what each descriptor did.
++//!
++//! The wait owns nothing but one interrupt eventfd per waiting thread: it
++//! names descriptors its caller keeps open for it and writes back what each
++//! one did.
++
++use super::suspend::{
++    HOST_POLL_ERR, HOST_POLL_FDS_MAX, HOST_POLL_HUP, HOST_POLL_RDHUP, HOST_POLL_READ,
++    HOST_POLL_WRITE, HostPollFd, HostPollFdResult, HostPollFdWait,
++};
++
++#[cfg(target_os = "linux")]
++mod linux {
++    use std::io;
++    use std::os::fd::RawFd;
++    use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
++    use std::sync::{Mutex, PoisonError};
++    use std::time::Instant;
++
++    use super::{
++        HOST_POLL_ERR, HOST_POLL_FDS_MAX, HOST_POLL_HUP, HOST_POLL_RDHUP, HOST_POLL_READ,
++        HOST_POLL_WRITE, HostPollFd, HostPollFdResult, HostPollFdWait,
++    };
++
++    /// The wait's state: not yet decided, in use, never available
++    /// (`DISABLE_DIRECT_POLL` is set), or turned off after a call this code
++    /// could not interpret. `ppoll` and `eventfd` are old enough to need no
++    /// probe, so the first wait decides by the variable alone.
++    const UNKNOWN: u8 = 0;
++    const SUPPORTED: u8 = 1;
++    const UNAVAILABLE: u8 = 2;
++    const DISABLED: u8 = 3;
++
++    static SUPPORT: AtomicU8 = AtomicU8::new(UNKNOWN);
++
++    /// The largest wait this accepts: the limit a caller sizes its own
++    /// arrays by, and the interrupt descriptor beside it. A larger one is
++    /// refused rather than truncated, because a truncated wait would sleep
++    /// through the descriptors it dropped.
++    const MAX_POLL_FDS: usize = HOST_POLL_FDS_MAX + 1;
++
++    /// One thread inside a wait.
++    struct Waiter {
++        /// The interrupt word it is watching, as an address, so that the
++        /// list can be held in a static.
++        word: usize,
++        /// Its interrupt descriptor.
++        interrupt: RawFd,
++    }
++
++    /// Every thread currently inside a wait. A thread is in this list only
++    /// while it is between `register` and `unregister` below, so an entry
++    /// never outlives the descriptors or the word it names.
++    static WAITERS: Mutex<Vec<Waiter>> = Mutex::new(Vec::new());
++
++    /// How many entries `WAITERS` holds, so that a wake with nothing to do -
++    /// which is every wake in a process where no thread is waiting directly -
++    /// answers without taking the lock.
++    static WAITER_COUNT: AtomicUsize = AtomicUsize::new(0);
++
++    thread_local! {
++        /// This thread's interrupt descriptor, created on its first direct
++        /// wait and closed when the thread ends, together with what the last
++        /// wait left on it.
++        ///
++        /// A thread that retires into a freeze exits with the raw syscall
++        /// and runs no destructor, so `thread_retiring` below is what
++        /// closes it there.
++        static INTERRUPT: Interrupt = const {
++            Interrupt {
++                fd: std::cell::Cell::new(-1),
++                undrained: std::cell::Cell::new(false),
++            }
++        };
++    }
++
++    struct Interrupt {
++        fd: std::cell::Cell<RawFd>,
++        /// Whether the descriptor is known to hold a count nothing has read.
++        /// A wait that ends while the interrupt slot is readable leaves this
++        /// set rather than paying a `read(2)` for it, and the next wait
++        /// drains it before it sleeps. It is a hint and never more than one:
++        /// `wait_registered` is correct whichever way it is wrong.
++        undrained: std::cell::Cell<bool>,
++    }
++
++    impl Drop for Interrupt {
++        fn drop(&mut self) {
++            let fd = self.fd.replace(-1);
++            if fd >= 0 {
++                // SAFETY: this thread created the descriptor and, having
++                // reached its own destructors, is not inside a wait, so it is
++                // not in `WAITERS` and nothing else can write it.
++                unsafe { libc::close(fd) };
++            }
++        }
++    }
++
++    /// Whether a direct descriptor wait can be made, deciding on the first
++    /// call.
++    pub(crate) fn supported() -> bool {
++        match SUPPORT.load(Ordering::Acquire) {
++            UNKNOWN => decide(),
++            state => state == SUPPORTED,
++        }
++    }
++
++    #[cold]
++    fn decide() -> bool {
++        let state = if std::env::var_os("DISABLE_DIRECT_POLL").is_some() {
++            #[cfg(feature = "tracing")]
++            tracing::warn!("DISABLE_DIRECT_POLL is set; disabling the direct descriptor wait");
++            UNAVAILABLE
++        } else {
++            SUPPORTED
++        };
++        // Only a state still unknown is decided here: a wait that gave up on
++        // the backend has already answered and its answer stands.
++        let _ = SUPPORT.compare_exchange(UNKNOWN, state, Ordering::AcqRel, Ordering::Acquire);
++        SUPPORT.load(Ordering::Acquire) == SUPPORTED
++    }
++
++    /// Closes this thread's interrupt descriptor as the thread retires.
++    ///
++    /// A thread that retires into a freeze leaves through the raw exit
++    /// syscall and runs no destructor, so without this the descriptor is
++    /// leaked: one per waiting guest thread per freeze, which grows without
++    /// bound in a process that freezes again and again. Taking the waiter
++    /// lock is what makes the close safe - a wake only writes descriptors
++    /// it finds while holding it - and a retiring thread left its wait
++    /// before it got here, so it holds no entry in the list.
++    pub(crate) fn thread_retiring() {
++        let _waiters = WAITERS.lock().unwrap_or_else(PoisonError::into_inner);
++        INTERRUPT.with(|slot| {
++            let fd = slot.fd.replace(-1);
++            if fd >= 0 {
++                slot.undrained.set(false);
++                // SAFETY: this thread created the descriptor and is not
++                // inside a wait, so nothing else can write it.
++                unsafe { libc::close(fd) };
++            }
++        });
++    }
++
++    /// This thread's interrupt descriptor, created on first use.
++    ///
++    /// An eventfd is a counter and reads level-triggered, so a wake that
++    /// arrives while the thread is running is still there when it reaches
++    /// `ppoll(2)`, whether or not anything drained it first. That is what
++    /// lets the drain be skipped: see `wait_registered`.
++    fn interrupt_fd() -> Option<RawFd> {
++        INTERRUPT.with(|slot| {
++            let existing = slot.fd.get();
++            if existing >= 0 {
++                return Some(existing);
++            }
++            // SAFETY: a plain constructor call with no pointer arguments.
++            let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
++            if fd < 0 {
++                return None;
++            }
++            slot.fd.set(fd);
++            Some(fd)
++        })
++    }
++
++    fn register(word: *const u32, interrupt: RawFd) {
++        let entry = Waiter {
++            word: word as usize,
++            interrupt,
++        };
++        let mut waiters = WAITERS.lock().unwrap_or_else(PoisonError::into_inner);
++        waiters.push(entry);
++        WAITER_COUNT.store(waiters.len(), Ordering::Release);
++        // This publishes the entry to a waker that has already changed a
++        // generation word and is about to read the count. Releasing the
++        // mutex orders the two stores but not this thread's later load of
++        // the generation, and without that order both sides can miss each
++        // other: the waker reads no waiters and writes nothing, the waiter
++        // reads a generation that has already moved and sleeps anyway.
++        std::sync::atomic::fence(Ordering::SeqCst);
++    }
++
++    fn unregister(word: *const u32, interrupt: RawFd) {
++        let mut waiters = WAITERS.lock().unwrap_or_else(PoisonError::into_inner);
++        if let Some(index) = waiters
++            .iter()
++            .position(|entry| entry.word == word as usize && entry.interrupt == interrupt)
++        {
++            waiters.swap_remove(index);
++        }
++        WAITER_COUNT.store(waiters.len(), Ordering::Release);
++    }
++
++    /// Ends the wait of every thread watching `address`, or of every waiter
++    /// when `address` is null.
++    ///
++    /// This cannot lose a wake. A caller changes the generation word before
++    /// it calls here, and a waiter registers before it reads the generation,
++    /// so a waiter this call does not find has yet to read a value that has
++    /// already changed - which the fence below is what makes true.
++    pub(crate) fn wake(address: *const u32) {
++        // The pair of this is the fence at the end of `register`: between
++        // them, one of the two sides always sees the other's write.
++        std::sync::atomic::fence(Ordering::SeqCst);
++        if WAITER_COUNT.load(Ordering::Acquire) == 0 {
++            return;
++        }
++        let waiters = WAITERS.lock().unwrap_or_else(PoisonError::into_inner);
++        for waiter in waiters.iter() {
++            if !address.is_null() && waiter.word != address as usize {
++                continue;
++            }
++            write_interrupt(waiter.interrupt);
++        }
++    }
++
++    fn write_interrupt(fd: RawFd) {
++        let value: u64 = 1;
++        // SAFETY: the descriptor belongs to a thread still inside its wait,
++        // which holds the entry, and an eventfd write takes eight bytes
++        // from the caller.
++        unsafe {
++            libc::write(fd, std::ptr::from_ref(&value).cast(), 8);
++        }
++    }
++
++    pub(crate) fn wait(request: HostPollFdWait) -> HostPollFdResult {
++        if SUPPORT.load(Ordering::Acquire) != SUPPORTED {
++            return HostPollFdResult::Unavailable;
++        }
++        if request.fd_count == 0 || request.fd_count + 1 > MAX_POLL_FDS {
++            return HostPollFdResult::Unavailable;
++        }
++        let Some(interrupt) = interrupt_fd() else {
++            return disable_after_error(io::Error::last_os_error().raw_os_error());
++        };
++        // SAFETY: the hook contract keeps the array live for this call and
++        // hands it over to be written.
++        let fds = unsafe { std::slice::from_raw_parts_mut(request.fds, request.fd_count) };
++
++        let mut poll_fds = [libc::pollfd {
++            fd: -1,
++            events: 0,
++            revents: 0,
++        }; MAX_POLL_FDS];
++        // The interrupt descriptor goes first so that the descriptors the
++        // guest named keep the order it gave them.
++        poll_fds[0] = libc::pollfd {
++            fd: interrupt,
++            events: libc::POLLIN,
++            revents: 0,
++        };
++        for (slot, wanted) in poll_fds[1..].iter_mut().zip(fds.iter()) {
++            *slot = libc::pollfd {
++                fd: wanted.fd,
++                events: poll_events(*wanted),
++                revents: 0,
++            };
++        }
++        let used = fds.len() + 1;
++
++        // What the last wait on this thread left on the descriptor. It is
++        // carried across calls rather than read away at the end of one,
++        // because a wait that ends on a descriptor the guest asked about is
++        // the common case and it should cost nothing.
++        let mut undrained = INTERRUPT.with(|slot| slot.undrained.get());
++
++        register(request.interrupt, interrupt);
++        let result = wait_registered(
++            &mut poll_fds[..used],
++            fds,
++            &request,
++            interrupt,
++            &mut undrained,
++        );
++        unregister(request.interrupt, interrupt);
++        INTERRUPT.with(|slot| slot.undrained.set(undrained));
++        result
++    }
++
++    /// Maps the requested events. Hangup, error and an invalid descriptor
++    /// are reported by the kernel whether or not they were asked for, so a
++    /// wait for writability still ends when the peer goes away, and a
++    /// descriptor closed under the wait ends it rather than hanging it.
++    /// A peer that has shut only its writing half down is the exception:
++    /// the kernel reports that one only to a caller that asked for it.
++    fn poll_events(wanted: HostPollFd) -> libc::c_short {
++        let mut events = 0;
++        if wanted.events & HOST_POLL_READ != 0 {
++            events |= libc::POLLIN;
++        }
++        if wanted.events & HOST_POLL_WRITE != 0 {
++            events |= libc::POLLOUT;
++        }
++        if wanted.events & HOST_POLL_RDHUP != 0 {
++            events |= libc::POLLRDHUP;
++        }
++        events
++    }
++
++    /// Maps what the kernel reported back into the runtime's bits. An
++    /// invalid descriptor joins the error bit: to the guest both mean the
++    /// socket cannot be waited on and the event must be reported now.
++    fn host_revents(revents: libc::c_short) -> u16 {
++        let mut bits = 0;
++        if revents & libc::POLLIN != 0 {
++            bits |= HOST_POLL_READ;
++        }
++        if revents & libc::POLLOUT != 0 {
++            bits |= HOST_POLL_WRITE;
++        }
++        if revents & libc::POLLHUP != 0 {
++            bits |= HOST_POLL_HUP;
++        }
++        if revents & libc::POLLRDHUP != 0 {
++            bits |= HOST_POLL_RDHUP;
++        }
++        if revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
++            bits |= HOST_POLL_ERR;
++        }
++        bits
++    }
++
++    /// The wait proper, with the thread registered for wakes.
++    ///
++    /// `undrained` says whether the interrupt descriptor is known to hold a
++    /// count, and is left saying so on return. The descriptor is read only
++    /// when it does: on the first turn when the previous wait left one
++    /// behind, and on any later turn when the previous `ppoll` reported the
++    /// slot readable. Reading it on every turn cost a `read(2)` on every
++    /// wait, and skipping it loses no wake:
++    ///
++    /// - a writer changes a generation *before* it writes the descriptor, so
++    ///   a wake that lands while this thread runs - after one `ppoll` and
++    ///   before the next - is seen by the generation check below, which is
++    ///   read after the drain either way. The drain was never what observed
++    ///   a wake; it only kept a spent count from ending the next sleep early.
++    /// - a count nobody drained does exactly that and no more. The next
++    ///   `ppoll` returns at once with the interrupt slot readable and no
++    ///   other descriptor set, which is the bottom of this loop; the turn
++    ///   after drains the count, re-reads the generations and sleeps for
++    ///   what is left of the deadline, which is recomputed each turn and so
++    ///   is never extended. One spurious return per undrained count, and a
++    ///   count is at most one because the descriptor is read to zero.
++    /// - the flag is only ever wrong in the cheap direction. Wrongly set,
++    ///   the drain reads nothing from a non-blocking descriptor. Wrongly
++    ///   clear - a wake written in the window between `ppoll` returning and
++    ///   the thread unregistering - costs the one spurious return above.
++    fn wait_registered(
++        poll_fds: &mut [libc::pollfd],
++        fds: &mut [HostPollFd],
++        request: &HostPollFdWait,
++        interrupt: RawFd,
++        undrained: &mut bool,
++    ) -> HostPollFdResult {
++        loop {
++            // Drained before the generations are read: a wake drained here
++            // changed a generation first, so the read below sees it. A wake
++            // that arrives after the read finds this thread registered and
++            // its write is what ends the poll.
++            if *undrained {
++                drain(interrupt);
++                *undrained = false;
++            }
++            if load(request.gate) != request.gate_expected
++                || load(request.interrupt) != request.interrupt_expected
++            {
++                return HostPollFdResult::Interrupted;
++            }
++            let timeout = match request.deadline {
++                None => None,
++                Some(deadline) => {
++                    // A deadline that has already passed is not a refusal to
++                    // look: the caller asked what is ready now, which is what
++                    // a guest's non-blocking wait is, and a zero timeout
++                    // answers that without blocking. Nothing ready is then
++                    // reported as the deadline it is.
++                    let remaining = deadline.saturating_duration_since(Instant::now());
++                    Some(libc::timespec {
++                        tv_sec: libc::time_t::try_from(remaining.as_secs())
++                            .unwrap_or(libc::time_t::MAX),
++                        tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
++                    })
++                }
++            };
++            for slot in poll_fds.iter_mut() {
++                slot.revents = 0;
++            }
++            // `ppoll` rather than `poll` for the nanosecond timeout: a guest
++            // that asks to sleep for a fraction of a millisecond gets that,
++            // where `poll`'s millisecond timeout would round it up.
++            //
++            // SAFETY: the array is this frame's, the timeout is a local, and
++            // a null signal mask leaves the thread's mask alone.
++            let ready = unsafe {
++                libc::ppoll(
++                    poll_fds.as_mut_ptr(),
++                    poll_fds.len() as libc::nfds_t,
++                    timeout
++                        .as_ref()
++                        .map_or(std::ptr::null(), std::ptr::from_ref),
++                    std::ptr::null(),
++                )
++            };
++            if ready < 0 {
++                match io::Error::last_os_error().raw_os_error() {
++                    // A Unix signal can interrupt the call independently of a
++                    // WASIX one. Recheck the generations and go round again.
++                    Some(libc::EINTR) => continue,
++                    other => return disable_after_error(other),
++                }
++            }
++            if ready == 0 {
++                return HostPollFdResult::TimedOut;
++            }
++            // Whatever the interrupt slot reported is a count left on the
++            // descriptor, for the next turn or the next wait to read away.
++            *undrained = poll_fds[0].revents != 0;
++            if poll_fds[1..].iter().any(|slot| slot.revents != 0) {
++                // Every descriptor is answered, the quiet ones with zero, so
++                // that the caller reads the whole set from the array it gave
++                // and asks no descriptor again.
++                for (slot, out) in poll_fds[1..].iter().zip(fds.iter_mut()) {
++                    out.revents = host_revents(slot.revents);
++                    out.nbytes = if out.revents & HOST_POLL_RDHUP != 0 {
++                        still_readable(slot.fd)
++                    } else {
++                        0
++                    };
++                }
++                return HostPollFdResult::Ready;
++            }
++            // Only the interrupt descriptor fired. Every writer of it changes
++            // a generation first, so the next turn of this loop sees the
++            // change and reports it; a write that changed nothing is drained
++            // at the top of that turn and the wait resumes for what is left
++            // of its deadline.
++        }
++    }
++
++    /// One when the descriptor still holds bytes and zero when it does not,
++    /// for the one answer that needs to know: a peer that has shut its
++    /// writing half down reports the same readiness whether or not it sent
++    /// a last request first. One byte peeked tells the two apart and takes
++    /// nothing out of the kernel; a descriptor that cannot answer reads as
++    /// the end of the stream.
++    fn still_readable(fd: RawFd) -> u32 {
++        let mut probe = 0u8;
++        // SAFETY: `MSG_PEEK` copies at most one byte into `probe` and
++        // dequeues nothing, and the descriptor is one this wait was handed.
++        let n = unsafe {
++            libc::recv(
++                fd,
++                (&raw mut probe).cast(),
++                1,
++                libc::MSG_PEEK | libc::MSG_DONTWAIT,
++            )
++        };
++        u32::from(n > 0)
++    }
++
++    fn drain(fd: RawFd) {
++        let mut value: u64 = 0;
++        // SAFETY: an eventfd read takes eight bytes into the caller's buffer,
++        // and the descriptor is non-blocking, so this returns at once.
++        unsafe {
++            libc::read(fd, std::ptr::from_mut(&mut value).cast(), 8);
++        }
++    }
++
++    fn load(address: *const u32) -> u32 {
++        // SAFETY: the hook contract supplies a live and aligned 32-bit word.
++        unsafe { AtomicU32::from_ptr(address.cast_mut()) }.load(Ordering::Acquire)
++    }
++
++    /// Gives up on the backend for the rest of the process after a call this
++    /// code cannot interpret. Every later wait falls back without asking, and
++    /// only the wait that turns it off says so.
++    fn disable_after_error(errno: Option<i32>) -> HostPollFdResult {
++        if SUPPORT.swap(DISABLED, Ordering::AcqRel) == SUPPORTED {
++            report_giving_up(errno);
++        }
++        HostPollFdResult::Unavailable
++    }
++
++    #[cfg(feature = "tracing")]
++    fn report_giving_up(errno: Option<i32>) {
++        tracing::warn!(
++            errno,
++            error = %io::Error::from_raw_os_error(errno.unwrap_or(libc::EIO)),
++            "a direct descriptor wait failed; disabling the direct descriptor wait"
++        );
++    }
++
++    #[cfg(not(feature = "tracing"))]
++    fn report_giving_up(_errno: Option<i32>) {}
++
++    #[cfg(test)]
++    mod tests {
++        use super::*;
++        use std::io::Write as _;
++        use std::os::fd::AsRawFd;
++        use std::sync::Arc;
++        use std::sync::mpsc;
++        use std::thread;
++        use std::time::Duration;
++
++        struct Words {
++            interrupt: AtomicU32,
++            gate: AtomicU32,
++        }
++
++        impl Words {
++            fn new() -> Arc<Self> {
++                Arc::new(Self {
++                    interrupt: AtomicU32::new(0),
++                    gate: AtomicU32::new(0),
++                })
++            }
++        }
++
++        fn request(
++            words: &Words,
++            fds: &mut [HostPollFd],
++            deadline: Option<Instant>,
++        ) -> HostPollFdWait {
++            request_expecting(words, fds, deadline, 0)
++        }
++
++        /// A request for a thread that has already been interrupted once and
++        /// has taken the new generation as its own.
++        fn request_expecting(
++            words: &Words,
++            fds: &mut [HostPollFd],
++            deadline: Option<Instant>,
++            interrupt_expected: u32,
++        ) -> HostPollFdWait {
++            HostPollFdWait {
++                fd_count: fds.len(),
++                fds: fds.as_mut_ptr(),
++                interrupt: (&raw const words.interrupt).cast(),
++                interrupt_expected,
++                gate: (&raw const words.gate).cast(),
++                gate_expected: 0,
++                deadline,
++            }
++        }
++
++        fn read_fd(fd: RawFd) -> HostPollFd {
++            HostPollFd {
++                fd,
++                events: HOST_POLL_READ,
++                revents: 0,
++                nbytes: 0,
++            }
++        }
++
++        fn enable() {
++            SUPPORT.store(SUPPORTED, Ordering::Release);
++        }
++
++        /// A connected pair with nothing to read: the wait ends at the
++        /// deadline it was given and reports the timeout, which is what turns
++        /// into the guest's clock event.
++        #[test]
++        fn a_wait_with_nothing_ready_ends_at_its_deadline() {
++            enable();
++            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let mut fds = [read_fd(a.as_raw_fd())];
++            let words = Words::new();
++            let started = Instant::now();
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(started + Duration::from_millis(120)),
++            ));
++            assert_eq!(result, HostPollFdResult::TimedOut);
++            assert!(started.elapsed() >= Duration::from_millis(100));
++        }
++
++        /// A deadline that has already passed asks what is ready now: the
++        /// poll still runs, so readiness already there is reported rather
++        /// than slept through, and it never blocks. This is what a guest's
++        /// non-blocking wait becomes.
++        #[test]
++        fn an_elapsed_deadline_reports_what_is_ready_without_blocking() {
++            enable();
++            let (quiet, _quiet_peer) = std::os::unix::net::UnixStream::pair().unwrap();
++            let (loud, mut loud_peer) = std::os::unix::net::UnixStream::pair().unwrap();
++            loud_peer.write_all(b"x").unwrap();
++            let words = Words::new();
++
++            let mut fds = [read_fd(loud.as_raw_fd())];
++            let started = Instant::now();
++            let result = wait(request(&words, &mut fds, Some(started)));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents & HOST_POLL_READ, HOST_POLL_READ);
++
++            let mut fds = [read_fd(quiet.as_raw_fd())];
++            let result = wait(request(&words, &mut fds, Some(Instant::now())));
++            assert_eq!(result, HostPollFdResult::TimedOut);
++            assert!(started.elapsed() < Duration::from_millis(100));
++            drop(loud_peer);
++        }
++
++        /// Data on the descriptor ends the wait, and the descriptor carries
++        /// the events the kernel reported.
++        #[test]
++        fn a_ready_descriptor_ends_the_wait() {
++            enable();
++            let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let mut fds = [read_fd(a.as_raw_fd())];
++            let words = Words::new();
++            let writer = thread::spawn(move || {
++                thread::sleep(Duration::from_millis(30));
++                b.write_all(b"x").unwrap();
++                b
++            });
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents & HOST_POLL_READ, HOST_POLL_READ);
++            drop(writer.join().unwrap());
++        }
++
++        /// Every descriptor of a ready wait is answered, the quiet ones with
++        /// nothing: the caller reads which of them fired out of the array it
++        /// handed over, and never has to ask the descriptors again.
++        #[test]
++        fn a_ready_wait_answers_every_descriptor() {
++            enable();
++            let (quiet, _quiet_peer) = std::os::unix::net::UnixStream::pair().unwrap();
++            let (loud, mut loud_peer) = std::os::unix::net::UnixStream::pair().unwrap();
++            let mut fds = [read_fd(quiet.as_raw_fd()), read_fd(loud.as_raw_fd())];
++            fds[0].revents = u16::MAX;
++            fds[1].revents = u16::MAX;
++            let words = Words::new();
++            loud_peer.write_all(b"x").unwrap();
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents, 0);
++            assert_eq!(fds[1].revents, HOST_POLL_READ);
++            drop(loud_peer);
++        }
++
++        /// A peer that goes away is a hangup, which the kernel reports
++        /// although nothing asked for it, and the wait passes it on.
++        #[test]
++        fn a_closed_peer_is_reported_as_a_hangup() {
++            enable();
++            let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let mut fds = [HostPollFd {
++                fd: a.as_raw_fd(),
++                events: HOST_POLL_WRITE,
++                revents: 0,
++                nbytes: 0,
++            }];
++            let words = Words::new();
++            drop(b);
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents & HOST_POLL_HUP, HOST_POLL_HUP);
++        }
++
++        /// A peer that has shut only its writing half down is reported,
++        /// but only because the wait asked for it: the kernel keeps that
++        /// one to itself otherwise. It is kept apart from a full hangup
++        /// because a stream whose peer has stopped writing can still be
++        /// written to.
++        #[test]
++        fn a_half_closed_peer_is_reported_only_when_it_is_asked_for() {
++            enable();
++            let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
++            b.shutdown(std::net::Shutdown::Write).unwrap();
++            let words = Words::new();
++
++            let mut fds = [HostPollFd {
++                fd: a.as_raw_fd(),
++                events: HOST_POLL_READ | HOST_POLL_RDHUP,
++                revents: 0,
++                nbytes: 0,
++            }];
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents & HOST_POLL_RDHUP, HOST_POLL_RDHUP);
++            assert_eq!(fds[0].revents & HOST_POLL_HUP, 0);
++
++            let mut fds = [read_fd(a.as_raw_fd())];
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents & HOST_POLL_RDHUP, 0);
++            drop(b);
++        }
++
++        /// A wait whose generation has already moved on never sleeps: the
++        /// signal that moved it was raised before the wait started.
++        #[test]
++        fn a_stale_generation_does_not_sleep() {
++            enable();
++            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let mut fds = [read_fd(a.as_raw_fd())];
++            let words = Words::new();
++            words.interrupt.store(1, Ordering::Release);
++            let started = Instant::now();
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(started + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Interrupted);
++            assert!(started.elapsed() < Duration::from_secs(1));
++        }
++
++        /// A signal raised on the waiting thread from another one changes the
++        /// interrupt word and wakes it through the interrupt descriptor.
++        #[test]
++        fn another_thread_ends_the_wait_through_the_interrupt_word() {
++            enable();
++            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let words = Words::new();
++            let waiter_words = words.clone();
++            let waiter = thread::spawn(move || {
++                let mut fds = [read_fd(a.as_raw_fd())];
++                let result = wait(request(
++                    &waiter_words,
++                    &mut fds,
++                    Some(Instant::now() + Duration::from_secs(10)),
++                ));
++                drop(a);
++                result
++            });
++            wait_until_registered();
++            words.interrupt.fetch_add(1, Ordering::SeqCst);
++            wake((&raw const words.interrupt).cast());
++            assert_eq!(waiter.join().unwrap(), HostPollFdResult::Interrupted);
++        }
++
++        /// Closing the freeze gate wakes every waiter, whatever word it is
++        /// watching, because the gate belongs to the whole process.
++        #[test]
++        fn closing_the_gate_ends_every_wait() {
++            enable();
++            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let words = Words::new();
++            let waiter_words = words.clone();
++            let waiter = thread::spawn(move || {
++                let mut fds = [read_fd(a.as_raw_fd())];
++                let result = wait(request(
++                    &waiter_words,
++                    &mut fds,
++                    Some(Instant::now() + Duration::from_secs(10)),
++                ));
++                drop(a);
++                result
++            });
++            wait_until_registered();
++            words.gate.fetch_add(1, Ordering::SeqCst);
++            wake(std::ptr::null());
++            assert_eq!(waiter.join().unwrap(), HostPollFdResult::Interrupted);
++        }
++
++        /// A wake for a word nobody is watching reaches no waiter, so a
++        /// futex wake elsewhere in the process cannot cut a wait short.
++        #[test]
++        fn a_wake_for_another_word_is_ignored() {
++            enable();
++            let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let words = Words::new();
++            let other = AtomicU32::new(0);
++            let waiter_words = words.clone();
++            let waiter = thread::spawn(move || {
++                let mut fds = [read_fd(a.as_raw_fd())];
++                let result = wait(request(
++                    &waiter_words,
++                    &mut fds,
++                    Some(Instant::now() + Duration::from_secs(10)),
++                ));
++                drop(a);
++                result
++            });
++            wait_until_registered();
++            wake((&raw const other).cast());
++            thread::sleep(Duration::from_millis(50));
++            assert!(!waiter.is_finished());
++            b.write_all(b"x").unwrap();
++            assert_eq!(waiter.join().unwrap(), HostPollFdResult::Ready);
++        }
++
++        /// A set as large as the runtime's own limit is waited on, and one
++        /// descriptor more is refused rather than truncated: a truncated
++        /// wait would sleep through the descriptors it dropped, so the
++        /// runtime keeps its own path for that set.
++        #[test]
++        fn a_set_at_the_limit_is_waited_on_and_one_above_it_is_refused() {
++            enable();
++            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let words = Words::new();
++
++            let mut fds = vec![read_fd(a.as_raw_fd()); super::HOST_POLL_FDS_MAX];
++            assert_eq!(fds.len() + 1, MAX_POLL_FDS);
++            assert_eq!(
++                wait(request(&words, &mut fds, Some(Instant::now()))),
++                HostPollFdResult::TimedOut
++            );
++
++            let mut fds = vec![read_fd(a.as_raw_fd()); MAX_POLL_FDS];
++            assert_eq!(
++                wait(request(&words, &mut fds, None)),
++                HostPollFdResult::Unavailable
++            );
++        }
++
++        /// A peer that has shut its writing half down reports the same
++        /// readiness whether or not it sent a last request first, so the
++        /// wait peeks on that turn and one byte or none tells the two apart.
++        /// Every other descriptor is answered with none and pays no syscall.
++        #[test]
++        fn a_half_close_says_whether_bytes_are_still_unread() {
++            enable();
++            let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let words = Words::new();
++            b.write_all(b"hello").unwrap();
++            b.shutdown(std::net::Shutdown::Write).unwrap();
++
++            let mut fds = [HostPollFd {
++                fd: a.as_raw_fd(),
++                events: HOST_POLL_READ | HOST_POLL_RDHUP,
++                revents: 0,
++                nbytes: 7,
++            }];
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents & HOST_POLL_RDHUP, HOST_POLL_RDHUP);
++            assert_eq!(fds[0].nbytes, 1);
++
++            // The same descriptor once the request has been read: the half
++            // close is all that is left, and it is the end of the stream.
++            let mut buffer = [0u8; 5];
++            std::io::Read::read_exact(&mut &a, &mut buffer).unwrap();
++            let mut fds = [HostPollFd {
++                fd: a.as_raw_fd(),
++                events: HOST_POLL_READ | HOST_POLL_RDHUP,
++                revents: 0,
++                nbytes: 7,
++            }];
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].revents & HOST_POLL_RDHUP, HOST_POLL_RDHUP);
++            assert_eq!(fds[0].nbytes, 0);
++
++            // A descriptor that reported no half close is answered with
++            // none, and nothing is peeked for it.
++            let (c, mut d) = std::os::unix::net::UnixStream::pair().unwrap();
++            d.write_all(b"xyz").unwrap();
++            let mut fds = [read_fd(c.as_raw_fd())];
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(Instant::now() + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Ready);
++            assert_eq!(fds[0].nbytes, 0);
++            drop(d);
++        }
++
++        /// A thread that retires into a freeze leaves through the raw exit
++        /// syscall and runs no destructor, so the descriptor it made is
++        /// closed for it. Leaving it open costs one descriptor per waiting
++        /// guest thread per freeze, without bound.
++        #[test]
++        fn a_retiring_thread_closes_its_interrupt_descriptor() {
++            let retired = thread::spawn(|| {
++                // Nothing to close before one is made, and asking twice
++                // gives the same descriptor.
++                thread_retiring();
++                let fd = interrupt_fd().unwrap();
++                assert_eq!(interrupt_fd(), Some(fd));
++
++                thread_retiring();
++                assert_eq!(INTERRUPT.with(|slot| slot.fd.get()), -1);
++                // SAFETY: a descriptor query with no memory arguments. The
++                // number was this thread's and nothing here reopens one.
++                let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
++                assert!(!still_open, "the interrupt descriptor was left open");
++
++                // The next wait on the thread makes another one.
++                interrupt_fd().unwrap()
++            });
++            assert!(retired.join().unwrap() >= 0);
++        }
++
++        /// A wait ended by the interrupt descriptor reads it to zero on its
++        /// way past, so the next wait on the same thread starts clean. The
++        /// second wait here asks only what is ready now: a count left on the
++        /// descriptor would end its poll at once, every turn, and it would
++        /// never answer.
++        #[test]
++        fn an_interrupt_leaves_the_descriptor_clean_for_the_next_wait() {
++            enable();
++            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let words = Words::new();
++            let waiter_words = words.clone();
++            let (tx, rx) = mpsc::channel();
++            let waiter = thread::spawn(move || {
++                let mut fds = [read_fd(a.as_raw_fd())];
++                let first = wait(request(
++                    &waiter_words,
++                    &mut fds,
++                    Some(Instant::now() + Duration::from_secs(10)),
++                ));
++                let mut fds = [read_fd(a.as_raw_fd())];
++                let second = wait(request_expecting(
++                    &waiter_words,
++                    &mut fds,
++                    Some(Instant::now()),
++                    1,
++                ));
++                drop(a);
++                tx.send((first, second)).unwrap();
++            });
++            wait_until_registered();
++            words.interrupt.fetch_add(1, Ordering::SeqCst);
++            wake((&raw const words.interrupt).cast());
++            let (first, second) = rx
++                .recv_timeout(Duration::from_secs(10))
++                .expect("the second wait never answered");
++            assert_eq!(first, HostPollFdResult::Interrupted);
++            assert_eq!(second, HostPollFdResult::TimedOut);
++            waiter.join().unwrap();
++        }
++
++        /// A wake raised while the thread is running - after one wait has
++        /// returned and before the next - reaches it through the generation
++        /// alone: the thread is registered nowhere, so nothing writes its
++        /// descriptor. The next wait reads the generation before it sleeps,
++        /// and reports the interrupt although the descriptor it was given is
++        /// readable and would have ended the wait anyway.
++        #[test]
++        fn a_wake_while_the_thread_runs_is_seen_before_the_next_sleep() {
++            enable();
++            let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let words = Words::new();
++            b.write_all(b"x").unwrap();
++            let mut fds = [read_fd(a.as_raw_fd())];
++            assert_eq!(
++                wait(request(
++                    &words,
++                    &mut fds,
++                    Some(Instant::now() + Duration::from_secs(5)),
++                )),
++                HostPollFdResult::Ready
++            );
++
++            words.interrupt.fetch_add(1, Ordering::SeqCst);
++            wake((&raw const words.interrupt).cast());
++
++            let started = Instant::now();
++            let mut fds = [read_fd(a.as_raw_fd())];
++            let result = wait(request(
++                &words,
++                &mut fds,
++                Some(started + Duration::from_secs(5)),
++            ));
++            assert_eq!(result, HostPollFdResult::Interrupted);
++            assert!(started.elapsed() < Duration::from_secs(1));
++            drop(b);
++        }
++
++        /// A count on the interrupt descriptor that no wait knows about -
++        /// the wake written in the window between a poll returning and the
++        /// thread unregistering - neither wedges the next wait nor cuts it
++        /// short. Its first poll returns on the count, the turn after reads
++        /// it away, and the wait then sleeps for the deadline it was given.
++        #[test]
++        fn an_undrained_interrupt_count_does_not_wedge_a_wait() {
++            enable();
++            let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
++            let words = Words::new();
++            let (tx, rx) = mpsc::channel();
++            let waiter = thread::spawn(move || {
++                let interrupt = interrupt_fd().unwrap();
++                let value: u64 = 1;
++                // SAFETY: an eventfd write takes eight bytes from the caller,
++                // and the descriptor belongs to this thread, which is not in
++                // a wait.
++                unsafe {
++                    libc::write(interrupt, std::ptr::from_ref(&value).cast(), 8);
++                }
++                INTERRUPT.with(|slot| slot.undrained.set(false));
++
++                let mut fds = [read_fd(a.as_raw_fd())];
++                let started = Instant::now();
++                let slept = wait(request(
++                    &words,
++                    &mut fds,
++                    Some(started + Duration::from_millis(120)),
++                ));
++                let elapsed = started.elapsed();
++                let mut fds = [read_fd(a.as_raw_fd())];
++                let probed = wait(request(&words, &mut fds, Some(Instant::now())));
++                drop(a);
++                tx.send((slept, elapsed, probed)).unwrap();
++            });
++            let (slept, elapsed, probed) = rx
++                .recv_timeout(Duration::from_secs(10))
++                .expect("the wait never answered");
++            assert_eq!(slept, HostPollFdResult::TimedOut);
++            assert!(elapsed >= Duration::from_millis(100));
++            assert_eq!(probed, HostPollFdResult::TimedOut);
++            waiter.join().unwrap();
++        }
++
++        fn wait_until_registered() {
++            for _ in 0..500 {
++                if WAITER_COUNT.load(Ordering::Acquire) > 0 {
++                    thread::sleep(Duration::from_millis(5));
++                    return;
++                }
++                thread::sleep(Duration::from_millis(2));
++            }
++            panic!("the waiter never registered");
++        }
++    }
++}
++
++#[cfg(not(target_os = "linux"))]
++mod linux {
++    use super::{HostPollFdResult, HostPollFdWait};
++
++    pub(crate) fn supported() -> bool {
++        false
++    }
++
++    pub(crate) fn wait(_request: HostPollFdWait) -> HostPollFdResult {
++        HostPollFdResult::Unavailable
++    }
++
++    pub(crate) fn wake(_address: *const u32) {}
++
++    pub(crate) fn thread_retiring() {}
++}
++
++pub(crate) use linux::{supported, thread_retiring, wait, wake};
+diff --git a/lib/vm/src/trap/suspend.rs b/lib/vm/src/trap/suspend.rs
+index c3dcab5..27ae096 100644
+--- a/lib/vm/src/trap/suspend.rs
++++ b/lib/vm/src/trap/suspend.rs
+@@ -59,6 +59,9 @@ pub enum WasmYield {
+     /// The guest is blocked on a 32-bit futex that the host can wait on
+     /// directly, together with the thread and freeze interrupt words.
+     Futex(SuspendedFutex),
++    /// The guest is blocked on host descriptors that the host can wait on
++    /// directly, together with the thread and freeze interrupt words.
++    PollFd(SuspendedPollFd),
+ }
+ 
+ /// The result of a host futex wait.
+@@ -101,6 +104,111 @@ pub(crate) struct HostFutexWait {
+     /// The guest futex word and its expected value, when the wait has one;
+     /// a wait without one ends only by interrupt or deadline.
+     pub futex: Option<(*const u32, u32)>,
++    /// Per-guest-thread interrupt generation. The wait ends when it leaves
++    /// `interrupt_expected`, and a host that learns of readiness the wait
++    /// itself cannot see - a backend taking bytes out of the kernel, say -
++    /// may change it for that reason too: the caller then looks at
++    /// everything again, which is what such a change means everywhere.
++    pub interrupt: *const u32,
++    /// Expected interrupt generation.
++    pub interrupt_expected: u32,
++    /// Process-wide freeze-gate generation.
++    pub gate: *const u32,
++    /// Expected freeze-gate generation.
++    pub gate_expected: u32,
++    /// Absolute monotonic deadline, if any.
++    pub deadline: Option<Instant>,
++}
++
++/// One descriptor of a direct descriptor wait, in the shape `poll(2)` wants.
++///
++/// `events` is the caller's request and `revents` the host's answer: a wait
++/// that ends `Ready` has written the events it saw into every descriptor of
++/// the array, so the caller learns which ones fired and with what, and need
++/// not ask the descriptors again.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct HostPollFd {
++    /// A descriptor the host itself can wait on.
++    pub fd: i32,
++    /// The events the guest asked for, as `HOST_POLL_*` bits.
++    pub events: u16,
++    /// The events the host saw, as `HOST_POLL_*` bits. Written by the wait.
++    pub revents: u16,
++    /// One when the descriptor still holds bytes, written by the wait
++    /// alongside a `revents` carrying [`HOST_POLL_RDHUP`] and zero on every
++    /// other descriptor. A peer that has shut its writing half down reports
++    /// the same readiness whether or not it sent a last request first, and
++    /// a byte peeked on that turn tells the two apart.
++    pub nbytes: u32,
++}
++
++/// The most descriptors one direct wait names, which is what a caller sizes
++/// its arrays by and what a host's wait must accept alongside whatever
++/// interrupt descriptor of its own it adds.
++///
++/// A wait larger than this is refused rather than truncated: a truncated
++/// wait would sleep through the descriptors it dropped.
++pub const HOST_POLL_FDS_MAX: usize = 64;
++
++/// Readiness bit: readable. As an `events` bit it is a request; hangup and
++/// error need no request, because every kernel that can report them does so
++/// whatever was asked for.
++pub const HOST_POLL_READ: u16 = 1 << 0;
++/// Readiness bit: writable.
++pub const HOST_POLL_WRITE: u16 = 1 << 1;
++/// Readiness bit: the peer has gone away. Reported, never requested.
++pub const HOST_POLL_HUP: u16 = 1 << 2;
++/// Readiness bit: an error is waiting on the descriptor. Reported, never
++/// requested.
++pub const HOST_POLL_ERR: u16 = 1 << 3;
++/// Readiness bit: the peer has shut its writing half down. Unlike hangup
++/// this one must be asked for, and it is kept apart from hangup because the
++/// two mean different things to a guest: a stream whose peer has sent its
++/// last byte can still be written to.
++pub const HOST_POLL_RDHUP: u16 = 1 << 4;
++
++/// The result of a direct descriptor wait.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[repr(u8)]
++pub enum HostPollFdResult {
++    /// At least one descriptor reported an event, and every descriptor's
++    /// `revents` says what it was.
++    Ready = 1,
++    /// The deadline elapsed with no descriptor ready.
++    TimedOut = 2,
++    /// The guest thread's interrupt generation or the freeze gate changed.
++    Interrupted = 3,
++    /// This host cannot perform the wait; the guest must use its fallback.
++    Unavailable = 4,
++}
++
++impl TryFrom<u8> for HostPollFdResult {
++    type Error = ();
++
++    fn try_from(value: u8) -> Result<Self, ()> {
++        match value {
++            value if value == Self::Ready as u8 => Ok(Self::Ready),
++            value if value == Self::TimedOut as u8 => Ok(Self::TimedOut),
++            value if value == Self::Interrupted as u8 => Ok(Self::Interrupted),
++            value if value == Self::Unavailable as u8 => Ok(Self::Unavailable),
++            _ => Err(()),
++        }
++    }
++}
++
++/// One direct descriptor wait, as handed to the kernel backend.
++///
++/// The descriptor array and both generation words are live for the duration
++/// of the wait, and the array is the wait's to write: it fills in every
++/// `revents` before it answers `Ready`. The wait ends when any descriptor
++/// becomes ready, when either generation leaves its expected value, or at
++/// the deadline, and answers `Unavailable` without blocking if it cannot.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct HostPollFdWait {
++    /// The descriptors, the events wanted on each, and the events seen.
++    pub fds: *mut HostPollFd,
++    /// How many of them.
++    pub fd_count: usize,
+     /// Per-guest-thread interrupt generation.
+     pub interrupt: *const u32,
+     /// Expected interrupt generation.
+@@ -113,6 +221,23 @@ pub(crate) struct HostFutexWait {
+     pub deadline: Option<Instant>,
+ }
+ 
++/// A direct descriptor wait retained while its coroutine is suspended.
++#[derive(Clone, Copy, Debug)]
++pub struct SuspendedPollFd {
++    fds: NonNull<HostPollFd>,
++    fd_count: usize,
++    epoch: u64,
++    interrupt: NonNull<AtomicU32>,
++    interrupt_expected: u32,
++    deadline: Option<Instant>,
++    result: NonNull<AtomicU8>,
++}
++
++// SAFETY: as for `SuspendedFutex`: the descriptor array and the result live
++// on the suspended coroutine's stack, which stays intact, and only the host
++// loop driving that coroutine touches them.
++unsafe impl Send for SuspendedPollFd {}
++
+ /// A direct futex wait retained while its coroutine is suspended.
+ #[derive(Clone, Copy, Debug)]
+ pub struct SuspendedFutex {
+@@ -160,6 +285,15 @@ pub type SleepHook = fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send + Sy
+ static ENABLED: AtomicBool = AtomicBool::new(false);
+ static SLEEP_HOOK: OnceLock<SleepHook> = OnceLock::new();
+ 
++/// Bumped whenever the descriptors a suspended wait named may no longer mean
++/// what they did. Resurrecting the coroutines is that moment: the process
++/// they are resurrected in is a forked child whose networking has been
++/// rebuilt, so a listening socket the parent named is not the one the child
++/// serves. A wait carried across it is answered `Unavailable` and its caller
++/// falls back to the runtime's own wait, which resolves the descriptors
++/// afresh.
++static POLLFD_EPOCH: AtomicU64 = AtomicU64::new(0);
++
+ /// Enables suspension process-wide: host imports run on the coroutine stack
+ /// and blocking waits suspend the coroutine. `sleep` supplies timers for the
+ /// waits wasmer-vm implements itself. Irreversible.
+@@ -173,6 +307,116 @@ pub fn enabled() -> bool {
+     ENABLED.load(Ordering::Relaxed)
+ }
+ 
++/// Ends the direct descriptor wait of every thread whose interrupt word is
++/// `address`, or of every waiting thread when `address` is null.
++///
++/// A thread inside `poll(2)` sees neither a changed generation word nor a
++/// waker, so whoever changes one must say so here. Callable at any time: a
++/// process with nobody waiting directly answers on one atomic load.
++pub fn wake_host_pollfd(address: *const u32) {
++    super::pollfd::wake(address);
++}
++
++/// Whether a direct wait on host descriptors can be made at all.
++///
++/// It does not depend on suspension: a coroutine that can suspend hands the
++/// wait to its host loop, and a thread that cannot is the thread that wants
++/// the readiness anyway, so it waits where it stands.
++pub fn can_suspend_on_pollfd() -> bool {
++    super::pollfd::supported()
++}
++
++/// Suspends this coroutine in a direct wait on `fds`, on the thread's
++/// interrupt word and on the freeze gate, until `deadline`. Returns `None`
++/// without yielding when the caller should use its existing wait.
++///
++/// On [`HostPollFdResult::Ready`] every entry of `fds` carries the events
++/// that descriptor reported; on any other answer their `revents` mean
++/// nothing.
++///
++/// `interrupt` must remain alive and aligned until this call returns, and
++/// its value must have been captured before the caller's last check for
++/// pending signals, so that a notification in between is not lost.
++///
++/// # Safety
++///
++/// Every descriptor in `fds` must stay open for the duration of the wait -
++/// the caller keeps whatever owns them alive - and `interrupt` must point to
++/// a live, aligned `AtomicU32`.
++pub unsafe fn try_suspend_on_pollfd(
++    fds: &mut [HostPollFd],
++    interrupt: *const AtomicU32,
++    interrupt_expected: u32,
++    deadline: Option<Instant>,
++) -> Option<HostPollFdResult> {
++    if fds.is_empty() || !can_suspend_on_pollfd() {
++        return None;
++    }
++    let yielder = match enabled().then(yielder_get).flatten() {
++        Some(yielder) => yielder,
++        // Nothing to suspend: this thread is the one that wants the
++        // readiness and it is going nowhere, so it does the wait itself.
++        // There is no freeze without suspension either, so the gate this
++        // names cannot move under it.
++        None => {
++            // SAFETY: the caller's contract is this function's, and it
++            // keeps the descriptors and the word alive for the wait.
++            return Some(unsafe { wait_pollfd_here(fds, interrupt, interrupt_expected, deadline) });
++        }
++    };
++    let interrupt = NonNull::new(interrupt.cast_mut())?;
++    let result = AtomicU8::new(FUTEX_PENDING);
++    let fd_count = fds.len();
++    let wait = SuspendedPollFd {
++        fds: NonNull::new(fds.as_mut_ptr())?,
++        fd_count,
++        epoch: POLLFD_EPOCH.load(Ordering::SeqCst),
++        interrupt,
++        interrupt_expected,
++        deadline,
++        result: NonNull::from(&result),
++    };
++    // SAFETY: the yielder belongs to the running coroutine, and both the
++    // descriptor array and the result stay on its suspended stack.
++    unsafe { yielder.as_ref().suspend(WasmYield::PollFd(wait)) };
++    yielder_set(Some(yielder));
++    let value = result.load(Ordering::Acquire);
++    Some(
++        HostPollFdResult::try_from(value)
++            .unwrap_or_else(|()| panic!("host resumed a poll wait with invalid result {value}")),
++    )
++}
++
++/// The same wait, made on the calling thread because there is no coroutine
++/// to hand it to.
++///
++/// Suspension is what lets a wait leave its OS thread; without it the
++/// thread that named the descriptors is the thread that wants them, and
++/// blocking it here is what the path this replaces did anyway. The freeze
++/// gate is named for uniformity and cannot move: freezing needs suspension.
++///
++/// # Safety
++///
++/// As [`try_suspend_on_pollfd`]: the descriptors stay open for the wait and
++/// `interrupt` points to a live, aligned `AtomicU32`.
++unsafe fn wait_pollfd_here(
++    fds: &mut [HostPollFd],
++    interrupt: *const AtomicU32,
++    interrupt_expected: u32,
++    deadline: Option<Instant>,
++) -> HostPollFdResult {
++    let request = HostPollFdWait {
++        fd_count: fds.len(),
++        fds: fds.as_mut_ptr(),
++        interrupt: interrupt.cast(),
++        interrupt_expected,
++        gate: (&GATE_EPOCH as *const AtomicU32).cast(),
++        gate_expected: GATE_EPOCH.load(Ordering::SeqCst),
++        deadline,
++    };
++    super::pollfd::wait(request)
++}
++
+ /// Wakes at most `count` direct futex waiters on `address`, returning how
+ /// many woke.
+ ///
+@@ -386,6 +630,68 @@ fn wait_futex(wait: SuspendedFutex, gate: Option<&mut dyn TopLevelCoro>) {
+     }
+ }
+ 
++/// Waits directly on host descriptors without remaining active while
++/// blocked, exactly as [`wait_futex`] does for a futex word: a long wait
++/// must not hold a freeze off, and the gate generation is what makes ending
++/// it race-free.
++fn wait_pollfd(wait: SuspendedPollFd, gate: Option<&mut dyn TopLevelCoro>) {
++    if wait.result().is_some() {
++        return;
++    }
++    // A wait that was yielded before the descriptors were rebuilt names
++    // numbers this process may have given to something else, so it is not
++    // performed at all; the caller resolves them again on its own path.
++    if wait.epoch != POLLFD_EPOCH.load(Ordering::SeqCst) {
++        wait.complete(HostPollFdResult::Unavailable);
++        return;
++    }
++    if !try_enter(gate.is_some()) {
++        retire(gate.expect("only gated loops are refused"));
++    }
++    let gate_expected = GATE_EPOCH.load(Ordering::SeqCst);
++    if gate.is_some() && GATE_CLOSED.load(Ordering::SeqCst) {
++        leave();
++        retire(gate.expect("a closed gate only retires a gated loop"));
++    }
++    let request = HostPollFdWait {
++        fds: wait.fds.as_ptr(),
++        fd_count: wait.fd_count,
++        interrupt: wait.interrupt.as_ptr().cast(),
++        interrupt_expected: wait.interrupt_expected,
++        gate: (&GATE_EPOCH as *const AtomicU32).cast(),
++        gate_expected,
++        deadline: wait.deadline,
++    };
++    // The kernel wait itself must not count as active, for the reason the
++    // futex wait gives: the gate generation, and the wake that goes with it,
++    // make closing the gate race-free while a thread is asleep in it.
++    leave();
++    let result = super::pollfd::wait(request);
++    if gate.is_some() && GATE_CLOSED.load(Ordering::SeqCst) {
++        retire(gate.expect("a closed gate only retires a gated loop"));
++    }
++    wait.complete(result);
++}
++
++impl SuspendedPollFd {
++    fn result(self) -> Option<HostPollFdResult> {
++        // SAFETY: the result belongs to the suspended coroutine and this host
++        // loop is its only driver.
++        match unsafe { self.result.as_ref() }.load(Ordering::Acquire) {
++            FUTEX_PENDING => None,
++            value => Some(
++                HostPollFdResult::try_from(value)
++                    .unwrap_or_else(|()| panic!("invalid stored poll result {value}")),
++            ),
++        }
++    }
++
++    fn complete(self, result: HostPollFdResult) {
++        // SAFETY: as above.
++        unsafe { self.result.as_ref() }.store(result as u8, Ordering::Release);
++    }
++}
++
+ impl SuspendedFutex {
+     fn result(self) -> Option<HostFutexResult> {
+         match unsafe { self.result.as_ref() }.load(Ordering::Acquire) {
+@@ -464,6 +770,7 @@ struct Fused<'a, F: Future> {
+ enum PendingWait {
+     Future(BlockedFuture),
+     Futex(SuspendedFutex),
++    PollFd(SuspendedPollFd),
+ }
+ 
+ impl<F: Future> Future for Fused<'_, F> {
+@@ -558,6 +865,9 @@ impl<T: 'static> GuestCoro<T> {
+             CoroutineResult::Yield(WasmYield::Futex(wait)) => {
+                 self.pending = Some(PendingWait::Futex(*wait));
+             }
++            CoroutineResult::Yield(WasmYield::PollFd(wait)) => {
++                self.pending = Some(PendingWait::PollFd(*wait));
++            }
+             _ => {}
+         }
+         result
+@@ -628,6 +938,15 @@ pub(crate) fn run_wasm_call<F: FnOnce() -> T + 'static, T: 'static>(
+                 }
+                 None => wait_futex(wait, None),
+             },
++            CoroutineResult::Yield(WasmYield::PollFd(wait)) => match outer {
++                Some(outer) => {
++                    // SAFETY: as for the waits above, this propagates the
++                    // inner coroutine's suspension to its live outer owner.
++                    unsafe { outer.as_ref().suspend(WasmYield::PollFd(wait)) };
++                    yielder_set(Some(outer));
++                }
++                None => wait_pollfd(wait, None),
++            },
+             CoroutineResult::Return(result) => break result,
+         }
+     };
+@@ -705,6 +1024,9 @@ impl<T: 'static> TopLevelCoro for GuestCoro<T> {
+             CoroutineResult::Yield(WasmYield::Futex(wait)) => {
+                 Step::Blocked(PendingWait::Futex(wait))
+             }
++            CoroutineResult::Yield(WasmYield::PollFd(wait)) => {
++                Step::Blocked(PendingWait::PollFd(wait))
++            }
+             CoroutineResult::Yield(WasmYield::Unwind(_)) => {
+                 // SAFETY: as in `run_wasm_call`: `unwind_with` guarantees only
+                 // Wasm frames on the stack.
+@@ -817,6 +1139,7 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<PendingWait>) {
+             match wait {
+                 PendingWait::Future(fut) => wait_ready(fut, Some(coro)),
+                 PendingWait::Futex(wait) => wait_futex(wait, Some(coro)),
++                PendingWait::PollFd(wait) => wait_pollfd(wait, Some(coro)),
+             }
+         }
+         if !try_enter(coro.started()) {
+@@ -846,6 +1169,11 @@ fn host_loop(ptr: NonNull<dyn TopLevelCoro>, mut pending: Option<PendingWait>) {
+ fn retire(coro: &mut dyn TopLevelCoro) -> ! {
+     log!(trace, id = coro.id(), "retiring: the gate is closed");
+     coro.capture_thread_state();
++    // This thread leaves through the raw exit syscall below and runs no
++    // destructor, so what the descriptor wait keeps per thread is released
++    // here. It is out of its wait by now: the wait returned before this was
++    // reached.
++    super::pollfd::thread_retiring();
+     HOST_LOOPS.fetch_sub(1, Ordering::SeqCst);
+     exit_current_thread()
+ }
+@@ -873,6 +1201,12 @@ pub fn close_gate() {
+     GATE_CLOSED.store(true, Ordering::SeqCst);
+     GATE_EPOCH.fetch_add(1, Ordering::SeqCst);
+     let _ = wake_host_futex((&GATE_EPOCH as *const AtomicU32).cast(), u32::MAX);
++    // A thread asleep in a direct descriptor wait watches the gate word but
++    // cannot be woken through it, so say so explicitly, for every waiter.
++    // The wake cannot be lost: a waiter registers before it looks at the
++    // generation, so either it is registered here or it has yet to read a
++    // generation this call has already changed.
++    wake_host_pollfd(std::ptr::null());
+     log!(debug, "gate closed");
+ }
+ 
+@@ -1032,6 +1366,9 @@ pub fn resurrect_all(
+         }
+     }
+     log!(debug, coroutines = entries.len(), "resurrecting");
++    // The descriptors of any wait suspended before this point belong to the
++    // process that was forked, not to this one.
++    POLLFD_EPOCH.fetch_add(1, Ordering::SeqCst);
+     open_gate();
+     for entry in &entries {
+         let entry = *entry;
+diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
+index b654795..7232756 100644
+--- a/lib/wasix/src/net/socket.rs
++++ b/lib/wasix/src/net/socket.rs
+@@ -1728,6 +1728,13 @@ impl InodeSocket {
+             _ => false,
+         }
+     }
++
++    /// The host descriptor a caller can wait on itself instead of going
++    /// through the shared event selector, or `None` when there is none.
++    #[cfg(unix)]
++    pub fn host_fd(&self) -> Option<std::os::fd::RawFd> {
++        self.inner.protected.read().unwrap().host_fd()
++    }
+ }
+ 
+ /// On connected UDP sockets, discard datagrams not from the stored peer.
+@@ -1792,6 +1799,32 @@ impl InodeSocketProtected {
+         }
+     }
+ 
++    /// The raw host descriptor whose kernel readiness is this socket's.
++    ///
++    /// A caller that has one for every socket it waits on can block on the
++    /// descriptors itself instead of registering handlers with the shared
++    /// event selector. Only the three states whose readiness comes straight
++    /// off a kernel socket can answer: a stream, a listener, and a datagram
++    /// socket with no peer set. A datagram socket *with* a peer filters
++    /// arriving packets in the runtime, so kernel readiness is not the same
++    /// as its readiness; a pre-socket and a bound-but-not-listening socket
++    /// have nothing to wait on; a remote socket lives at the other end of a
++    /// protocol.
++    #[cfg(unix)]
++    pub fn host_fd(&self) -> Option<std::os::fd::RawFd> {
++        match &self.kind {
++            InodeSocketKind::TcpListener { socket, .. } => socket.host_fd(),
++            InodeSocketKind::TcpStream { socket, .. } => socket.host_fd(),
++            InodeSocketKind::UdpSocket { socket, peer: None } => socket.host_fd(),
++            InodeSocketKind::UdpSocket { peer: Some(_), .. }
++            | InodeSocketKind::Raw(..)
++            | InodeSocketKind::Icmp(..)
++            | InodeSocketKind::BoundTcp { .. }
++            | InodeSocketKind::PreSocket { .. }
++            | InodeSocketKind::RemoteSocket { .. } => None,
++        }
++    }
++
+     pub fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+         match &mut self.kind {
+             InodeSocketKind::TcpListener { socket, .. } => socket.poll_read_ready(cx),
+@@ -2112,6 +2145,46 @@ pub(crate) mod tests {
+         }
+     }
+ 
++    /// Only the states whose readiness comes off a kernel socket may answer
++    /// with a descriptor, and only when the backend has one. The mock
++    /// backend has none, so every state built on it answers `None`.
++    #[cfg(unix)]
++    #[test]
++    fn host_fd_is_absent_without_a_host_backend() {
++        let socket = close_tracking_socket(Arc::new(AtomicUsize::new(0)));
++        assert_eq!(socket.host_fd(), None);
++        assert_eq!(socket.inner.protected.read().unwrap().host_fd(), None);
++    }
++
++    /// A socket that has not been bound or connected has nothing to wait on.
++    #[cfg(unix)]
++    #[test]
++    fn host_fd_is_absent_for_a_pre_socket() {
++        let socket = InodeSocket::new(InodeSocketKind::PreSocket {
++            props: SocketProperties {
++                family: Addressfamily::Inet4,
++                ty: Socktype::Stream,
++                pt: SockProto::Tcp,
++                only_v6: false,
++                reuse_port: false,
++                reuse_addr: false,
++                no_delay: None,
++                keep_alive: None,
++                dont_route: None,
++                send_buf_size: None,
++                recv_buf_size: None,
++                write_timeout: None,
++                read_timeout: None,
++                accept_timeout: None,
++                connect_timeout: None,
++                handler: None,
++            },
++            addr: None,
++        });
++        assert_eq!(socket.host_fd(), None);
++        assert_eq!(socket.inner.protected.read().unwrap().host_fd(), None);
++    }
++
+     #[test]
+     fn inode_socket_poll_write_ready_uses_write_path() {
+         let read_calls = Arc::new(AtomicUsize::new(0));
+diff --git a/lib/wasix/src/os/task/thread.rs b/lib/wasix/src/os/task/thread.rs
+index b8b4f71..ef4c5e5 100644
+--- a/lib/wasix/src/os/task/thread.rs
++++ b/lib/wasix/src/os/task/thread.rs
+@@ -402,13 +402,23 @@ impl WasiThread {
+         (word, word.load(Ordering::SeqCst))
+     }
+ 
++    /// Whether a signal is queued. Read after capturing the interrupt
++    /// generation: the flag is set before the generation changes, so a
++    /// reader that sees neither has not passed a signal.
++    pub fn signals_pending(&self) -> bool {
++        self.state.signals_pending.load(Ordering::Acquire)
++    }
++
+     fn interrupt_waits(&self) {
+         self.state.wait_interrupt.fetch_add(1, Ordering::SeqCst);
+         #[cfg(feature = "direct-waits")]
+-        let _ = wasmer_vm::wake_host_futex(
+-            (&self.state.wait_interrupt as *const AtomicU32).cast(),
+-            u32::MAX,
+-        );
++        {
++            let word = (&self.state.wait_interrupt as *const AtomicU32).cast();
++            let _ = wasmer_vm::wake_host_futex(word, u32::MAX);
++            // A thread waiting directly on host descriptors watches this
++            // word but cannot be woken through it.
++            wasmer_vm::wake_host_pollfd(word);
++        }
+     }
+ 
+     /// Returns all the signals that are waiting to be processed

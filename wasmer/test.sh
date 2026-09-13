@@ -56,4 +56,9 @@ packages=()
 for crate in "${crates[@]}"; do
   packages+=(-p "$crate")
 done
+# The servicecache set keeps wasix's direct kernel waits behind a feature
+# that the host and the CLI ask for, so their tests are asked for here.
+if [[ "$WASMER_VARIANT" == servicecache ]]; then
+  packages+=(--features wasmer-wasix/direct-waits)
+fi
 run_tests "${packages[@]}" "$@"

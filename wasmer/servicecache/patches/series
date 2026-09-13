@@ -16,3 +16,5 @@
 0016-wasix-snapshot-shared-memory-across-native-forks.patch
 0017-wasix-wait-on-an-interruptible-host-futex.patch
 0018-wasix-suspend-finite-clock-only-polls-directly.patch
+0019-vm-wait-on-host-descriptors-from-the-thread-that-nee.patch
+0020-wasix-serve-a-level-triggered-socket-from-the-waitin.patch

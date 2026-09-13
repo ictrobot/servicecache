@@ -374,6 +374,15 @@ struct PassedListener {
 }
 
 impl VirtualTcpListener for PassedListener {
+    /// Forwarded, so that a guest thread waiting on this listener can wait
+    /// on the kernel descriptor itself.
+    fn host_fd(&self) -> Option<RawFd> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .host_fd()
+    }
+
     fn try_accept(
         &mut self,
     ) -> virtual_net::Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
@@ -558,6 +567,12 @@ impl VirtualConnectedSocket for TrackedStream {
 }
 
 impl VirtualTcpSocket for TrackedStream {
+    /// Forwarded, so that a guest thread waiting on this stream can wait
+    /// on the kernel descriptor itself.
+    fn host_fd(&self) -> Option<RawFd> {
+        self.inner.host_fd()
+    }
+
     fn set_recv_buf_size(&mut self, size: usize) -> virtual_net::Result<()> {
         self.inner.set_recv_buf_size(size)
     }
