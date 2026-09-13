@@ -77,10 +77,10 @@ index f250835..0e842db 100644
          let handler: MockHandlerSlot = Arc::new(StdMutex::new(None));
          let socket = InodeSocket::new(InodeSocketKind::TcpStream {
 diff --git a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
-index f239f1a..907b28f 100644
+index f239f1a..ae4db1e 100644
 --- a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
 +++ b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
-@@ -272,6 +272,414 @@ impl Future for PollBatch {
+@@ -272,6 +272,449 @@ impl Future for PollBatch {
      }
  }
  
@@ -101,8 +101,12 @@ index f239f1a..907b28f 100644
 +    /// The call ends with this error code, which processing a signal asked
 +    /// for.
 +    Errno(Errno),
-+    /// The existing path runs exactly as it would have.
-+    Fallthrough,
++    /// The existing path runs exactly as it would have. With a reason, the
++    /// call had sockets it could have polled for itself and hands them to
++    /// that path, whose guards register them with the selector for the rest
++    /// of their lives; without one, it had none, or a subscription the
++    /// existing path refuses before it registers anything.
++    Fallthrough(Option<&'static str>),
 +}
 +
 +/// One subscription the calling thread polls for itself: a read or a write
@@ -257,7 +261,7 @@ index f239f1a..907b28f 100644
 +#[cfg(all(unix, feature = "direct-waits"))]
 +fn direct_poll_answer(events: Vec<Event>) -> DirectPoll {
 +    if events.is_empty() {
-+        DirectPoll::Fallthrough
++        DirectPoll::Fallthrough(Some("descriptor-unresolvable"))
 +    } else {
 +        DirectPoll::Events(events)
 +    }
@@ -315,7 +319,7 @@ index f239f1a..907b28f 100644
 +                // More sockets than the host's wait accepts. The call takes
 +                // the existing path whole rather than splitting the set,
 +                // which is correct and not fast.
-+                return Ok(DirectPoll::Fallthrough);
++                return Ok(DirectPoll::Fallthrough(Some("set-too-large")));
 +            }
 +            Some(sub) => {
 +                direct[ndirect] = Some(sub);
@@ -325,16 +329,16 @@ index f239f1a..907b28f 100644
 +                Ok(guard) => guarded.push(guard),
 +                // The existing path reports this refusal the way it always
 +                // has.
-+                Err(_) => return Ok(DirectPoll::Fallthrough),
++                Err(_) => return Ok(DirectPoll::Fallthrough(None)),
 +            },
 +        }
 +    }
 +    if ndirect == 0 {
-+        return Ok(DirectPoll::Fallthrough);
++        return Ok(DirectPoll::Fallthrough(None));
 +    }
 +
 +    let Some(deadline) = direct_poll_deadline(time_to_sleep) else {
-+        return Ok(DirectPoll::Fallthrough);
++        return Ok(DirectPoll::Fallthrough(Some("deadline-overflow")));
 +    };
 +
 +    let mut joins: Vec<InodeValFilePollGuardJoin> = guarded
@@ -409,7 +413,7 @@ index f239f1a..907b28f 100644
 +            if ctx.data().thread.signals_pending() {
 +                // A signal the runtime cannot deliver right now stays
 +                // queued, and looking at it again here would spin.
-+                return Ok(DirectPoll::Fallthrough);
++                return Ok(DirectPoll::Fallthrough(Some("signal-undeliverable")));
 +            }
 +            continue;
 +        }
@@ -480,7 +484,7 @@ index f239f1a..907b28f 100644
 +                if wasmer_vm::pollfd_epoch() != epoch {
 +                    continue;
 +                }
-+                return Ok(DirectPoll::Fallthrough);
++                return Ok(DirectPoll::Fallthrough(Some("host-unavailable")));
 +            }
 +        }
 +    }
@@ -492,10 +496,41 @@ index f239f1a..907b28f 100644
 +    tracing::trace!(direct, outcome, nfds, "poll oneoff answered");
 +}
 +
++/// The event for a call the direct wait handed to the existing path, with
++/// the reason when it had sockets to hand over.
++///
++/// Those sockets are registered with the selector by the guards the existing
++/// path builds, for the rest of their lives, so every event on them costs a
++/// selector wake from then on even when later calls poll them directly. The
++/// first such call in a process is also a warning, under the
++/// `wasmer_wasix::performance` target; the rest would only repeat it and
++/// stay at trace.
++#[cfg(all(unix, feature = "direct-waits"))]
++fn trace_poll_fallthrough(reason: Option<&'static str>, nfds: usize) {
++    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++    if let Some(reason) = reason
++        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
++    {
++        tracing::warn!(
++            target: "wasmer_wasix::performance",
++            reason,
++            nfds,
++            "poll_oneoff fell back to the slow path"
++        );
++    }
++    tracing::trace!(
++        direct = false,
++        outcome = "fallthrough",
++        reason,
++        nfds,
++        "poll oneoff answered"
++    );
++}
++
  pub(crate) fn poll_fd_guard(
      state: &Arc<WasiState>,
      peb: PollEventSet,
-@@ -414,6 +822,101 @@ where
+@@ -414,6 +857,101 @@ where
          };
      }
  
@@ -586,7 +621,7 @@ index f239f1a..907b28f 100644
 +                trace_poll_call(true, "errno", subs_len);
 +                return Ok(errno);
 +            }
-+            DirectPoll::Fallthrough => trace_poll_call(false, "fallthrough", subs_len),
++            DirectPoll::Fallthrough(reason) => trace_poll_fallthrough(reason, subs_len),
 +        }
 +    }
 +    // Taken again: the branch above needs the context for as long as it
@@ -597,7 +632,7 @@ index f239f1a..907b28f 100644
      let mut events_seen: u32 = 0;
  
      let batch = {
-@@ -464,33 +967,6 @@ where
+@@ -464,33 +1002,6 @@ where
      };
  
      // Function to process a timeout
@@ -631,7 +666,7 @@ index f239f1a..907b28f 100644
  
      #[cfg(feature = "sys")]
      if env.capabilities.threading.enable_blocking_sleep && subs_len == 1 {
-@@ -501,7 +977,7 @@ where
+@@ -501,7 +1012,7 @@ where
          // real-time demands with greater precision.
          if let Some(timeout) = timeout {
              std::thread::sleep(timeout);
@@ -640,7 +675,7 @@ index f239f1a..907b28f 100644
              return Ok(Errno::Success);
          }
      }
-@@ -524,43 +1000,6 @@ where
+@@ -524,43 +1035,6 @@ where
          }
      };
  
@@ -684,7 +719,7 @@ index f239f1a..907b28f 100644
      // We use asyncify with a deep sleep to wait on new IO events
      let res = __asyncify_with_deep_sleep::<M, Result<Vec<EventResult>, Errno>, _>(
          ctx,
-@@ -572,3 +1011,245 @@ where
+@@ -572,3 +1046,245 @@ where
      }
      Ok(Errno::Success)
  }
@@ -846,7 +881,7 @@ index f239f1a..907b28f 100644
 +
 +        assert!(matches!(
 +            direct_poll_answer(Vec::new()),
-+            DirectPoll::Fallthrough
++            DirectPoll::Fallthrough(Some("descriptor-unresolvable"))
 +        ));
 +        let DirectPoll::Events(events) = direct_poll_answer(vec![collected]) else {
 +            panic!("the events the guards reported were discarded");
@@ -931,7 +966,7 @@ index f239f1a..907b28f 100644
 +    }
 +}
 diff --git a/lib/wasix/src/syscalls/wasix/epoll_wait.rs b/lib/wasix/src/syscalls/wasix/epoll_wait.rs
-index 75f6213..03ebc41 100644
+index 36f1cb1..c784249 100644
 --- a/lib/wasix/src/syscalls/wasix/epoll_wait.rs
 +++ b/lib/wasix/src/syscalls/wasix/epoll_wait.rs
 @@ -33,24 +33,26 @@ enum DirectEpoll {

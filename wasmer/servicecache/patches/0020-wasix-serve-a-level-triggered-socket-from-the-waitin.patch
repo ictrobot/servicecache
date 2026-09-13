@@ -1380,10 +1380,10 @@ index ef4c5e5..dbca714 100644
          self.state.wait_interrupt.fetch_add(1, Ordering::SeqCst);
          #[cfg(feature = "direct-waits")]
 diff --git a/lib/wasix/src/syscalls/wasix/epoll_wait.rs b/lib/wasix/src/syscalls/wasix/epoll_wait.rs
-index d1b56a3..75f6213 100644
+index d1b56a3..36f1cb1 100644
 --- a/lib/wasix/src/syscalls/wasix/epoll_wait.rs
 +++ b/lib/wasix/src/syscalls/wasix/epoll_wait.rs
-@@ -1,16 +1,371 @@
+@@ -1,16 +1,387 @@
  use wasmer_wasix_types::wasi::{EpollData, EpollEvent, EpollType, SubscriptionClock, Userdata};
  
  use super::*;
@@ -1517,6 +1517,12 @@ index d1b56a3..75f6213 100644
 +/// Hands every direct-served subscription in the set back to the selector
 +/// and says why, so that a run that stopped serving itself can be told from
 +/// one that never started.
++///
++/// A demoted set stays with the selector for the rest of its life, and every
++/// event on its sockets then costs a selector wake again, so the first
++/// demotion in a process that moved anything is also a warning, under the
++/// `wasmer_wasix::performance` target; the rest would only repeat it and
++/// stay at debug.
 +#[cfg(all(unix, feature = "direct-waits"))]
 +fn demote_with_reason(
 +    epoll_state: &Arc<EpollState>,
@@ -1524,7 +1530,17 @@ index d1b56a3..75f6213 100644
 +    epfd: WasiFd,
 +    reason: &'static str,
 +) {
++    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 +    let demoted = epoll_state.demote_direct(state);
++    if demoted > 0 && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
++        tracing::warn!(
++            target: "wasmer_wasix::performance",
++            epfd,
++            reason,
++            demoted,
++            "epoll set fell back to the slow path"
++        );
++    }
 +    tracing::debug!(
 +        epfd,
 +        reason,
@@ -1756,7 +1772,7 @@ index d1b56a3..75f6213 100644
  /// ### `epoll_wait()`
  /// Wait for an I/O event on an epoll file descriptor
  #[instrument(level = "trace", skip_all, fields(timeout_ms = field::Empty, fd_guards = field::Empty, seen = field::Empty), ret)]
-@@ -46,42 +401,6 @@ pub fn epoll_wait<M: MemorySize + 'static>(
+@@ -46,42 +417,6 @@ pub fn epoll_wait<M: MemorySize + 'static>(
          }
      };
  
@@ -1799,7 +1815,7 @@ index d1b56a3..75f6213 100644
      // We replace the process events callback with another callback
      // which will interpret the error codes
      let process_events = {
-@@ -136,21 +455,108 @@ pub fn epoll_wait<M: MemorySize + 'static>(
+@@ -136,21 +471,108 @@ pub fn epoll_wait<M: MemorySize + 'static>(
          }
      };
  
