@@ -1,0 +1,346 @@
+Subject: virtual-net: answer a listener's readiness without accepting
+
+A host listener answered whether a connection was waiting by accepting
+one and keeping it in a backlog of its own, and an accept then took it
+from there. That is a second place readiness can live, which anything
+that looks only at the kernel descriptor - a poll, an epoll set, another
+thread - then has to be told about. Leaving the connection in the kernel
+is simpler.
+
+Readiness is now one zero-timeout poll on the listening descriptor,
+which reports a pending connection without taking it, and an accept
+takes it from the kernel when the guest asks. The same probe already
+decided whether to reassert readiness after an accept; on Windows,
+where that was a stub, it is WSAPoll, so the reassert works there too.
+Windows also needs the interest put back when a probe finds nothing,
+whether asked for readiness or after an accept that emptied the queue:
+mio's readiness there is one-shot, re-armed by an operation returning
+WouldBlock, which the accept in the old readiness check was and a probe
+of the kernel is not. Selector::rearm registers the source again, as
+mio itself does on WouldBlock.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index a72232c..8c47f6b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -6888,6 +6888,7 @@ dependencies = [
+  "tracing",
+  "tracing-test",
+  "virtual-mio",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+diff --git a/lib/virtual-io/src/guard.rs b/lib/virtual-io/src/guard.rs
+index 60d5596..b499542 100644
+--- a/lib/virtual-io/src/guard.rs
++++ b/lib/virtual-io/src/guard.rs
+@@ -52,6 +52,19 @@ impl InterestGuard {
+         }
+     }
+ 
++    /// See [`Selector::rearm`].
++    #[cfg(windows)]
++    pub fn rearm(
++        &self,
++        source: &mut dyn mio::event::Source,
++        interests: mio::Interest,
++    ) -> io::Result<()> {
++        match self.selector.upgrade() {
++            Some(selector) => selector.rearm(self.token, source, interests),
++            None => Ok(()),
++        }
++    }
++
+     pub fn interest(&mut self, interest: InterestType) {
+         if let Some(selector) = self.selector.upgrade() {
+             selector.push_interest(self.token, interest);
+diff --git a/lib/virtual-io/src/selector.rs b/lib/virtual-io/src/selector.rs
+index 858f80e..e3fb43b 100644
+--- a/lib/virtual-io/src/selector.rs
++++ b/lib/virtual-io/src/selector.rs
+@@ -177,6 +177,22 @@ impl Selector {
+         Ok(())
+     }
+ 
++    /// Registers `source` again under `token`, for a source that has found
++    /// it has nothing to do without asking mio. On Windows mio's readiness
++    /// is one-shot: delivering an event takes that interest out of the
++    /// socket's registration, and mio puts it back when an operation on the
++    /// socket returns `WouldBlock`, which a probe of the kernel never does.
++    #[cfg(windows)]
++    pub fn rearm(
++        &self,
++        token: Token,
++        source: &mut dyn mio::event::Source,
++        interests: mio::Interest,
++    ) -> io::Result<()> {
++        let inner_registry = self.registry.lock().unwrap();
++        source.reregister(&inner_registry, token, interests)
++    }
++
+     pub fn push_interest(&self, token: Token, interest: InterestType) {
+         self.queue_modification(SelectorModification::PushInterest { token, interest });
+     }
+diff --git a/lib/virtual-net/Cargo.toml b/lib/virtual-net/Cargo.toml
+index 7c6528e..6e5d8d2 100644
+--- a/lib/virtual-net/Cargo.toml
++++ b/lib/virtual-net/Cargo.toml
+@@ -82,3 +82,5 @@ rkyv = ["dep:rkyv", "dep:bytecheck"]
+ [package.metadata.docs.rs]
+ features = ["host-net", "remote"]
+ rustc-args = ["--cfg", "docsrs"]
++[target.'cfg(windows)'.dependencies]
++windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
+index 68c5630..67e581a 100644
+--- a/lib/virtual-net/src/host.rs
++++ b/lib/virtual-net/src/host.rs
+@@ -299,7 +299,6 @@ pub struct LocalTcpListener {
+     handler_guard: HandlerGuardState,
+     no_delay: Option<bool>,
+     keep_alive: Option<bool>,
+-    backlog: VecDeque<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)>,
+     ruleset: Option<Ruleset>,
+ }
+ 
+@@ -307,11 +306,11 @@ impl LocalTcpListener {
+     /// mio delivers readiness transitions, while WASIX epoll is level
+     /// triggered. If another connection remains after one accept, synthesize
+     /// the level event that the guest's next epoll_wait expects.
+-    #[cfg(not(target_os = "windows"))]
+     fn reassert_readable_if_ready(&mut self) {
+-        let remains_readable = libc_poll(self.stream.as_raw_fd(), libc::POLLIN)
+-            .is_some_and(|events| events & libc::POLLIN != 0);
+-        if !remains_readable {
++        if !connection_pending(&self.stream) {
++            // An accept that emptied the queue answered no WouldBlock, so
++            // on Windows the interest is put back by hand.
++            self.rearm().ok();
+             return;
+         }
+         match &mut self.handler_guard {
+@@ -322,8 +321,28 @@ impl LocalTcpListener {
+         }
+     }
+ 
++    /// Puts the readiness interest back after a probe found nothing. On
++    /// Windows mio's readiness is one-shot and is normally re-armed by an
++    /// operation returning `WouldBlock`; a kernel probe is not one.
+     #[cfg(target_os = "windows")]
+-    fn reassert_readable_if_ready(&mut self) {}
++    fn rearm(&mut self) -> Result<()> {
++        match &self.handler_guard {
++            HandlerGuardState::ExternalHandler(guard) | HandlerGuardState::WakerMap(guard, _) => {
++                guard
++                    .rearm(
++                        &mut self.stream,
++                        mio::Interest::READABLE.add(mio::Interest::WRITABLE),
++                    )
++                    .map_err(io_err_into_net_error)
++            }
++            HandlerGuardState::None => Ok(()),
++        }
++    }
++
++    #[cfg(not(target_os = "windows"))]
++    fn rearm(&mut self) -> Result<()> {
++        Ok(())
++    }
+ 
+     fn try_accept_internal(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
+         match self.stream.accept().map_err(io_err_into_net_error) {
+@@ -358,10 +377,7 @@ impl LocalTcpListener {
+ 
+ impl VirtualTcpListener for LocalTcpListener {
+     fn try_accept(&mut self) -> Result<(Box<dyn VirtualTcpSocket + Sync>, SocketAddr)> {
+-        let child = match self.backlog.pop_front() {
+-            Some(child) => child,
+-            None => self.try_accept_internal()?,
+-        };
++        let child = self.try_accept_internal()?;
+         self.reassert_readable_if_ready();
+         Ok(child)
+     }
+@@ -438,35 +454,34 @@ impl VirtualIoSource for LocalTcpListener {
+     }
+ 
+     fn poll_read_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<usize>> {
+-        if !self.backlog.is_empty() {
+-            return Poll::Ready(Ok(self.backlog.len()));
+-        }
+-
+         let (state, selector, source) = self.split_borrow();
+         let map = state_as_waker_map(state, selector, source).map_err(io_err_into_net_error)?;
++        map.pop(InterestType::Readable);
+         map.add(InterestType::Readable, cx.waker());
+ 
+-        if let Ok(child) = self.try_accept_internal() {
+-            self.backlog.push_back(child);
+-            return Poll::Ready(Ok(1));
++        // A pending connection is asked about, not accepted: it stays in
++        // the kernel's queue for the accept that follows and for anything
++        // waiting on the descriptor itself.
++        if connection_pending(&self.stream) {
++            Poll::Ready(Ok(1))
++        } else {
++            self.rearm()?;
++            Poll::Pending
+         }
+-        Poll::Pending
+     }
+ 
+     fn poll_write_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<usize>> {
+-        if !self.backlog.is_empty() {
+-            return Poll::Ready(Ok(self.backlog.len()));
+-        }
+-
+         let (state, selector, source) = self.split_borrow();
+         let map = state_as_waker_map(state, selector, source).map_err(io_err_into_net_error)?;
++        map.pop(InterestType::Writable);
+         map.add(InterestType::Writable, cx.waker());
+ 
+-        if let Ok(child) = self.try_accept_internal() {
+-            self.backlog.push_back(child);
+-            return Poll::Ready(Ok(1));
++        if connection_pending(&self.stream) {
++            Poll::Ready(Ok(1))
++        } else {
++            self.rearm()?;
++            Poll::Pending
+         }
+-        Poll::Pending
+     }
+ }
+ 
+@@ -496,7 +511,6 @@ impl VirtualTcpBoundSocket for LocalTcpBoundSocket {
+             handler_guard: HandlerGuardState::None,
+             no_delay: None,
+             keep_alive: None,
+-            backlog: Default::default(),
+             ruleset: self.ruleset.clone(),
+         }))
+     }
+@@ -980,6 +994,26 @@ impl VirtualIoSource for LocalTcpStream {
+     }
+ }
+ 
++/// Whether the kernel holds a connection for a listening socket, asked with
++/// a zero-timeout poll so that the connection stays where it is.
++#[cfg(not(target_os = "windows"))]
++fn connection_pending(listener: &mio::net::TcpListener) -> bool {
++    libc_poll(listener.as_raw_fd(), libc::POLLIN).is_some_and(|events| events & libc::POLLIN != 0)
++}
++
++#[cfg(target_os = "windows")]
++fn connection_pending(listener: &mio::net::TcpListener) -> bool {
++    use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, WSAPOLLFD, WSAPoll};
++    let mut fds = [WSAPOLLFD {
++        fd: listener.as_raw_socket() as _,
++        events: POLLRDNORM,
++        revents: 0,
++    }];
++    // SAFETY: the array is this frame's, and the socket is the listener's.
++    let ret = unsafe { WSAPoll(fds.as_mut_ptr(), 1, 0) };
++    ret == 1 && fds[0].revents & POLLRDNORM != 0
++}
++
+ #[cfg(not(target_os = "windows"))]
+ fn libc_poll(fd: RawFd, events: libc::c_short) -> Option<libc::c_short> {
+     let mut fds: [libc::pollfd; 1] = [libc::pollfd {
+@@ -1329,6 +1363,79 @@ mod tests {
+         }
+     }
+ 
++    /// A pending connection is readiness the kernel holds: asking leaves it
++    /// in the accept queue, where a second handle on the same socket can
++    /// take it, and the listener is then not ready.
++    #[test]
++    fn a_listener_leaves_a_pending_connection_in_the_kernel() {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let addr = listener.local_addr().unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let queue = listener.try_clone().unwrap();
++        let mut listener = LocalTcpListener {
++            stream: mio::net::TcpListener::from_std(listener),
++            selector: Selector::new(),
++            handler_guard: HandlerGuardState::None,
++            no_delay: None,
++            keep_alive: None,
++            ruleset: None,
++        };
++        let waker = std::task::Waker::noop();
++        let mut cx = std::task::Context::from_waker(waker);
++        assert!(matches!(listener.poll_read_ready(&mut cx), Poll::Pending));
++
++        let _client = TcpStream::connect(addr).unwrap();
++        while !matches!(listener.poll_read_ready(&mut cx), Poll::Ready(Ok(1))) {
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        assert!(matches!(
++            listener.poll_read_ready(&mut cx),
++            Poll::Ready(Ok(1))
++        ));
++        // The other handle shares the kernel's queue and nothing else, so
++        // the connection it accepts is the one the poll saw.
++        queue.accept().unwrap();
++        assert!(matches!(listener.poll_read_ready(&mut cx), Poll::Pending));
++        assert!(matches!(
++            listener.try_accept(),
++            Err(NetworkError::WouldBlock)
++        ));
++    }
++
++    /// A connection that arrives once the queue has been emptied is reported
++    /// as a fresh event: nothing about the probe stops the next edge.
++    #[test]
++    fn a_connection_after_the_queue_emptied_is_reported() {
++        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        let addr = listener.local_addr().unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let mut listener = LocalTcpListener {
++            stream: mio::net::TcpListener::from_std(listener),
++            selector: Selector::new(),
++            handler_guard: HandlerGuardState::None,
++            no_delay: None,
++            keep_alive: None,
++            ruleset: None,
++        };
++        let (sender, receiver) = mpsc::channel();
++        listener
++            .set_handler(Box::new(ChannelHandler(sender)))
++            .unwrap();
++
++        let _first = TcpStream::connect(addr).unwrap();
++        expect_readable(&receiver);
++        while receiver.try_recv().is_ok() {}
++        listener.try_accept().unwrap();
++        assert!(matches!(
++            listener.try_accept(),
++            Err(NetworkError::WouldBlock)
++        ));
++
++        let _second = TcpStream::connect(addr).unwrap();
++        expect_readable(&receiver);
++        listener.try_accept().unwrap();
++    }
++
+     #[test]
+     fn accepting_one_of_several_connections_reasserts_readability() {
+         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+@@ -1340,7 +1447,6 @@ mod tests {
+             handler_guard: HandlerGuardState::None,
+             no_delay: None,
+             keep_alive: None,
+-            backlog: Default::default(),
+             ruleset: None,
+         };
+         let (sender, receiver) = mpsc::channel();
+@@ -1381,7 +1487,6 @@ mod tests {
+             handler_guard: HandlerGuardState::None,
+             no_delay: None,
+             keep_alive: None,
+-            backlog: Default::default(),
+             ruleset: None,
+         };
+         let client = TcpStream::connect(addr).unwrap();

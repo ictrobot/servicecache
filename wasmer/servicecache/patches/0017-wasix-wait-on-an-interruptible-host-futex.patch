@@ -33,10 +33,10 @@ host-futex feature, which every native configuration enables, and
 nothing changes until suspension is enabled.
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 7a39208..ce1d729 100644
+index 6c6e944..efc1a0f 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -8012,6 +8012,7 @@ dependencies = [
+@@ -8013,6 +8013,7 @@ dependencies = [
   "wasmer-journal",
   "wasmer-package",
   "wasmer-types",

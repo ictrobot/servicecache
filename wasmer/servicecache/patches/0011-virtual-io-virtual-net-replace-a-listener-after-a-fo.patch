@@ -6,7 +6,7 @@ interest handler stays registered, through `Selector::reregister`, which
 moves a token's registration to a new descriptor.
 
 diff --git a/lib/virtual-io/src/guard.rs b/lib/virtual-io/src/guard.rs
-index ac50e02..42dc47a 100644
+index fb681c6..2b054c3 100644
 --- a/lib/virtual-io/src/guard.rs
 +++ b/lib/virtual-io/src/guard.rs
 @@ -32,6 +32,11 @@ impl InterestGuard {
@@ -22,11 +22,11 @@ index ac50e02..42dc47a 100644
          if let Some(selector) = self.selector.upgrade() {
              selector.remove(self.token, Some(source))?;
 diff --git a/lib/virtual-io/src/selector.rs b/lib/virtual-io/src/selector.rs
-index fd3467c..6cbb626 100644
+index a05389f..34afc4a 100644
 --- a/lib/virtual-io/src/selector.rs
 +++ b/lib/virtual-io/src/selector.rs
-@@ -259,6 +259,32 @@ impl Selector {
-         Ok(())
+@@ -275,6 +275,32 @@ impl Selector {
+         source.reregister(&instance.registry, token, interests)
      }
  
 +    /// Moves a token's registration to another descriptor, keeping its
@@ -59,10 +59,10 @@ index fd3467c..6cbb626 100644
          self.queue_modification(SelectorModification::PushInterest { token, interest });
      }
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index 2211dbc..1794511 100644
+index c1e79de..f571ff0 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
-@@ -324,6 +324,38 @@ impl LocalTcpListener {
+@@ -322,6 +322,37 @@ impl LocalTcpListener {
          })
      }
  
@@ -93,7 +93,6 @@ index 2211dbc..1794511 100644
 +                mio::Interest::READABLE.add(mio::Interest::WRITABLE),
 +            )?;
 +        }
-+        self.backlog.clear();
 +        self.stream = stream;
 +        Ok(())
 +    }

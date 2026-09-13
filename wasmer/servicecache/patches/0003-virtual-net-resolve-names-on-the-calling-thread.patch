@@ -10,7 +10,7 @@ instead be re-submitted on the child's runtime, but nothing gains from
 that.
 
 diff --git a/lib/virtual-net/src/host.rs b/lib/virtual-net/src/host.rs
-index 123d657..2211dbc 100644
+index c0b2cab..c1e79de 100644
 --- a/lib/virtual-net/src/host.rs
 +++ b/lib/virtual-net/src/host.rs
 @@ -23,7 +23,6 @@ use std::os::windows::io::AsRawSocket;

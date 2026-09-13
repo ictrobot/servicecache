@@ -13,10 +13,10 @@ allocation fails while any overlay exists: moving would silently turn
 the shared pages into private copies.
 
 diff --git a/Cargo.lock b/Cargo.lock
-index a72232c..7a39208 100644
+index 8c47f6b..6c6e944 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -7916,6 +7916,7 @@ dependencies = [
+@@ -7917,6 +7917,7 @@ dependencies = [
   "rustversion",
   "scopeguard",
   "serde",
