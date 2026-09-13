@@ -30,15 +30,20 @@ not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
   kernel. Suspension is off unless the host enables it; the I/O changes
   apply always.
 
-build.sh <variant> builds and installs a variant's CLI; setup.sh <variant>
-only prepares its checkout; test.sh <variant> runs the unit tests of the
-crates that go into the built CLIs, and of any other crate the patch sets
-modify, so patches carry their tests and the tests actually run;
-upstream's integration suites and the backends we do not build are left to
-upstream's CI. The matching make targets are wasmer-<variant>,
-test-wasmer-<variant> and clean-wasmer-<variant>.
+build.sh <variant> builds and installs a variant's CLI, stamped with the
+hash of its patch sets so that a changed series rebuilds it; setup.sh
+<variant> only prepares its checkout, resetting it to the tag first when
+the patches applied to it are not the current sets; test.sh <variant>
+runs the unit tests of the crates that go into the built CLIs, and of any
+other crate the patch sets modify, so patches carry their tests and the
+tests actually run; upstream's integration suites and the backends we do
+not build are left to upstream's CI. The matching make targets are
+wasmer-<variant>, test-wasmer-<variant> and clean-wasmer-<variant>.
 
 The patch sets are developed as stacked branches of a checkout under
 work/wasmer-dev — a set's branch contains the branches below it — and
 written back with export-patches.sh. They are maintained for the sys
-backend on Linux.
+backend on Linux. setup-dev.sh (make setup-wasmer-dev) clones that
+checkout when it is missing and rebuilds any of those branches whose
+export no longer reproduces its committed set, and the branches stacked
+on it, from the committed series; every other branch is left alone.

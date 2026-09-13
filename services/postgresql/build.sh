@@ -7,6 +7,7 @@ sc_clean_if_toolchain_changed
 : "${SC_SOURCE_URL:=https://github.com/postgres/postgres.git}"
 : "${POSTGRESQL_TAG:=REL_${SC_VERSION//./_}}"
 sc_checkout "$SC_SOURCE_URL" "$POSTGRESQL_TAG" "$SC_SRC"
+sc_reset_if_stale "$SC_SRC" "$SC_VERSION_DIR/patches"
 sc_apply_series "$SC_VERSION_DIR/patches" "$SC_SRC"
 
 for tool in perl bison flex zic; do

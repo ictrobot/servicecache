@@ -138,6 +138,7 @@ patch_sysroot() {
   local checkout="$SC_ROOT/work/wasix-libc"
   (
     sc_checkout https://github.com/wasix-org/wasix-libc.git "$WASIX_SYSROOT_TAG" "$checkout"
+    sc_reset_if_stale "$checkout" "$SC_ROOT/patches/wasix-libc"
     sc_apply_series "$SC_ROOT/patches/wasix-libc" "$checkout"
   ) || fail "could not prepare the wasix-libc checkout"
 

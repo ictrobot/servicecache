@@ -52,11 +52,29 @@ sc_init() {
   export SC_SERVICE_DIR SC_VERSION_DIR SC_SRC SC_BUILD SC_OUT
 }
 
+# sc_git_cache url tag: prints the bare repository shared by every checkout
+# of the remote, work/git/<url with non-alphanumerics as underscores>, with
+# the tag fetched into it alone and at depth 1.
+sc_git_cache() {
+  if [[ $# -ne 2 ]]; then
+    sc_fail "usage: sc_git_cache url tag"
+    return 1
+  fi
+
+  local url="$1" tag="$2" root cache
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  cache="$root/work/git/${url//[^[:alnum:]]/_}"
+  if [[ ! -d "$cache" ]]; then
+    git init --quiet --bare "$cache"
+  fi
+  if ! git --git-dir="$cache" rev-parse --verify --quiet "refs/tags/$tag^{commit}" >/dev/null; then
+    git --git-dir="$cache" fetch --depth=1 --no-tags "$url" tag "$tag"
+  fi
+  echo "$cache"
+}
+
 # sc_checkout url tag tree: the tag checked out at tree, detached, as a
-# worktree of a bare repository shared by every checkout of the same
-# remote, work/git/<url with non-alphanumerics as underscores>. A tag is
-# fetched alone and at depth 1, so versions of one project share their
-# objects.
+# worktree of the bare repository sc_git_cache keeps for the remote.
 sc_checkout() {
   if [[ $# -ne 3 ]]; then
     sc_fail "usage: sc_checkout url tag tree"
@@ -65,18 +83,11 @@ sc_checkout() {
 
   local url="$1" tree="$3"
   SC_UPSTREAM_TAG="$2"
-  local root
-  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  local cache="$root/work/git/${url//[^[:alnum:]]/_}"
 
   if [[ ! -e "$tree" ]]; then
+    local cache
+    cache="$(sc_git_cache "$url" "$SC_UPSTREAM_TAG")" || return 1
     mkdir -p "$(dirname "$tree")"
-    if [[ ! -d "$cache" ]]; then
-      git init --quiet --bare "$cache"
-    fi
-    if ! git --git-dir="$cache" rev-parse --verify --quiet "refs/tags/$SC_UPSTREAM_TAG^{commit}" >/dev/null; then
-      git --git-dir="$cache" fetch --depth=1 --no-tags "$url" tag "$SC_UPSTREAM_TAG"
-    fi
     git --git-dir="$cache" worktree prune
     git --git-dir="$cache" worktree add --quiet --detach "$tree" "refs/tags/$SC_UPSTREAM_TAG"
   elif ! git -C "$tree" rev-parse --git-dir >/dev/null 2>&1; then
@@ -93,6 +104,63 @@ sc_checkout() {
   fi
 
   export SC_UPSTREAM_TAG
+}
+
+# sc_series_stamps patch-directory...: the .sc-applied lines that applying
+# the series in order leaves behind.
+sc_series_stamps() {
+  local patch_dir patch_name
+  for patch_dir in "$@"; do
+    if [[ ! -f "$patch_dir/series" ]]; then
+      sc_fail "patch series not found: $patch_dir/series"
+      return 1
+    fi
+    while IFS= read -r patch_name; do
+      [[ -z "$patch_name" || "$patch_name" == \#* ]] && continue
+      if [[ ! -f "$patch_dir/$patch_name" ]]; then
+        sc_fail "series entry not found: $patch_dir/$patch_name"
+        return 1
+      fi
+      echo "$(sha256sum "$patch_dir/$patch_name" | cut -d' ' -f1)  $patch_name"
+    done < "$patch_dir/series"
+  done
+}
+
+# sc_reset_if_stale tree [patch-directory...]: reset a checkout to the tag
+# when its .sc-applied stamp is not a prefix of what the series would
+# leave (after a branch switch, typically), or when it is modified with no
+# stamp at all, so the sc_apply_series calls that follow start clean.
+# Build directories are left alone.
+sc_reset_if_stale() {
+  if [[ $# -lt 1 ]]; then
+    sc_fail "usage: sc_reset_if_stale tree [patch-directory...]"
+    return 1
+  fi
+
+  local tree="$1"
+  shift
+  if [[ ! -e "$tree/.git" ]]; then
+    return 0
+  fi
+
+  local stamp_file="$tree/.sc-applied" reason
+  if [[ -f "$stamp_file" ]]; then
+    local expected applied
+    expected="$(sc_series_stamps "$@")" || return 1
+    applied="$(cat "$stamp_file")"
+    if [[ -z "$applied" || "$expected"$'\n' == "$applied"$'\n'* ]]; then
+      return 0
+    fi
+    reason="its applied patches are not the current series"
+  elif [[ -n "$(git -C "$tree" status --porcelain --untracked-files=no)" ]]; then
+    reason="it has changes but no record of applied patches"
+  else
+    return 0
+  fi
+
+  echo "resetting ${tree}: $reason" >&2
+  git -C "$tree" reset --quiet --hard &&
+    git -C "$tree" clean --quiet -fdx
 }
 
 sc_apply_series() {
@@ -317,7 +385,7 @@ sc_toolchain_identity() {
 sc_reset_build_state() {
   rm -rf "$SC_BUILD"
   if [[ -e "$SC_SRC/.git" ]]; then
-    git -C "$SC_SRC" checkout --quiet -- .
+    git -C "$SC_SRC" reset --quiet --hard
     git -C "$SC_SRC" clean --quiet -fdx
   fi
 }

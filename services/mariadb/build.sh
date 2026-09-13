@@ -14,10 +14,12 @@ sc_checkout "$SC_SOURCE_URL" "$MARIADB_TAG" "$SC_SRC"
 # updating unrelated optional submodules.
 env PATH=/usr/bin:/bin git -C "$SC_SRC" submodule update --init --depth 1 libmariadb extra/wolfssl/wolfssl
 
+sc_reset_if_stale "$SC_SRC" "$SC_VERSION_DIR/patches"
 sc_apply_series "$SC_VERSION_DIR/patches" "$SC_SRC"
 # The connector series applies at the commit the release pins.
 mariadb_tag="$SC_UPSTREAM_TAG"
 SC_UPSTREAM_TAG="$(git -C "$SC_SRC" rev-parse HEAD:libmariadb)"
+sc_reset_if_stale "$SC_SRC/libmariadb" "$SC_VERSION_DIR/patches/libmariadb"
 sc_apply_series "$SC_VERSION_DIR/patches/libmariadb" "$SC_SRC/libmariadb"
 SC_UPSTREAM_TAG="$mariadb_tag"
 export SC_UPSTREAM_TAG

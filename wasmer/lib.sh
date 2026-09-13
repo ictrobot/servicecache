@@ -35,6 +35,34 @@ sc_wasmer_sets_hash() {
   } | sha256sum | cut -d' ' -f1
 }
 
+# sc_wasmer_dev_sets: the stacked branches of a Wasmer dev checkout, one
+# "from to set-directory" line per patch set, innermost first.
+sc_wasmer_dev_sets() {
+  echo "v$WASMER_VERSION fixes wasmer/fixes/patches"
+  echo "fixes ictrobot_shm_v1 extensions/ictrobot_shm_v1/patches"
+  echo "ictrobot_shm_v1 servicecache wasmer/servicecache/patches"
+}
+
+# sc_wasmer_export_range <checkout> <from> <to> <directory>: write the
+# commits from..to as the directory's patch set and series. Each file
+# keeps its Subject and body and then the diff, like the service series.
+sc_wasmer_export_range() {
+  local checkout="$1" from="$2" to="$3" patch_dir="$4" patch
+  mkdir -p "$patch_dir"
+  rm -f "$patch_dir"/*.patch
+  git -C "$checkout" format-patch --keep-subject --no-signature --quiet \
+    -o "$patch_dir" "$from..$to"
+  for patch in "$patch_dir"/*.patch; do
+    [[ -f "$patch" ]] || continue
+    sed -i \
+      -e '1,/^Subject:/{/^Subject:/!d}' \
+      -e '/^---$/,/^diff --git/{/^diff --git/!d}' \
+      -e '0,/^diff --git/s//\n&/' \
+      "$patch"
+  done
+  (cd "$patch_dir" && ls -- *.patch) > "$patch_dir/series"
+}
+
 # sc_wasmer_napi_submodule <tree>: lib/cli needs the wasmer-napi submodule
 # before cargo can load the workspace manifest; nothing the host embeds does.
 sc_wasmer_napi_submodule() {

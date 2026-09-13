@@ -23,7 +23,7 @@ CLEAN_WASMER_TARGETS := $(addprefix clean-wasmer-,$(WASMER_VARIANTS))
 EXTENSION_NAMES := $(patsubst extensions/%/smoke.sh,%,$(wildcard extensions/*/smoke.sh))
 SMOKE_EXTENSION_TARGETS := $(addprefix smoke-extension-,$(EXTENSION_NAMES))
 
-.PHONY: help bootstrap setup-wasmer build test lint check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
+.PHONY: help bootstrap setup-wasmer setup-wasmer-dev build test lint check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
 .PHONY: $(SERVICE_NAME_TARGETS) $(WASMER_TARGETS) $(TEST_WASMER_TARGETS) $(CLEAN_WASMER_TARGETS) $(SMOKE_EXTENSION_TARGETS)
@@ -39,6 +39,7 @@ help:
 	@echo "smoke-extensions                run every Wasmer extension's demo ($(EXTENSION_NAMES))"
 	@echo "smoke-extension-<name>          run one extension's demo under the extensions CLI; stock must refuse it"
 	@echo "setup-wasmer                    prepare the servicecache Wasmer variant the host builds against"
+	@echo "setup-wasmer-dev                put work/wasmer-dev's exported branches at the committed patch sets (clones it if missing)"
 	@echo "wasmer-<variant>                build a Wasmer variant's CLI into work/wasmer/<variant> ($(WASMER_VARIANTS))"
 	@echo "test-wasmer-<variant>           run the unit tests of the CLI's crates in that variant's checkout"
 	@echo "build                           setup-wasmer, then cargo build"
@@ -71,6 +72,9 @@ smoke-toolchain: bootstrap
 
 setup-wasmer:
 	wasmer/setup.sh servicecache
+
+setup-wasmer-dev:
+	wasmer/setup-dev.sh
 
 build: setup-wasmer
 	cargo build --workspace
@@ -113,7 +117,7 @@ clean-services: $(CLEAN_SERVICE_TARGETS)
 clean-wasmer: $(CLEAN_WASMER_TARGETS)
 
 clean-wasix-libc:
-	git -C work/wasix-libc checkout --quiet -- . && git -C work/wasix-libc clean --quiet -fdx
+	git -C work/wasix-libc reset --quiet --hard && git -C work/wasix-libc clean --quiet -fdx
 
 purge:
 	rm -rf work target
@@ -142,7 +146,7 @@ test-wasmer-$(1):
 
 clean-wasmer-$(1):
 	if [ -d work/src/wasmer/$(1) ]; then \
-	  git -C work/src/wasmer/$(1) checkout --quiet -- . && git -C work/src/wasmer/$(1) clean --quiet -fdx; \
+	  git -C work/src/wasmer/$(1) reset --quiet --hard && git -C work/src/wasmer/$(1) clean --quiet -fdx; \
 	fi
 	rm -rf work/build/wasmer/$(1) work/wasmer/$(1)
 endef

@@ -7,12 +7,14 @@ sc_clean_if_toolchain_changed
 : "${SC_SOURCE_URL:=https://github.com/mysql/mysql-server.git}"
 : "${MYSQL_TAG:=mysql-$SC_VERSION}"
 sc_checkout "$SC_SOURCE_URL" "$MYSQL_TAG" "$SC_SRC"
-sc_apply_series "$SC_VERSION_DIR/patches" "$SC_SRC"
-sc_apply_series "$SC_VERSION_DIR/patches/protobuf" "$SC_SRC"
-sc_apply_series "$SC_VERSION_DIR/patches/libmysql" "$SC_SRC"
+sets=("$SC_VERSION_DIR/patches" "$SC_VERSION_DIR/patches/protobuf" "$SC_VERSION_DIR/patches/libmysql")
 if [[ -d "$SC_VERSION_DIR/patches/abseil" ]]; then
-  sc_apply_series "$SC_VERSION_DIR/patches/abseil" "$SC_SRC"
+  sets+=("$SC_VERSION_DIR/patches/abseil")
 fi
+sc_reset_if_stale "$SC_SRC" "${sets[@]}"
+for set in "${sets[@]}"; do
+  sc_apply_series "$set" "$SC_SRC"
+done
 source "$SC_SERVICE_DIR/deps.sh" "$SC_VERSION"
 
 jobs="${JOBS:-16}"
