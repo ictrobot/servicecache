@@ -38,6 +38,23 @@ sc_init() {
   source "$SC_TOOLCHAIN/versions.sh"
   source "$SC_TOOLCHAIN/env.sh"
 
+  # Keep each module's name section, so a profiler can name guest functions.
+  # A module goes through these steps, in order:
+  #   1. wasm-ld links it, with --strip-debug from WASIXCC_LINKER_FLAGS,
+  #      which drops the DWARF and keeps the name section.
+  #   2. For an optimised build, wasixcc runs wasm-opt on it. wasm-opt drops
+  #      the name section unless run with -g, so binaryen-names adds -g. With
+  #      -g it would also preserve DWARF and optimise less, but step 1 left
+  #      none.
+  #   3. sc_strip runs wasm-opt once more to remove any DWARF, again with -g
+  #      so the name section stays.
+  SC_WASM_OPT="$WASIXCC_BINARYEN_LOCATION/bin/wasm-opt"
+  if [[ ":${WASIXCC_LINKER_FLAGS:-}:" != *:--strip-debug:* ]]; then
+    WASIXCC_LINKER_FLAGS="${WASIXCC_LINKER_FLAGS:+$WASIXCC_LINKER_FLAGS:}--strip-debug"
+  fi
+  WASIXCC_BINARYEN_LOCATION="$SC_TOOLCHAIN/binaryen-names"
+  export WASIXCC_LINKER_FLAGS WASIXCC_BINARYEN_LOCATION
+
   # The Wasmer CLI this package's modules run under, picked up by
   # run-wasix.sh for smoke tests and build-time execution: stock, or the
   # extensions variant when the version declares SC_GUEST_EXTENSIONS.
@@ -50,6 +67,7 @@ sc_init() {
 
   export SC_SERVICE SC_VERSION SC_ROOT SC_WORK SC_TOOLCHAIN SC_WASMER
   export SC_SERVICE_DIR SC_VERSION_DIR SC_SRC SC_BUILD SC_OUT
+  export SC_WASM_OPT
 }
 
 # sc_git_cache url tag: prints the bare repository shared by every checkout
@@ -242,8 +260,9 @@ sc_strip() {
     return 1
   fi
 
+  # Drop DWARF but keep the name section, which binaryen writes only with -g.
   mkdir -p "$(dirname "$output")"
-  "$WASIXCC_BINARYEN_LOCATION/bin/wasm-opt" --strip-debug "$input" -o "$output"
+  "${SC_WASM_OPT:?sc_init must run before sc_strip}" --strip-dwarf -g "$input" -o "$output"
   chmod +x "$output"
 }
 
@@ -367,15 +386,17 @@ sc_sysroot_patch_hash() {
   done < "$patch_dir/series" | sha256sum | cut -d' ' -f1
 }
 
-# The toolchain a service version is compiled and linked with, one
-# "name: value" line per pin: what BUILD-INFO records, and what
-# sc_clean_if_toolchain_changed compares a build tree against.
+# The toolchain a service version is compiled and linked with, and the
+# debug information its modules keep, one "name: value" line per pin: what
+# BUILD-INFO records, and what sc_clean_if_toolchain_changed compares a
+# build tree against.
 sc_toolchain_identity() {
   echo "wasixcc: $WASIXCC_VERSION"
   echo "WASIX sysroot: $WASIX_SYSROOT_TAG"
   echo "WASIX sysroot patches: $(sc_sysroot_patch_hash)"
   echo "WASIX LLVM: $WASIX_LLVM_TAG"
   echo "Binaryen: $BINARYEN_TAG"
+  echo "Debug info: names"
 }
 
 # Returns a version's build state to what a first build starts from: the
