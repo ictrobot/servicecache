@@ -221,6 +221,10 @@ pub(super) fn fork(host: &mut Host, child_control: OwnedFd, listener: OwnedFd) -
 /// before `fork()`, so its elapsed time here spans the syscall too.
 fn rebuild(host: &mut Host, listener: TcpListener, forked_at: Instant) -> Result<()> {
     let started = Instant::now();
+    // SAFETY: freeze verified that the process was single-threaded at the
+    // fork, and no guest code runs until every coroutine resumes at the end.
+    unsafe { wasmer::sys::profile_after_fork() }
+        .context("registering inherited guest code with the profiler")?;
     // The parent-death signal does not survive a fork; the template is
     // this clone's parent.
     die_with_parent()?;

@@ -1,0 +1,174 @@
+Subject: cli: write a perf jitdump with --profiler jitdump
+
+The CLI's --profiler option chose a perf map, or a GDB or LLDB command
+file, all through the compiler configuration. A jitdump is chosen on the
+engine instead, and the option had no value for it.
+
+--profiler jitdump sets the engine's profile mode to JitDump wherever the
+CLI builds a compiling engine, for every backend, and --profiler perfmap
+now sets PerfMap there too, alongside the compiler setting it already
+made; the GDB and LLDB values leave the engine's mode off. A jitdump is
+written only on Linux, so the value is refused elsewhere, as
+--experimental-artifact is.
+
+A profile of a guest also needs the CLI's own frames, and perf's libdw
+unwinder takes an executable's load bias to be its mapping's start minus
+the mapping's file offset. lld places the CLI's executable segment 4 KiB
+further into memory than into the file, so that bias comes out 4 KiB too
+high and perf unwinds the CLI's frames with a neighbouring function's
+rules. On Linux the build script links the wasmer binary with
+-z separate-code, which gives executable code pages of its own at the
+same offset in the file as in memory.
+
+diff --git a/lib/cli/build.rs b/lib/cli/build.rs
+index 6de63ed..5eb2e54 100644
+--- a/lib/cli/build.rs
++++ b/lib/cli/build.rs
+@@ -13,4 +13,13 @@ pub fn main() {
+         println!("cargo:rustc-env=WASMER_BUILD_DATE={date}");
+     }
+     println!("cargo:rustc-env=WASMER_REPRODUCIBLE_BUILD={reproducible_build}");
++
++    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
++        // perf's libdw unwinder takes the load bias to be the mapping's
++        // start minus its file offset, which is wrong for lld's default
++        // layout, so host PCs use another function's unwind rules. Put
++        // executable code in its own PT_LOAD segment at the same offset
++        // in the file as in memory.
++        println!("cargo:rustc-link-arg-bin=wasmer=-Wl,-z,separate-code");
++    }
+ }
+diff --git a/lib/cli/src/backend.rs b/lib/cli/src/backend.rs
+index 6020942..fa496dd 100644
+--- a/lib/cli/src/backend.rs
++++ b/lib/cli/src/backend.rs
+@@ -200,6 +200,8 @@ pub enum Profiler {
+     Gdb,
+     /// LLDB command file.
+     Lldb,
++    /// Perf jitdump with each function's code and unwind information.
++    Jitdump,
+ }
+ 
+ impl FromStr for Profiler {
+@@ -210,6 +212,7 @@ impl FromStr for Profiler {
+             "perfmap" => Ok(Self::Perfmap),
+             "gdb" => Ok(Self::Gdb),
+             "lldb" => Ok(Self::Lldb),
++            "jitdump" => Ok(Self::Jitdump),
+             _ => Err(anyhow::anyhow!("Unrecognized profiler: {s}")),
+         }
+     }
+@@ -220,6 +223,9 @@ impl RuntimeOptions {
+         if self.experimental_artifact && !cfg!(target_os = "linux") {
+             bail!("--experimental-artifact is only supported on Linux");
+         }
++        if matches!(self.profiler, Some(Profiler::Jitdump)) && !cfg!(target_os = "linux") {
++            bail!("The jitdump profiler is only supported on Linux");
++        }
+         if !self.experimental_artifact {
+             match self.profiler {
+                 Some(Profiler::Gdb) => {
+@@ -234,6 +240,17 @@ impl RuntimeOptions {
+         Ok(())
+     }
+ 
++    /// How an engine built from these options registers the code it places
++    /// with a profiler.
++    #[cfg(feature = "compiler")]
++    fn profile_mode(&self) -> wasmer_compiler::ProfileMode {
++        match self.profiler {
++            Some(Profiler::Perfmap) => wasmer_compiler::ProfileMode::PerfMap,
++            Some(Profiler::Jitdump) => wasmer_compiler::ProfileMode::JitDump,
++            _ => wasmer_compiler::ProfileMode::Off,
++        }
++    }
++
+     pub fn get_available_backends(&self) -> Result<Vec<BackendType>> {
+         // If a specific backend is explicitly requested, use it
+         #[cfg(feature = "cranelift")]
+@@ -423,6 +440,7 @@ impl RuntimeOptions {
+         Ok(wasmer_compiler::EngineBuilder::new(compiler_config)
+             .set_features(Some(features))
+             .set_target(Some(target))
++            .set_profile_mode(self.profile_mode())
+             .engine()
+             .into())
+     }
+@@ -453,6 +471,8 @@ impl RuntimeOptions {
+                         Profiler::Perfmap => config.enable_perfmap(),
+                         Profiler::Gdb => config.enable_debugger(Debugger::Gdb),
+                         Profiler::Lldb => config.enable_debugger(Debugger::Lldb),
++                        // The engine, not the compiler, writes a jitdump.
++                        Profiler::Jitdump => {}
+                     }
+                 }
+                 if let Some(mut debug_dir) = self.compiler_debug_dir.clone() {
+@@ -483,6 +503,8 @@ impl RuntimeOptions {
+                         Profiler::Perfmap => config.enable_perfmap(),
+                         Profiler::Gdb => config.enable_debugger(Debugger::Gdb),
+                         Profiler::Lldb => config.enable_debugger(Debugger::Lldb),
++                        // The engine, not the compiler, writes a jitdump.
++                        Profiler::Jitdump => {}
+                     }
+                 }
+                 if let Some(mut debug_dir) = self.compiler_debug_dir.clone() {
+@@ -526,6 +548,8 @@ impl RuntimeOptions {
+                         Profiler::Perfmap => config.enable_perfmap(),
+                         Profiler::Gdb => config.enable_debugger(Debugger::Gdb),
+                         Profiler::Lldb => config.enable_debugger(Debugger::Lldb),
++                        // The engine, not the compiler, writes a jitdump.
++                        Profiler::Jitdump => {}
+                     }
+                 }
+ 
+@@ -612,6 +636,8 @@ impl BackendType {
+                         Profiler::Perfmap => config.enable_perfmap(),
+                         Profiler::Gdb => config.enable_debugger(Debugger::Gdb),
+                         Profiler::Lldb => config.enable_debugger(Debugger::Lldb),
++                        // The engine, not the compiler, writes a jitdump.
++                        Profiler::Jitdump => {}
+                     }
+                 }
+                 if let Some(mut debug_dir) = runtime_opts.compiler_debug_dir.clone() {
+@@ -626,6 +652,7 @@ impl BackendType {
+                 let engine = wasmer_compiler::EngineBuilder::new(config)
+                     .set_features(Some(supported_features))
+                     .set_target(Some(target.clone()))
++                    .set_profile_mode(runtime_opts.profile_mode())
+                     .engine()
+                     .into();
+                 Ok(engine)
+@@ -651,6 +678,8 @@ impl BackendType {
+                         Profiler::Perfmap => config.enable_perfmap(),
+                         Profiler::Gdb => config.enable_debugger(Debugger::Gdb),
+                         Profiler::Lldb => config.enable_debugger(Debugger::Lldb),
++                        // The engine, not the compiler, writes a jitdump.
++                        Profiler::Jitdump => {}
+                     }
+                 }
+                 if let Some(mut debug_dir) = runtime_opts.compiler_debug_dir.clone() {
+@@ -665,6 +694,7 @@ impl BackendType {
+                 let engine = wasmer_compiler::EngineBuilder::new(config)
+                     .set_features(Some(supported_features))
+                     .set_target(Some(target.clone()))
++                    .set_profile_mode(runtime_opts.profile_mode())
+                     .engine()
+                     .into();
+                 Ok(engine)
+@@ -705,12 +735,15 @@ impl BackendType {
+                         Profiler::Perfmap => config.enable_perfmap(),
+                         Profiler::Gdb => config.enable_debugger(Debugger::Gdb),
+                         Profiler::Lldb => config.enable_debugger(Debugger::Lldb),
++                        // The engine, not the compiler, writes a jitdump.
++                        Profiler::Jitdump => {}
+                     }
+                 }
+ 
+                 let engine = wasmer_compiler::EngineBuilder::new(config)
+                     .set_features(Some(supported_features))
+                     .set_target(Some(target.clone()))
++                    .set_profile_mode(runtime_opts.profile_mode())
+                     .engine()
+                     .into();
+                 Ok(engine)

@@ -25,17 +25,27 @@ use crate::{
 
 /// The engine every guest in this host is compiled by.
 ///
-/// With `SERVICECACHE_PERFMAP` set, Cranelift also appends each module's
-/// functions to `/tmp/perf-<pid>.map` as it places them, compiled or loaded
-/// from the cache, so `perf` can name frames in guest code. The names come
-/// from the module's `name` section; a module without one adds nothing.
+/// With `SERVICECACHE_JITDUMP` set, the engine writes a perf jitdump of each
+/// function and trampoline it places, compiled or loaded from the cache,
+/// with its code and unwind information, so a recording made with
+/// `perf record -k 1 --call-graph dwarf` and passed through
+/// `perf inject --jit` can name and unwind guest frames. With
+/// `SERVICECACHE_PERFMAP` set instead, it appends only their names to
+/// `/tmp/perf-<pid>.map`. A function the module's `name` section does not
+/// name is named by its export, or as `wasm[N]`.
 fn engine() -> Engine {
-    let mut compiler = wasmer::sys::Cranelift::default();
-    if std::env::var_os("SERVICECACHE_PERFMAP").is_some() {
-        wasmer::sys::CompilerConfig::enable_perfmap(&mut compiler);
-    }
-    let compiler: Box<dyn wasmer::sys::CompilerConfig> = Box::new(compiler);
-    wasmer::sys::EngineBuilder::new(compiler).into()
+    let mode = if std::env::var_os("SERVICECACHE_JITDUMP").is_some() {
+        wasmer::sys::ProfileMode::JitDump
+    } else if std::env::var_os("SERVICECACHE_PERFMAP").is_some() {
+        wasmer::sys::ProfileMode::PerfMap
+    } else {
+        wasmer::sys::ProfileMode::Off
+    };
+    let compiler: Box<dyn wasmer::sys::CompilerConfig> =
+        Box::new(wasmer::sys::Cranelift::default());
+    wasmer::sys::EngineBuilder::new(compiler)
+        .set_profile_mode(mode)
+        .into()
 }
 
 /// Compiles on a private Rayon pool that is dropped before this returns.

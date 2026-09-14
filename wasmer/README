@@ -19,15 +19,20 @@ not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
   its specification, guest header, demo, smoke test and its own patch set.
   A package that declares extensions builds and smoke-tests under this CLI.
 
+- jitdump: perf profiling of generated code. It applies the fixes and
+  extensions sets and then its own, which registers an engine's code with
+  perf, as a perf map or a jitdump with unwind information, also in a
+  forked child. It is off unless selected; the CLI takes --profiler jitdump.
+
 - servicecache: the runtime the host embeds ([patch.crates-io] in Cargo.toml
-  points at its checkout). It applies the fixes and extensions sets and then
-  its own, which makes a guest coroutine suspend on a blocking host wait
-  instead of parking its OS thread, lets guest threads be resurrected on fresh
-  threads in a forked child, rebuilds the selector after a fork, replaces a
-  clone's listening socket, snapshots shared memory across the native fork
-  so clones diverge, keeps host I/O from going through a runtime handle
-  captured at construction, and waits on a guest futex or on a socket's
-  host descriptor in the kernel. Suspension is off unless the host
+  points at its checkout). It applies the fixes, extensions and jitdump sets
+  and then its own, which makes a guest coroutine suspend on a blocking host
+  wait instead of parking its OS thread, lets guest threads be resurrected on
+  fresh threads in a forked child, rebuilds the selector after a fork,
+  replaces a clone's listening socket, snapshots shared memory across the
+  native fork so clones diverge, keeps host I/O from going through a runtime
+  handle captured at construction, and waits on a guest futex or on a
+  socket's host descriptor in the kernel. Suspension is off unless the host
   enables it; the I/O changes apply always.
 
 build.sh <variant> builds and installs a variant's CLI, stamped with the

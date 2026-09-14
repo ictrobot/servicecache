@@ -1,0 +1,1469 @@
+Subject: compiler, api: register generated code with perf through jitdump
+
+Wasmer could name generated code for perf with a perf map, but only in a
+limited way: a compiler setting turned it on, so a headless engine
+loading artifacts never wrote one; it listed only functions with a
+name-section entry and no trampolines; and a forked child, which has a
+new PID, had no map at all. A perf map also gives perf nothing to unwind
+with. perf's DWARF unwinder needs each function's unwind information and
+code, so a call graph that reached generated code stopped there.
+
+An engine now carries a ProfileMode, Off, PerfMap or JitDump, chosen
+with EngineBuilder::set_profile_mode, headless engines included; a
+compiler with perf maps enabled still selects PerfMap. The engine
+registers every function and trampoline once its code is executable and
+its runtime unwind information is published, before either artifact
+format's load hands the artifact back. A local function is named by its
+name-section entry, else by the least of its export names, else as
+wasm[N] with its full function index; the trampolines are
+wasmer::call_trampoline[N] and wasmer::dynamic_trampoline[N]. A native
+ELF artifact's extents come from its symbol table, so profiling one that
+has none fails to load.
+
+JitDump writes perf's jitdump format. Each process gets one dump,
+jit-<pid>.dump, in a new /tmp/jitted-wasmer-* directory, since perf's
+libdw unwinder recognises generated code only under /tmp/jitted- and a
+directory of its own keeps a reused PID from overwriting a recording.
+The dump's header page is mapped executable as the marker perf looks
+for, and its timestamps are CLOCK_MONOTONIC, to be recorded with -k 1.
+Every region is an unwinding-information record followed by a code-load
+record with the region's code. The unwinding information is a
+self-contained .eh_frame and .eh_frame_hdr for that one region, converted
+from the module's published .eh_frame: its CIE and FDE rules are copied,
+the personality and LSDA a profiler never uses are dropped, and its
+addresses are rebased to the layout of the ELF file perf inject builds
+for the region. A process-wide lock keeps each registration's records
+together across engines and threads, code indexes are unique within the
+process, a close record is written at exit, and a failed write stops
+all later output rather than extend a stream it may have corrupted.
+
+A registration keeps a copy of its regions, with their code for a
+jitdump, for as long as its engine keeps the code allocated; the process
+list refers to it weakly and drops expired entries as it grows.
+profile_after_fork, called in a forked child before it runs inherited
+code or starts a thread, gives the child its own dump or map and replays
+every live registration into it; a later call in the same process does
+nothing, and a registration attempted in a child before it is refused.
+It is unsafe because it relies on loading, profiling and engine
+destruction having been quiescent at the fork. A perf map uses the same
+names and regions, appends each registration's lines in one write and is
+replayed the same way. Hosts other than Linux still get perf maps;
+jitdump is Linux-only.
+
+Unit tests cover jitdump record sizes, timestamps and unique indexes,
+refusing an exhausted index or an oversized record, a failed write
+stopping later output, converted unwind information keeping each
+region's own rules under shared CIEs and both address encodings while
+dropping personality and LSDA references and refusing a duplicate FDE,
+a region's search header leading gimli's reader to its table and rules
+at the addresses perf gives them, and name selection.
+
+diff --git a/lib/api/src/backend/sys/mod.rs b/lib/api/src/backend/sys/mod.rs
+index d8c38a1..fca1119 100644
+--- a/lib/api/src/backend/sys/mod.rs
++++ b/lib/api/src/backend/sys/mod.rs
+@@ -16,7 +16,9 @@ pub use wasmer_compiler::{
+     CompilerConfig, FunctionMiddleware, MiddlewareReaderState, ModuleMiddleware, wasmparser,
+ };
+ 
+-pub use wasmer_compiler::{Artifact, EngineBuilder, Features, FunctionExtent, Tunables};
++pub use wasmer_compiler::{
++    Artifact, EngineBuilder, Features, FunctionExtent, ProfileMode, Tunables, profile_after_fork,
++};
+ 
+ pub use wasmer_types::MiddlewareError;
+ pub use wasmer_types::target::{Architecture, CpuFeature, OperatingSystem, Target, Triple};
+diff --git a/lib/compiler/src/engine/artifact.rs b/lib/compiler/src/engine/artifact.rs
+index aabe7d2..abc81e5 100644
+--- a/lib/compiler/src/engine/artifact.rs
++++ b/lib/compiler/src/engine/artifact.rs
+@@ -16,12 +16,16 @@ use std::{
+ use crate::ModuleEnvironment;
+ use crate::{
+     ArtifactBuild, ArtifactBuildFromArchive, ArtifactCreate, Engine, EngineInner, Features,
+-    FrameInfosVariant, FunctionExtent, GlobalFrameInfoRegistration, InstantiationError, Tunables,
+-    WASMER_TRAP_FUNCTION_OFFSETS_SECTION_NAME, WASMER_TRAPS_SECTION_NAME,
++    FrameInfosVariant, FunctionExtent, GlobalFrameInfoRegistration, InstantiationError,
++    ProfileMode, Tunables, WASMER_TRAP_FUNCTION_OFFSETS_SECTION_NAME, WASMER_TRAPS_SECTION_NAME,
+     engine::{link::link_module, resolver::resolve_tags, trap::register_frame_info_source},
++    profile::{CodeRegion, FunctionNames},
+     resolve_imports,
+     serialize::{MetadataHeader, SerializableCompilation, SerializableModule},
+-    types::relocation::{RelocationLike, RelocationTarget},
++    types::{
++        function::FunctionBodyLike,
++        relocation::{RelocationLike, RelocationTarget},
++    },
+ };
+ #[cfg(feature = "static-artifact-create")]
+ use crate::{Compiler, FunctionBodyData, ModuleTranslationState, types::module::CompileModuleInfo};
+@@ -35,7 +39,7 @@ use std::vec::IntoIter;
+ use wasmer_types::CompilationProgressCallback;
+ 
+ use enumset::EnumSet;
+-use object::{Object as _, ObjectSection as _, ReadCache, ReadRef};
++use object::{Object as _, ObjectSection as _, ObjectSymbol as _, ReadCache, ReadRef};
+ use shared_buffer::OwnedBuffer;
+ 
+ use crate::engine::mapped_binary::DebugInfoSource;
+@@ -689,11 +693,6 @@ impl Artifact {
+                     }),
+             };
+ 
+-            #[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
+-            {
+-                engine_inner.register_perfmap(&finished_functions, module_info)?;
+-            }
+-
+             // Make all code compiled thus far executable.
+             engine_inner.publish_compiled_code();
+ 
+@@ -710,6 +709,66 @@ impl Artifact {
+             )))]
+             engine_inner.publish_eh_frame(eh_frame)?;
+ 
++            if engine_inner.profile_mode != ProfileMode::Off {
++                let names = FunctionNames::new(module_info);
++                let mut regions = Vec::new();
++                for (index, extent) in &finished_functions {
++                    regions.push(unsafe {
++                        CodeRegion::new(extent.ptr.0 as usize, extent.length, names.get(index))
++                    });
++                }
++                let (call_lengths, dynamic_lengths): (Vec<usize>, Vec<usize>) = match &artifact {
++                    ArtifactBuildVariant::Plain(p) => (
++                        p.get_function_call_trampolines_ref()
++                            .unwrap()
++                            .values()
++                            .map(|body| body.body().len())
++                            .collect(),
++                        p.get_dynamic_function_trampolines_ref()
++                            .unwrap()
++                            .values()
++                            .map(|body| body.body().len())
++                            .collect(),
++                    ),
++                    ArtifactBuildVariant::Archived(a) => (
++                        a.get_function_call_trampolines_ref()
++                            .unwrap()
++                            .values()
++                            .map(|body| body.body().len())
++                            .collect(),
++                        a.get_dynamic_function_trampolines_ref()
++                            .unwrap()
++                            .values()
++                            .map(|body| body.body().len())
++                            .collect(),
++                    ),
++                };
++                for ((index, pointer), length) in
++                    finished_function_call_trampolines.iter().zip(call_lengths)
++                {
++                    regions.push(unsafe {
++                        CodeRegion::new(
++                            *pointer as usize,
++                            length,
++                            format!("wasmer::call_trampoline[{}]", index.as_u32()),
++                        )
++                    });
++                }
++                for ((index, pointer), length) in finished_dynamic_function_trampolines
++                    .iter()
++                    .zip(dynamic_lengths)
++                {
++                    regions.push(unsafe {
++                        CodeRegion::new(
++                            pointer.0 as usize,
++                            length,
++                            format!("wasmer::dynamic_trampoline[{}]", index.as_u32()),
++                        )
++                    });
++                }
++                engine_inner.register_profile(regions, eh_frame)?;
++            }
++
+             drop(get_got_address);
+ 
+             let finished_function_lengths = finished_functions
+@@ -867,6 +926,7 @@ impl Artifact {
+         debug_info: DebugInfoSource,
+     ) -> Result<AllocatedArtifact, DeserializeError> {
+         let mut function_offsets = None;
++        let mut eh_frame = None;
+         for section in image.sections() {
+             let Ok(section_name) = section.name_bytes() else {
+                 continue;
+@@ -886,6 +946,12 @@ impl Artifact {
+                 }
+                 crate::EH_FRAME_SECTION_NAME => {
+                     engine_inner.publish_elf_eh_frame(section.address(), section.size())?;
++                    eh_frame = Some(unsafe {
++                        std::slice::from_raw_parts(
++                            base.add(section.address() as usize).cast::<u8>(),
++                            section.size() as usize,
++                        )
++                    });
+                 }
+                 _ => {}
+             }
+@@ -942,17 +1008,52 @@ impl Artifact {
+             .map(|&offset| FunctionBodyPtr(unsafe { base.add(offset) as _ }))
+             .collect::<PrimaryMap<LocalFunctionIndex, _>>();
+ 
+-        #[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
+-        let finished_function_extents = local_fn_offsets
+-            .iter()
+-            .zip(local_fn_sizes.iter())
+-            .map(|(&ptr, &length)| FunctionExtent {
+-                ptr: FunctionBodyPtr(unsafe { base.add(ptr) as _ }),
+-                length,
+-            })
+-            .collect::<PrimaryMap<LocalFunctionIndex, _>>();
+-        #[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
+-        engine_inner.register_perfmap(&finished_function_extents, module_info)?;
++        if engine_inner.profile_mode != ProfileMode::Off {
++            let names = FunctionNames::new(module_info);
++            let extents = image
++                .symbols()
++                .filter(|symbol| symbol.kind() == object::SymbolKind::Text && symbol.size() != 0)
++                .map(|symbol| (symbol.address() as usize, symbol.size() as usize))
++                .collect::<std::collections::BTreeMap<_, _>>();
++            let mut regions = Vec::new();
++            for (position, &offset) in function_offsets.iter().enumerate() {
++                let length = *extents.get(&offset).ok_or_else(|| {
++                    DeserializeError::CorruptedBinary(format!(
++                        "profiling requires an ELF symbol extent at {offset:#x}"
++                    ))
++                })?;
++                let in_section = image.sections().any(|section| {
++                    section.kind() == object::SectionKind::Text
++                        && offset as u64 >= section.address()
++                        && (offset as u64)
++                            .checked_add(length as u64)
++                            .is_some_and(|end| {
++                                section
++                                    .address()
++                                    .checked_add(section.size())
++                                    .is_some_and(|limit| end <= limit)
++                            })
++                });
++                if !in_section {
++                    return Err(corrupted_offsets());
++                }
++                let name = if position < local_function_count {
++                    names.get(LocalFunctionIndex::new(position))
++                } else if position < local_function_count + signature_count {
++                    format!(
++                        "wasmer::call_trampoline[{}]",
++                        position - local_function_count
++                    )
++                } else {
++                    format!(
++                        "wasmer::dynamic_trampoline[{}]",
++                        position - local_function_count - signature_count
++                    )
++                };
++                regions.push(unsafe { CodeRegion::new(base.add(offset) as usize, length, name) });
++            }
++            engine_inner.register_profile(regions, eh_frame)?;
++        }
+         let finished_function_call_trampolines = trampoline_offsets
+             .iter()
+             .map(|&offset| unsafe {
+diff --git a/lib/compiler/src/engine/builder.rs b/lib/compiler/src/engine/builder.rs
+index 81c942b..3b42ead 100644
+--- a/lib/compiler/src/engine/builder.rs
++++ b/lib/compiler/src/engine/builder.rs
+@@ -1,6 +1,7 @@
+ use super::Engine;
+ #[cfg(feature = "compiler")]
+ use crate::CompilerConfig;
++use crate::ProfileMode;
+ use wasmer_types::{Features, target::Target};
+ 
+ /// The Builder contents of `Engine`
+@@ -12,6 +13,7 @@ pub struct EngineBuilder {
+     target: Option<Target>,
+     /// The features to compile the Wasm module with
+     features: Option<Features>,
++    profile_mode: Option<ProfileMode>,
+ }
+ 
+ impl EngineBuilder {
+@@ -25,6 +27,7 @@ impl EngineBuilder {
+             compiler_config: Some(compiler_config.into()),
+             target: None,
+             features: None,
++            profile_mode: None,
+         }
+     }
+ 
+@@ -35,6 +38,7 @@ impl EngineBuilder {
+             compiler_config: None,
+             target: None,
+             features: None,
++            profile_mode: None,
+         }
+     }
+ 
+@@ -50,24 +54,37 @@ impl EngineBuilder {
+         self
+     }
+ 
++    /// Select the profile mode independently of the compiler, including headless loads.
++    /// An explicit choice overrides the compiler's legacy perf-map setting.
++    pub fn set_profile_mode(mut self, mode: ProfileMode) -> Self {
++        self.profile_mode = Some(mode);
++        self
++    }
++
+     /// Build the `Engine` for this configuration
+     #[cfg(feature = "compiler")]
+     pub fn engine(self) -> Engine {
+         let target = self.target.unwrap_or_default();
+-        if let Some(compiler_config) = self.compiler_config {
++        let engine = if let Some(compiler_config) = self.compiler_config {
+             let features = self
+                 .features
+                 .unwrap_or_else(|| compiler_config.default_features_for_target(&target));
+             Engine::new(compiler_config, target, features)
+         } else {
+             Engine::headless()
++        };
++        if let Some(mode) = self.profile_mode {
++            engine.inner_mut().profile_mode = mode;
+         }
++        engine
+     }
+ 
+     /// Build the `Engine` for this configuration
+     #[cfg(not(feature = "compiler"))]
+     pub fn engine(self) -> Engine {
+-        Engine::headless()
++        let engine = Engine::headless();
++        engine.inner_mut().profile_mode = self.profile_mode.unwrap_or_default();
++        engine
+     }
+ 
+     /// The Wasm features
+diff --git a/lib/compiler/src/engine/inner.rs b/lib/compiler/src/engine/inner.rs
+index 5f387c9..4d78a75 100644
+--- a/lib/compiler/src/engine/inner.rs
++++ b/lib/compiler/src/engine/inner.rs
+@@ -15,16 +15,12 @@ use wasmer_types::{CompileError, target::Target};
+ use shared_buffer::OwnedBuffer;
+ #[cfg(not(target_arch = "wasm32"))]
+ use std::ffi::c_void;
+-#[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
+-use std::io::Write;
+ #[cfg(not(target_arch = "wasm32"))]
+ use std::io::{Read, Seek};
+ #[cfg(all(not(target_arch = "wasm32"), unix))]
+ use std::os::fd::RawFd;
+ #[cfg(not(target_arch = "wasm32"))]
+ use std::path::Path;
+-#[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
+-use wasmer_types::ModuleInfo;
+ #[cfg(not(target_arch = "wasm32"))]
+ use wasmer_types::{
+     DeserializeError, FunctionIndex, FunctionType, LocalFunctionIndex, SignatureHash,
+@@ -71,9 +67,17 @@ impl Engine {
+         let tunables = BaseTunables::for_target(&target);
+         let compiler = compiler_config.compiler();
+         let name = format!("engine-{}", compiler.name());
++        let profile_mode = if compiler.get_perfmap_enabled() {
++            crate::ProfileMode::PerfMap
++        } else {
++            crate::ProfileMode::Off
++        };
+         Self {
+             inner: Arc::new(Mutex::new(EngineInner {
+                 compiler: Some(compiler),
++                profile_mode,
++                #[cfg(not(target_arch = "wasm32"))]
++                profile_registrations: vec![],
+                 features,
+                 #[cfg(not(target_arch = "wasm32"))]
+                 code_memory: vec![],
+@@ -148,6 +152,9 @@ impl Engine {
+             inner: Arc::new(Mutex::new(EngineInner {
+                 #[cfg(feature = "compiler")]
+                 compiler: None,
++                profile_mode: crate::ProfileMode::Off,
++                #[cfg(not(target_arch = "wasm32"))]
++                profile_registrations: vec![],
+                 #[cfg(feature = "compiler")]
+                 features: Features::default(),
+                 #[cfg(not(target_arch = "wasm32"))]
+@@ -381,6 +388,10 @@ impl std::fmt::Debug for Engine {
+ 
+ /// The inner contents of `Engine`
+ pub struct EngineInner {
++    pub(crate) profile_mode: crate::ProfileMode,
++    // Drop registrations before the executable allocations below.
++    #[cfg(not(target_arch = "wasm32"))]
++    profile_registrations: Vec<Arc<crate::profile::Registration>>,
+     #[cfg(feature = "compiler")]
+     /// The compiler and cpu features
+     compiler: Option<Box<dyn Compiler>>,
+@@ -701,46 +712,15 @@ impl EngineInner {
+             .register_frame_info(frame_info);
+     }
+ 
+-    #[cfg(all(not(target_arch = "wasm32"), feature = "compiler"))]
+-    pub(crate) fn register_perfmap(
+-        &self,
+-        finished_functions: &PrimaryMap<LocalFunctionIndex, FunctionExtent>,
+-        module_info: &ModuleInfo,
++    #[cfg(not(target_arch = "wasm32"))]
++    pub(crate) fn register_profile(
++        &mut self,
++        regions: Vec<crate::profile::CodeRegion>,
++        eh_frame: Option<&[u8]>,
+     ) -> Result<(), CompileError> {
+-        if self
+-            .compiler
+-            .as_ref()
+-            .is_some_and(|v| v.get_perfmap_enabled())
+-        {
+-            use std::fs::OpenOptions;
+-
+-            let filename = format!("/tmp/perf-{}.map", std::process::id());
+-            // We might be loading shared libraries and so we must append to the file.
+-            let file = OpenOptions::new()
+-                .append(true)
+-                .create(true)
+-                .open(&filename)
+-                .map_err(|e| {
+-                    CompileError::Codegen(format!("failed to open perf map file {filename}: {e}"))
+-                })?;
+-            let mut file = std::io::BufWriter::new(file);
+-
+-            for (func_index, code) in finished_functions.iter() {
+-                let func_index = module_info.func_index(func_index);
+-                if let Some(func_name) = module_info.function_names.get(&func_index) {
+-                    let sanitized_name = func_name.replace(['\n', '\r'], "_");
+-                    let line = format!(
+-                        "{:p} {:x} {sanitized_name}\n",
+-                        code.ptr.0 as *const _, code.length
+-                    );
+-                    write!(file, "{line}").map_err(|e| CompileError::Codegen(e.to_string()))?;
+-                }
+-            }
+-
+-            file.flush()
+-                .map_err(|e| CompileError::Codegen(e.to_string()))?;
+-        }
+-
++        let registration = crate::profile::register(self.profile_mode, regions, eh_frame)
++            .map_err(|e| CompileError::Resource(format!("profiling registration failed: {e}")))?;
++        self.profile_registrations.push(registration);
+         Ok(())
+     }
+ }
+diff --git a/lib/compiler/src/lib.rs b/lib/compiler/src/lib.rs
+index e8369e2..fb92298 100644
+--- a/lib/compiler/src/lib.rs
++++ b/lib/compiler/src/lib.rs
+@@ -20,7 +20,9 @@
+ #![cfg_attr(docsrs, feature(doc_cfg))]
+ 
+ mod engine;
++mod profile;
+ mod traits;
++pub use profile::{ProfileMode, profile_after_fork};
+ 
+ pub mod abi;
+ pub mod misc;
+diff --git a/lib/compiler/src/profile/linux.rs b/lib/compiler/src/profile/linux.rs
+new file mode 100644
+index 0000000..fd51004
+--- /dev/null
++++ b/lib/compiler/src/profile/linux.rs
+@@ -0,0 +1,371 @@
++use super::{CodeRegion, ProfileMode, Registration};
++use std::{
++    fs::{File, OpenOptions},
++    io::{self, Write},
++    path::Path,
++    sync::{
++        Arc, Mutex, Once, Weak,
++        atomic::{AtomicU32, Ordering},
++    },
++};
++
++static OWNER: AtomicU32 = AtomicU32::new(0);
++static EXIT: Once = Once::new();
++
++static PROCESS: Mutex<Process> = Mutex::new(Process {
++    pid: 0,
++    dump: None,
++    map: None,
++    failed: false,
++    live: Vec::new(),
++    prune_at: 256,
++});
++
++struct Process {
++    pid: u32,
++    dump: Option<Dump>,
++    map: Option<File>,
++    failed: bool,
++    live: Vec<Weak<Registration>>,
++    prune_at: usize,
++}
++
++struct Dump {
++    file: File,
++    _marker: memmap2::Mmap,
++    next_index: u64,
++}
++
++fn invalid(message: &str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, message)
++}
++
++fn now() -> io::Result<u64> {
++    let mut time = std::mem::MaybeUninit::uninit();
++    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let time = unsafe { time.assume_init() };
++    Ok(time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64)
++}
++
++fn record(id: u32, size: usize) -> io::Result<Vec<u8>> {
++    let size = u32::try_from(size).map_err(|_| invalid("jitdump record exceeds u32"))?;
++    let mut bytes = Vec::new();
++    bytes.extend_from_slice(&id.to_le_bytes());
++    bytes.extend_from_slice(&size.to_le_bytes());
++    bytes.extend_from_slice(&now()?.to_le_bytes());
++    Ok(bytes)
++}
++
++impl Dump {
++    fn new(pid: u32) -> io::Result<Self> {
++        // perf's libdw backend identifies packed JIT mappings by the literal
++        // prefix /tmp/jitted-. This must cover the directory as well as the
++        // synthetic DSO basename; other roots silently lose unwind frames.
++        Self::new_in(pid, Path::new("/tmp"))
++    }
++
++    fn new_in(pid: u32, root: &Path) -> io::Result<Self> {
++        let machine: u32 = if cfg!(target_arch = "x86_64") {
++            62
++        } else if cfg!(target_arch = "aarch64") {
++            183
++        } else {
++            return Err(io::Error::new(
++                io::ErrorKind::Unsupported,
++                "jitdump requires x86-64 or AArch64",
++            ));
++        };
++        // Unique directories prevent PID reuse from destroying recordings. Keep
++        // the file after engine/process exit: perf inject reads it afterwards.
++        let directory = tempfile::Builder::new()
++            .prefix("jitted-wasmer-")
++            .tempdir_in(root)?
++            .keep();
++        let mut file = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create_new(true)
++            .open(directory.join(format!("jit-{pid}.dump")))?;
++        let mut header = Vec::with_capacity(40);
++        for field in [0x4a695444, 1, 40, machine, 0, pid] {
++            header.extend_from_slice(&field.to_le_bytes());
++        }
++        header.extend_from_slice(&now()?.to_le_bytes());
++        header.extend_from_slice(&0u64.to_le_bytes());
++        file.write_all(&header)?;
++        // The executable mapping is perf's jitdump discovery marker; never call it.
++        let marker = unsafe { memmap2::MmapOptions::new().len(40).map_exec(&file)? };
++        EXIT.call_once(|| unsafe {
++            libc::atexit(close);
++        });
++        Ok(Self {
++            file,
++            _marker: marker,
++            next_index: 1,
++        })
++    }
++
++    fn load(&mut self, pid: u32, region: &CodeRegion) -> io::Result<()> {
++        let next = self
++            .next_index
++            .checked_add(1)
++            .ok_or_else(|| invalid("jitdump index exhausted"))?;
++        let size = 56usize
++            .checked_add(region.name.len())
++            .and_then(|n| n.checked_add(1))
++            .and_then(|n| n.checked_add(region.code.len()))
++            .ok_or_else(|| invalid("jitdump size overflow"))?;
++        let mut bytes = record(0, size)?;
++        bytes.extend_from_slice(&pid.to_le_bytes());
++        bytes.extend_from_slice(&(unsafe { libc::syscall(libc::SYS_gettid) } as u32).to_le_bytes());
++        for field in [
++            region.address as u64,
++            region.address as u64,
++            region.code.len() as u64,
++            self.next_index,
++        ] {
++            bytes.extend_from_slice(&field.to_le_bytes());
++        }
++        bytes.extend_from_slice(region.name.as_bytes());
++        bytes.push(0);
++        // No trailing padding: perf locates code at the end of this record.
++        bytes.extend_from_slice(&region.code);
++        if let Some(unwind) = &region.unwind {
++            let mut metadata = record(
++                4,
++                40usize
++                    .checked_add(unwind.len())
++                    .ok_or_else(|| invalid("unwind size overflow"))?,
++            )?;
++            for field in [unwind.len() as u64, 20, 0] {
++                metadata.extend_from_slice(&field.to_le_bytes());
++            }
++            // perf's generator consumes .eh_frame followed by .eh_frame_hdr.
++            metadata.extend_from_slice(unwind);
++            self.file.write_all(&metadata)?;
++        }
++        bytes[8..16].copy_from_slice(&now()?.to_le_bytes());
++        self.file.write_all(&bytes)?;
++        self.next_index = next;
++        Ok(())
++    }
++}
++
++impl Process {
++    fn emit(&mut self, registration: &Registration) -> io::Result<()> {
++        if self.failed {
++            return Err(invalid(
++                "profiling disabled after an earlier output failure",
++            ));
++        }
++        let result = (|| {
++            match registration.mode {
++                ProfileMode::Off => {}
++                ProfileMode::JitDump => {
++                    if self.dump.is_none() {
++                        self.dump = Some(Dump::new(self.pid)?);
++                    }
++                    for region in &registration.regions {
++                        self.dump.as_mut().unwrap().load(self.pid, region)?;
++                    }
++                }
++                ProfileMode::PerfMap => {
++                    if self.map.is_none() {
++                        self.map = Some(
++                            OpenOptions::new()
++                                .append(true)
++                                .create(true)
++                                .open(format!("/tmp/perf-{}.map", self.pid))?,
++                        );
++                    }
++                    // One append per registration keeps its lines together.
++                    let lines: String = registration
++                        .regions
++                        .iter()
++                        .map(|region| {
++                            format!("{:x} {:x} {}\n", region.address, region.length, region.name)
++                        })
++                        .collect();
++                    self.map.as_mut().unwrap().write_all(lines.as_bytes())?;
++                }
++            }
++            Ok(())
++        })();
++        if result.is_err() {
++            self.failed = true;
++        }
++        result
++    }
++}
++
++pub(super) fn register(registration: &Arc<Registration>) -> io::Result<()> {
++    let pid = std::process::id();
++    let owner = OWNER
++        .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
++        .unwrap_or_else(|pid| pid);
++    // Do not touch a possibly locked inherited mutex before an explicit hook.
++    if owner != 0 && owner != pid {
++        return Err(invalid(
++            "profiling requires explicit initialization after fork",
++        ));
++    }
++    let mut process = PROCESS
++        .lock()
++        .map_err(|_| invalid("profiling mutex poisoned"))?;
++    if process.pid == 0 {
++        process.pid = pid;
++    }
++    if process.pid != pid {
++        return Err(invalid(
++            "profiling requires explicit initialization after fork",
++        ));
++    }
++    process.emit(registration)?;
++    process.live.push(Arc::downgrade(registration));
++    // Amortize collection of expired weak entries across registrations.
++    if process.live.len() >= process.prune_at {
++        process.live.retain(|entry| entry.strong_count() != 0);
++        process.prune_at = process.live.len().saturating_mul(2).max(256);
++    }
++    Ok(())
++}
++
++extern "C" fn close() {
++    if OWNER.load(Ordering::Acquire) != std::process::id() {
++        return;
++    }
++    if let Ok(mut process) = PROCESS.try_lock() {
++        if !process.failed
++            && let Some(mut dump) = process.dump.take()
++            && let Ok(record) = record(3, 16)
++        {
++            let _ = dump.file.write_all(&record);
++        }
++    }
++}
++
++pub(super) unsafe fn after_fork() -> io::Result<()> {
++    let pid = std::process::id();
++    if OWNER.load(Ordering::Acquire) == pid {
++        return Ok(());
++    }
++    // The caller guarantees this mutex and the registry were quiescent at fork.
++    let mut process = PROCESS
++        .lock()
++        .map_err(|_| invalid("profiling mutex poisoned"))?;
++    // File is unbuffered, and Dump has no destructor that writes a CLOSE record.
++    process.dump = None;
++    process.map = None;
++    process.pid = pid;
++    process.failed = false;
++    OWNER.store(pid, Ordering::Release);
++    let live: Vec<_> = process.live.iter().filter_map(Weak::upgrade).collect();
++    process.live.retain(|entry| entry.strong_count() != 0);
++    process.prune_at = process.live.len().saturating_mul(2).max(256);
++    for registration in live {
++        process.emit(&registration)?;
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::{Read, Seek};
++
++    fn region() -> CodeRegion {
++        CodeRegion {
++            address: 0x1000,
++            length: 3,
++            name: "odd_size".into(),
++            code: vec![0x90, 0xc3, 0],
++            unwind: Some(vec![0; 20]),
++        }
++    }
++
++    #[test]
++    fn records_have_exact_sizes_ordered_timestamps_and_unique_indexes() {
++        let root = tempfile::tempdir().unwrap();
++        let mut dump = Dump::new_in(std::process::id(), root.path()).unwrap();
++        for _ in 0..8 {
++            dump.load(std::process::id(), &region()).unwrap();
++        }
++        dump.file.rewind().unwrap();
++        let mut bytes = Vec::new();
++        dump.file.read_to_end(&mut bytes).unwrap();
++        assert_eq!(
++            &bytes[..12],
++            &[0x44, 0x54, 0x69, 0x4a, 1, 0, 0, 0, 40, 0, 0, 0]
++        );
++        assert_eq!(
++            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
++            if cfg!(target_arch = "x86_64") {
++                62
++            } else {
++                183
++            }
++        );
++        let mut offset = 40;
++        let mut time = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
++        for index in 1..=8u64 {
++            for (kind, size) in [(4, 60), (0, 68)] {
++                assert_eq!(
++                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()),
++                    kind
++                );
++                assert_eq!(
++                    u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()),
++                    size as u32
++                );
++                let timestamp =
++                    u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
++                assert!(timestamp >= time);
++                time = timestamp;
++                if kind == 0 {
++                    assert_eq!(
++                        u64::from_le_bytes(bytes[offset + 48..offset + 56].try_into().unwrap()),
++                        index
++                    );
++                    assert_eq!(&bytes[offset + 56..offset + 65], b"odd_size\0");
++                    assert_eq!(&bytes[offset + 65..offset + 68], &region().code);
++                }
++                offset += size;
++            }
++        }
++        assert_eq!(offset, bytes.len());
++        dump.next_index = u64::MAX;
++        assert!(dump.load(std::process::id(), &region()).is_err());
++        assert_eq!(dump.file.metadata().unwrap().len(), bytes.len() as u64);
++        assert!(record(0, usize::MAX).is_err());
++    }
++
++    #[test]
++    fn output_failure_poisoning_prevents_later_records() {
++        let root = tempfile::tempdir().unwrap();
++        let mut dump = Dump::new_in(std::process::id(), root.path()).unwrap();
++        dump.file = OpenOptions::new().write(true).open("/dev/full").unwrap();
++        let mut process = Process {
++            pid: std::process::id(),
++            dump: Some(dump),
++            map: None,
++            failed: false,
++            live: Vec::new(),
++            prune_at: 256,
++        };
++        let registration = Registration {
++            mode: ProfileMode::JitDump,
++            regions: vec![region()],
++        };
++        assert!(process.emit(&registration).is_err());
++        assert!(process.failed);
++        assert!(
++            process
++                .emit(&registration)
++                .unwrap_err()
++                .to_string()
++                .contains("earlier output failure")
++        );
++    }
++}
+diff --git a/lib/compiler/src/profile/mod.rs b/lib/compiler/src/profile/mod.rs
+new file mode 100644
+index 0000000..cc5e739
+--- /dev/null
++++ b/lib/compiler/src/profile/mod.rs
+@@ -0,0 +1,157 @@
++//! Profiling of final, executable code, independent of compilation.
++
++use std::{collections::HashMap, sync::Arc};
++use wasmer_types::{ExportIndex, FunctionIndex, LocalFunctionIndex, ModuleInfo};
++
++#[cfg(target_os = "linux")]
++mod linux;
++#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
++mod tests;
++mod unwind;
++
++/// Native code profiler selected when an engine loads an artifact.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum ProfileMode {
++    /// Do not register generated code with a profiler.
++    #[default]
++    Off,
++    /// Append symbols to `/tmp/perf-PID.map`.
++    PerfMap,
++    /// Write Linux perf jitdump records using CLOCK_MONOTONIC.
++    /// Tested on x86-64 with perf's libdw unwinder; AArch64 output is untested.
++    /// Record with `perf record -k 1 --call-graph dwarf`, then `perf inject --jit`.
++    JitDump,
++}
++
++/// Initialize profiling in a forked child and replay all inherited live code.
++/// Call before executing guest code, even if the child loads no new modules.
++/// Repeated calls in the same process are harmless.
++///
++/// # Safety
++/// At fork, all engine/code-loading and profiling operations, and engine
++/// destruction, must be quiescent. The child must call this before starting
++/// threads or using inherited engines. This does not repair locks inherited
++/// from arbitrary multithreaded forks or make other runtime state fork-safe.
++pub unsafe fn profile_after_fork() -> std::io::Result<()> {
++    #[cfg(target_os = "linux")]
++    unsafe {
++        linux::after_fork()?;
++    }
++    Ok(())
++}
++
++pub(crate) struct CodeRegion {
++    pub address: usize,
++    pub length: usize,
++    pub name: String,
++    pub code: Vec<u8>,
++    pub unwind: Option<Vec<u8>>,
++}
++
++impl CodeRegion {
++    /// The caller guarantees that the finalized allocation contains this range.
++    pub unsafe fn new(address: usize, length: usize, name: String) -> Self {
++        Self {
++            address,
++            length,
++            name: name.replace(['\0', '\r', '\n'], "_"),
++            code: unsafe { std::slice::from_raw_parts(address as *const u8, length) }.to_vec(),
++            unwind: None,
++        }
++    }
++}
++
++pub(crate) struct FunctionNames<'a> {
++    module: &'a ModuleInfo,
++    exports: HashMap<FunctionIndex, &'a str>,
++}
++
++impl<'a> FunctionNames<'a> {
++    pub fn new(module: &'a ModuleInfo) -> Self {
++        // Index exports once, including the deterministic choice among aliases.
++        // Scanning the entire export table per unnamed function is quadratic.
++        let mut exports: HashMap<_, &str> = HashMap::new();
++        for (name, export) in &module.exports {
++            if let ExportIndex::Function(index) = export
++                && !name.is_empty()
++            {
++                exports
++                    .entry(*index)
++                    .and_modify(|old| *old = (*old).min(name.as_str()))
++                    .or_insert(name);
++            }
++        }
++        Self { module, exports }
++    }
++
++    pub fn get(&self, index: LocalFunctionIndex) -> String {
++        let index = self.module.func_index(index);
++        self.module
++            .function_names
++            .get(&index)
++            .filter(|name| !name.is_empty())
++            .map(String::as_str)
++            .or_else(|| self.exports.get(&index).copied())
++            .map(str::to_owned)
++            .unwrap_or_else(|| format!("wasm[{}]", index.as_u32()))
++    }
++}
++
++// Owned snapshots allow replay without reading executable memory. Engines retain
++// these for exactly as long as their allocations; the process registry uses Weak.
++pub(crate) struct Registration {
++    mode: ProfileMode,
++    regions: Vec<CodeRegion>,
++}
++
++pub(crate) fn register(
++    mode: ProfileMode,
++    mut regions: Vec<CodeRegion>,
++    eh_frame: Option<&[u8]>,
++) -> std::io::Result<Arc<Registration>> {
++    if mode == ProfileMode::JitDump
++        && let Some(frame) = eh_frame
++    {
++        unwind::attach(&mut regions, frame).map_err(std::io::Error::other)?;
++    }
++    if mode != ProfileMode::JitDump {
++        // Only jitdump records code bytes. A perf map needs each region's
++        // extent and name, so the registration keeps no copy of the code.
++        for region in &mut regions {
++            region.code = Vec::new();
++        }
++    }
++    let registration = Arc::new(Registration { mode, regions });
++    #[cfg(target_os = "linux")]
++    linux::register(&registration)?;
++    #[cfg(not(target_os = "linux"))]
++    match mode {
++        // Other hosts still get a perf map. The jitdump discovery protocol
++        // and replay after fork are Linux-only.
++        ProfileMode::PerfMap => {
++            use std::io::Write;
++            static MAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
++            let lines: String = registration
++                .regions
++                .iter()
++                .map(|region| format!("{:x} {:x} {}\n", region.address, region.length, region.name))
++                .collect();
++            let _guard = MAP
++                .lock()
++                .map_err(|_| std::io::Error::other("perf-map mutex poisoned"))?;
++            std::fs::OpenOptions::new()
++                .append(true)
++                .create(true)
++                .open(format!("/tmp/perf-{}.map", std::process::id()))?
++                .write_all(lines.as_bytes())?;
++        }
++        ProfileMode::JitDump => {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::Unsupported,
++                "jitdump is only supported on Linux",
++            ));
++        }
++        ProfileMode::Off => {}
++    }
++    Ok(registration)
++}
+diff --git a/lib/compiler/src/profile/tests.rs b/lib/compiler/src/profile/tests.rs
+new file mode 100644
+index 0000000..34d541b
+--- /dev/null
++++ b/lib/compiler/src/profile/tests.rs
+@@ -0,0 +1,165 @@
++use super::*;
++use gimli::{
++    BaseAddresses, CieOrFde, EhFrame, LittleEndian, UnwindSection,
++    write::{
++        Address, CallFrameInstruction as Cfi, CommonInformationEntry, EndianVec,
++        FrameDescriptionEntry, FrameTable,
++    },
++};
++
++fn cie() -> CommonInformationEntry {
++    let mut cie = CommonInformationEntry::new(
++        gimli::Encoding {
++            format: gimli::Format::Dwarf32,
++            version: 1,
++            address_size: 8,
++        },
++        1,
++        -8,
++        gimli::X86_64::RA,
++    );
++    cie.add_instruction(Cfi::Cfa(gimli::X86_64::RSP, 8));
++    cie.add_instruction(Cfi::Offset(gimli::X86_64::RA, -8));
++    cie
++}
++
++#[test]
++fn independent_frames_preserve_distinct_rules_and_remove_exception_references() {
++    let mut table = FrameTable::default();
++    let mut common = cie();
++    common.personality = Some((gimli::DW_EH_PE_absptr, Address::Constant(0x1234)));
++    common.lsda_encoding = Some(gimli::DW_EH_PE_absptr);
++    let common = table.add_cie(common);
++    for (address, stack) in [(0x1000, 32), (0x2000, 64)] {
++        let mut frame = FrameDescriptionEntry::new(Address::Constant(address), 16);
++        frame.lsda = Some(Address::Constant(0x5678));
++        frame.add_instruction(4, Cfi::CfaOffset(stack));
++        table.add_fde(common, frame);
++    }
++    let mut pc_relative = cie();
++    pc_relative.fde_address_encoding = gimli::DW_EH_PE_pcrel | gimli::DW_EH_PE_sdata4;
++    let pc_relative = table.add_cie(pc_relative);
++    table.add_fde(
++        pc_relative,
++        FrameDescriptionEntry::new(Address::Constant(0x4000), 16),
++    );
++    let mut input = gimli::write::EhFrame(EndianVec::new(LittleEndian));
++    table.write_eh_frame(&mut input).unwrap();
++    let bytes = input.0.into_vec();
++    let mut regions: Vec<_> = [0x1000, 0x2000, bytes.as_ptr() as usize + 0x4000]
++        .into_iter()
++        .map(|address| CodeRegion {
++            address,
++            length: 16,
++            name: "test".into(),
++            code: vec![0; 16],
++            unwind: None,
++        })
++        .collect();
++    unwind::attach(&mut regions, &bytes).unwrap();
++    for (index, region) in regions.iter().enumerate() {
++        let bytes = region.unwind.as_ref().unwrap();
++        let mut frame = EhFrame::new(&bytes[..bytes.len() - 20], LittleEndian);
++        frame.set_address_size(8);
++        // Synthetic code begins at 0x1000, followed by its aligned frame table.
++        let bases = BaseAddresses::default().set_eh_frame(0x1010);
++        let mut entries = frame.entries(&bases);
++        assert!(matches!(entries.next().unwrap(), Some(CieOrFde::Cie(_))));
++        let Some(CieOrFde::Fde(fde)) = entries.next().unwrap() else {
++            panic!("missing FDE")
++        };
++        let fde = fde.parse(EhFrame::cie_from_offset).unwrap();
++        assert_eq!(fde.initial_address(), 0x1000);
++        assert_eq!(fde.len(), 16);
++        assert!(fde.cie().personality().is_none());
++        assert!(fde.lsda().is_none());
++        let mut context = gimli::UnwindContext::new();
++        let row = fde
++            .unwind_info_for_address(&frame, &bases, &mut context, 0x1004)
++            .unwrap();
++        assert_eq!(
++            *row.cfa(),
++            gimli::CfaRule::RegisterAndOffset {
++                register: gimli::X86_64::RSP,
++                offset: [32, 64, 8][index]
++            }
++        );
++        assert!(entries.next().unwrap().is_none());
++    }
++    assert!(
++        unwind::attach(&mut regions, &bytes).is_err(),
++        "duplicate FDE must be rejected"
++    );
++    assert!(unwind::attach(&mut [], &[0xff; 12]).is_err());
++}
++
++#[test]
++fn search_header_leads_to_the_region_table_at_perf_addresses() {
++    let mut table = FrameTable::default();
++    let common = table.add_cie(cie());
++    let mut frame = FrameDescriptionEntry::new(Address::Constant(0x3000), 13);
++    frame.add_instruction(4, Cfi::CfaOffset(24));
++    table.add_fde(common, frame);
++    let mut input = gimli::write::EhFrame(EndianVec::new(LittleEndian));
++    table.write_eh_frame(&mut input).unwrap();
++    let bytes = input.0.into_vec();
++    let mut regions = vec![CodeRegion {
++        address: 0x3000,
++        length: 13,
++        name: "test".into(),
++        code: vec![0; 13],
++        unwind: None,
++    }];
++    unwind::attach(&mut regions, &bytes).unwrap();
++
++    // In the file perf builds for this region, the code starts at 0, the
++    // table at 16, and the 20-byte header follows the table.
++    let unwind = regions[0].unwind.as_ref().unwrap();
++    let (eh_frame, header) = unwind.split_at(unwind.len() - 20);
++    let bases = BaseAddresses::default()
++        .set_text(0)
++        .set_eh_frame(16)
++        .set_eh_frame_hdr(16 + eh_frame.len() as u64);
++    let header = gimli::EhFrameHdr::new(header, LittleEndian)
++        .parse(&bases, 8)
++        .unwrap();
++    assert_eq!(header.eh_frame_ptr(), gimli::Pointer::Direct(16));
++    let mut frame = EhFrame::new(eh_frame, LittleEndian);
++    frame.set_address_size(8);
++    let fde = header
++        .table()
++        .unwrap()
++        .fde_for_address(&frame, &bases, 5, EhFrame::cie_from_offset)
++        .unwrap();
++    assert_eq!(fde.initial_address(), 0);
++    assert_eq!(fde.len(), 13);
++    let mut context = gimli::UnwindContext::new();
++    let row = fde
++        .unwind_info_for_address(&frame, &bases, &mut context, 5)
++        .unwrap();
++    assert_eq!(
++        *row.cfa(),
++        gimli::CfaRule::RegisterAndOffset {
++            register: gimli::X86_64::RSP,
++            offset: 24
++        }
++    );
++}
++
++#[test]
++fn names_use_full_indexes_and_deterministic_exports() {
++    let mut module = ModuleInfo::default();
++    module.num_imported_functions = 2;
++    let local = LocalFunctionIndex::from_u32(0);
++    let index = module.func_index(local);
++    assert_eq!(FunctionNames::new(&module).get(local), "wasm[2]");
++    module
++        .exports
++        .insert("z".into(), ExportIndex::Function(index));
++    module
++        .exports
++        .insert("a".into(), ExportIndex::Function(index));
++    assert_eq!(FunctionNames::new(&module).get(local), "a");
++    module.function_names.insert(index, "named".into());
++    assert_eq!(FunctionNames::new(&module).get(local), "named");
++}
+diff --git a/lib/compiler/src/profile/unwind.rs b/lib/compiler/src/profile/unwind.rs
+new file mode 100644
+index 0000000..ee94c36
+--- /dev/null
++++ b/lib/compiler/src/profile/unwind.rs
+@@ -0,0 +1,275 @@
++//! Convert relocated module CFI into independent profiling-only frame tables.
++
++use super::CodeRegion;
++use gimli::{
++    BaseAddresses, CallFrameInstruction as ReadInstruction, CieOrFde, EhFrame, EndianSlice,
++    LittleEndian, UnwindSection,
++    write::{
++        self, Address, CallFrameInstruction as Instruction, CommonInformationEntry, EndianVec,
++        FrameDescriptionEntry, FrameTable,
++    },
++};
++use std::collections::BTreeMap;
++
++type Reader<'a> = EndianSlice<'a, LittleEndian>;
++
++pub(super) fn attach(regions: &mut [CodeRegion], bytes: &[u8]) -> Result<(), String> {
++    let mut frame = EhFrame::new(bytes, LittleEndian);
++    frame.set_address_size(8);
++    let bases = BaseAddresses::default().set_eh_frame(bytes.as_ptr() as u64);
++    let indexes: BTreeMap<_, _> = regions
++        .iter()
++        .enumerate()
++        .map(|(index, region)| (region.address as u64, index))
++        .collect();
++    let mut cies = BTreeMap::new();
++    let mut entries = frame.entries(&bases);
++    while let Some(entry) = entries.next().map_err(|e| e.to_string())? {
++        let CieOrFde::Fde(partial) = entry else {
++            continue;
++        };
++        let fde = partial
++            .parse(EhFrame::cie_from_offset)
++            .map_err(|e| e.to_string())?;
++        let Some(&index) = indexes.get(&fde.initial_address()) else {
++            continue;
++        };
++        let region = &mut regions[index];
++        if region.unwind.is_some() || fde.len() > region.code.len() as u64 {
++            return Err("overlapping or oversized profiling FDE".into());
++        }
++        let original = fde.cie();
++        let cie = if let Some(cie) = cies.get(&original.offset()) {
++            cie
++        } else {
++            let mut cie = CommonInformationEntry::new(
++                gimli::Encoding {
++                    format: gimli::Format::Dwarf32,
++                    ..original.encoding()
++                },
++                original
++                    .code_alignment_factor()
++                    .try_into()
++                    .map_err(|_| "CFI code alignment overflow")?,
++                original
++                    .data_alignment_factor()
++                    .try_into()
++                    .map_err(|_| "CFI data alignment overflow")?,
++                original.return_address_register(),
++            );
++            // Profiling never runs exception handlers. Omit personality and LSDA
++            // references so this table is independent of the runtime allocation.
++            cie.fde_address_encoding = gimli::DW_EH_PE_pcrel | gimli::DW_EH_PE_sdata4;
++            cie.signal_trampoline = original.is_signal_trampoline();
++            for (offset, instruction) in
++                instructions(original.instructions(&frame, &bases), original, &frame)?
++            {
++                if offset != 0 {
++                    return Err("location change in profiling CIE".into());
++                }
++                cie.add_instruction(instruction);
++            }
++            cies.entry(original.offset()).or_insert(cie)
++        };
++        // perf inject gives each region an ELF file of its own, with the code
++        // at address 0, the unwind table where the code ends, rounded up to
++        // 8 bytes, and the search header straight after the table. The
++        // addresses below are in that file; gimli writes an address as if
++        // the table itself starts at 0.
++        let text_address = 0u64;
++        let eh_frame_address = region
++            .code
++            .len()
++            .checked_next_multiple_of(8)
++            .ok_or("code length overflow")? as u64;
++        let mut copy = FrameDescriptionEntry::new(
++            Address::Constant(text_address.wrapping_sub(eh_frame_address)),
++            fde.len().try_into().map_err(|_| "FDE length overflow")?,
++        );
++        for (offset, instruction) in
++            instructions(fde.instructions(&frame, &bases), original, &frame)?
++        {
++            if u64::from(offset) > fde.len() {
++                return Err("CFI instruction outside function".into());
++            }
++            copy.add_instruction(offset, instruction);
++        }
++        let mut table = FrameTable::default();
++        let cie = table.add_cie(cie.clone());
++        table.add_fde(cie, copy);
++        let mut output = write::EhFrame(EndianVec::new(LittleEndian));
++        table
++            .write_eh_frame(&mut output)
++            .map_err(|e| e.to_string())?;
++        let mut unwind = output.0.into_vec();
++        let fde_address = eh_frame_address + only_fde_offset(&unwind)?;
++        // A zero length ends the table, and the header starts on the next
++        // 8-byte boundary.
++        unwind.extend_from_slice(&[0; 4]);
++        unwind.resize(unwind.len().next_multiple_of(8), 0);
++        let header_address = eh_frame_address + unwind.len() as u64;
++        push_search_header(
++            &mut unwind,
++            header_address,
++            eh_frame_address,
++            text_address,
++            fde_address,
++        )?;
++        region.unwind = Some(unwind);
++    }
++    Ok(())
++}
++
++/// The offset within `table` of the single FDE written for one region.
++fn only_fde_offset(table: &[u8]) -> Result<u64, String> {
++    let mut frame = EhFrame::new(table, LittleEndian);
++    frame.set_address_size(8);
++    let bases = BaseAddresses::default().set_eh_frame(0);
++    let mut entries = frame.entries(&bases);
++    while let Some(entry) = entries.next().map_err(|e| e.to_string())? {
++        if let CieOrFde::Fde(partial) = entry {
++            let fde = partial
++                .parse(EhFrame::cie_from_offset)
++                .map_err(|e| e.to_string())?;
++            return Ok(fde.offset() as u64);
++        }
++    }
++    Err("profiling unwind table has no FDE".into())
++}
++
++/// Append an `.eh_frame_hdr` for a table holding one FDE: the format
++/// version, the encodings of the fields that follow, a pointer to the table
++/// relative to that pointer's own field, the entry count, and one search
++/// entry of the code's address and the FDE's address, both relative to the
++/// start of the header.
++fn push_search_header(
++    unwind: &mut Vec<u8>,
++    header_address: u64,
++    eh_frame_address: u64,
++    text_address: u64,
++    fde_address: u64,
++) -> Result<(), String> {
++    let relative = |target: u64, base: u64| {
++        i32::try_from(target.wrapping_sub(base) as i64)
++            .map_err(|_| "profiling unwind table is too large".to_string())
++    };
++    let table_pointer = relative(eh_frame_address, header_address + 4)?;
++    let initial_location = relative(text_address, header_address)?;
++    let fde = relative(fde_address, header_address)?;
++    unwind.extend_from_slice(&[
++        1,
++        (gimli::DW_EH_PE_pcrel | gimli::DW_EH_PE_sdata4).0,
++        gimli::DW_EH_PE_udata4.0,
++        (gimli::DW_EH_PE_datarel | gimli::DW_EH_PE_sdata4).0,
++    ]);
++    unwind.extend_from_slice(&table_pointer.to_le_bytes());
++    unwind.extend_from_slice(&1u32.to_le_bytes());
++    unwind.extend_from_slice(&initial_location.to_le_bytes());
++    unwind.extend_from_slice(&fde.to_le_bytes());
++    Ok(())
++}
++
++fn instructions(
++    mut input: gimli::CallFrameInstructionIter<'_, Reader<'_>>,
++    cie: &gimli::CommonInformationEntry<Reader<'_>>,
++    frame: &EhFrame<Reader<'_>>,
++) -> Result<Vec<(u32, Instruction)>, String> {
++    let mut result = Vec::new();
++    let mut location = 0u32;
++    let signed = |value: i128| i32::try_from(value).map_err(|_| "CFI offset overflow".to_string());
++    let factored = |value: i128| signed(value * i128::from(cie.data_alignment_factor()));
++    let expression = |value: gimli::UnwindExpression<usize>| -> Result<write::Expression, String> {
++        let value = value.get(frame).map_err(|e| e.to_string())?;
++        let mut operations = value.operations(cie.encoding());
++        while let Some(operation) = operations.next().map_err(|e| e.to_string())? {
++            use gimli::Operation::*;
++            match operation {
++                Address { .. }
++                | AddressIndex { .. }
++                | ConstantIndex { .. }
++                | Call { .. }
++                | ImplicitPointer { .. }
++                | EntryValue { .. }
++                | ParameterRef { .. }
++                | TypedLiteral { .. }
++                | Convert { .. }
++                | Reinterpret { .. } => {
++                    return Err("CFI expression refers outside its frame table".into());
++                }
++                Deref { base_type, .. } | RegisterOffset { base_type, .. } if base_type.0 != 0 => {
++                    return Err("typed CFI expression refers outside its frame table".into());
++                }
++                _ => {}
++            }
++        }
++        Ok(write::Expression::raw(value.0.slice().to_vec()))
++    };
++    while let Some(instruction) = input.next().map_err(|e| e.to_string())? {
++        use ReadInstruction::*;
++        let instruction = match instruction {
++            Nop => continue,
++            AdvanceLoc { delta } => {
++                let advance = u64::from(delta)
++                    .checked_mul(cie.code_alignment_factor())
++                    .ok_or("CFI location overflow")?;
++                location = location
++                    .checked_add(advance.try_into().map_err(|_| "CFI location overflow")?)
++                    .ok_or("CFI location overflow")?;
++                continue;
++            }
++            SetLoc { .. } => return Err("absolute CFI locations are unsupported".into()),
++            DefCfa { register, offset } => Instruction::Cfa(register, signed(i128::from(offset))?),
++            DefCfaSf {
++                register,
++                factored_offset,
++            } => Instruction::Cfa(register, factored(i128::from(factored_offset))?),
++            DefCfaRegister { register } => Instruction::CfaRegister(register),
++            DefCfaOffset { offset } => Instruction::CfaOffset(signed(i128::from(offset))?),
++            DefCfaOffsetSf { factored_offset } => {
++                Instruction::CfaOffset(factored(i128::from(factored_offset))?)
++            }
++            DefCfaExpression { expression: value } => {
++                Instruction::CfaExpression(expression(value)?)
++            }
++            Undefined { register } => Instruction::Undefined(register),
++            SameValue { register } => Instruction::SameValue(register),
++            Offset {
++                register,
++                factored_offset,
++            } => Instruction::Offset(register, factored(i128::from(factored_offset))?),
++            OffsetExtendedSf {
++                register,
++                factored_offset,
++            } => Instruction::Offset(register, factored(i128::from(factored_offset))?),
++            ValOffset {
++                register,
++                factored_offset,
++            } => Instruction::ValOffset(register, factored(i128::from(factored_offset))?),
++            ValOffsetSf {
++                register,
++                factored_offset,
++            } => Instruction::ValOffset(register, factored(i128::from(factored_offset))?),
++            Register {
++                dest_register,
++                src_register,
++            } => Instruction::Register(dest_register, src_register),
++            Expression {
++                register,
++                expression: value,
++            } => Instruction::Expression(register, expression(value)?),
++            ValExpression {
++                register,
++                expression: value,
++            } => Instruction::ValExpression(register, expression(value)?),
++            Restore { register } => Instruction::Restore(register),
++            RememberState => Instruction::RememberState,
++            RestoreState => Instruction::RestoreState,
++            ArgsSize { size } => {
++                Instruction::ArgsSize(size.try_into().map_err(|_| "CFI argument size overflow")?)
++            }
++            NegateRaState => Instruction::NegateRaState,
++        };
++        result.push((location, instruction));
++    }
++    Ok(result)
++}

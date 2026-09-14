@@ -40,7 +40,8 @@ sc_wasmer_sets_hash() {
 sc_wasmer_dev_sets() {
   echo "v$WASMER_VERSION fixes wasmer/fixes/patches"
   echo "fixes ictrobot_shm_v1 extensions/ictrobot_shm_v1/patches"
-  echo "ictrobot_shm_v1 servicecache wasmer/servicecache/patches"
+  echo "ictrobot_shm_v1 jitdump wasmer/jitdump/patches"
+  echo "jitdump servicecache wasmer/servicecache/patches"
 }
 
 # sc_wasmer_export_range <checkout> <from> <to> <directory>: write the
