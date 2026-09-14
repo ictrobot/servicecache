@@ -23,7 +23,7 @@ CLEAN_WASMER_TARGETS := $(addprefix clean-wasmer-,$(WASMER_VARIANTS))
 EXTENSION_NAMES := $(patsubst extensions/%/smoke.sh,%,$(wildcard extensions/*/smoke.sh))
 SMOKE_EXTENSION_TARGETS := $(addprefix smoke-extension-,$(EXTENSION_NAMES))
 
-.PHONY: help bootstrap setup-wasmer setup-wasmer-dev build test lint check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
+.PHONY: help bootstrap setup-wasmer setup-wasmer-dev build build-release test lint check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
 .PHONY: $(SERVICE_NAME_TARGETS) $(WASMER_TARGETS) $(TEST_WASMER_TARGETS) $(CLEAN_WASMER_TARGETS) $(SMOKE_EXTENSION_TARGETS)
@@ -43,6 +43,7 @@ help:
 	@echo "wasmer-<variant>                build a Wasmer variant's CLI into work/wasmer/<variant> ($(WASMER_VARIANTS))"
 	@echo "test-wasmer-<variant>           run the unit tests of the CLI's crates in that variant's checkout"
 	@echo "build                           setup-wasmer, then cargo build"
+	@echo "build-release                   setup-wasmer, then cargo build --release"
 	@echo "test                            setup-wasmer, then cargo test"
 	@echo "lint                            setup-wasmer, then cargo fmt --check and cargo clippy"
 	@echo "lifecycle-tests                 freeze and fork every built service through the host (quick matrix)"
@@ -78,6 +79,9 @@ setup-wasmer-dev:
 
 build: setup-wasmer
 	cargo build --workspace
+
+build-release: setup-wasmer
+	cargo build --release --workspace
 
 test: setup-wasmer
 	cargo test --workspace

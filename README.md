@@ -91,6 +91,8 @@ make lifecycle-tests      # freeze and fork every built service
 
 The smoke and lifecycle matrices use artifacts below `work/services`, so build the relevant services first. Most targets also come in per-service and per-version forms, such as `smoke-service-mariadb` and `lifecycle-service-mariadb-11.8.9`.
 
+To profile a host and its guests with perf, see [PROFILING.md](PROFILING.md).
+
 ## License
 
 Except where otherwise noted, ServiceCache's original code, scripts and documentation are licensed under the [MIT License](LICENSE). Patch series modifying third-party software are licensed as documented in their respective patch directories.
