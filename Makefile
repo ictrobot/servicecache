@@ -23,7 +23,7 @@ CLEAN_WASMER_TARGETS := $(addprefix clean-wasmer-,$(WASMER_VARIANTS))
 EXTENSION_NAMES := $(patsubst extensions/%/smoke.sh,%,$(wildcard extensions/*/smoke.sh))
 SMOKE_EXTENSION_TARGETS := $(addprefix smoke-extension-,$(EXTENSION_NAMES))
 
-.PHONY: help bootstrap setup-wasmer setup-wasmer-dev build build-release test lint check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
+.PHONY: help bootstrap setup-wasmer setup-wasmer-dev build build-release test lint check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions smoke-openssl lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
 .PHONY: $(SERVICE_NAME_TARGETS) $(WASMER_TARGETS) $(TEST_WASMER_TARGETS) $(CLEAN_WASMER_TARGETS) $(SMOKE_EXTENSION_TARGETS)
@@ -128,7 +128,10 @@ purge:
 
 services: $(SERVICE_TARGETS)
 
-smoke: smoke-toolchain smoke-services smoke-extensions
+smoke: smoke-toolchain smoke-services smoke-extensions smoke-openssl
+
+smoke-openssl: bootstrap
+	toolchain/libs/openssl/smoke.sh
 
 smoke-services: $(SMOKE_SERVICE_TARGETS)
 

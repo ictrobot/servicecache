@@ -12,9 +12,10 @@ set -euo pipefail
 # the build tree live in that directory too, so removing it removes the whole
 # build.
 
-# Services run this through a link in their libs directory, so find the
-# repository from where the script really is.
-SC_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../.." && pwd)"
+# Services run this through a link in their libs directory, so find this
+# directory and the repository from where the script really is.
+lib_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SC_ROOT="$(cd "$lib_dir/../../.." && pwd)"
 source "$SC_ROOT/toolchain/lib.sh"
 source "$SC_ROOT/toolchain/versions.sh"
 source "$SC_ROOT/toolchain/env.sh"
@@ -44,9 +45,10 @@ done
 
 # Whether the directory already holds a complete WASIX build of this version of
 # OpenSSL: both static libraries, headers that announce the version asked for,
-# the datagram support this target does without, and real pthread locking
-# rather than the no-op the configuration falls back to when it decides the
-# platform has no threads.
+# the datagram support this target does without, the target wasix.conf
+# describes, built from the wasix.conf in this directory, and real pthread
+# locking rather than the no-op the configuration falls back to when it
+# decides the platform has no threads.
 openssl_ready() {
   local version_header="$install_dir/include/openssl/opensslv.h"
   local config_header="$install_dir/include/openssl/configuration.h"
@@ -61,6 +63,10 @@ openssl_ready() {
   grep -Eq "^# *define OPENSSL_VERSION_PATCH +${version_patch}$" "$version_header" || return 1
   grep -Eq '^# *define OPENSSL_VERSION_PRE_RELEASE +""$' "$version_header" || return 1
   grep -Eq '^# *define OPENSSL_NO_DGRAM$' "$config_header" || return 1
+  grep -Eq '^# *define SIXTY_FOUR_BIT$' "$config_header" || return 1
+  ! grep -q 'OPENSSL_NO_ASM' "$config_header" || return 1
+  ! grep -q 'OPENSSL_NO_EC_NISTP_64_GCC_128' "$config_header" || return 1
+  cmp -s "$lib_dir/wasix.conf" "$install_dir/wasix.conf" || return 1
   "$WASIXCC_DIR/bin/wasixnm" --defined-only --print-file-name \
     "$install_dir/lib/libcrypto.a" 2>/dev/null |
     grep -E 'libcrypto-lib-threads_pthread[.]o: .* T CRYPTO_THREAD_lock_new$' \
@@ -87,9 +93,13 @@ elif [[ ! -f "$source_dir/Configure" ]]; then
   exit 1
 fi
 
+# Configure from scratch: the build tree does not track changed options.
+rm -rf "$build_dir"
 mkdir -p "$build_dir"
 (
   cd "$build_dir"
+  # The wasix-wasm32 target keeps assembly enabled, so there is no no-asm
+  # here; see wasix.conf.
   env \
     CC="$WASIXCC_DIR/bin/wasixcc" \
     CXX="$WASIXCC_DIR/bin/wasix++" \
@@ -99,13 +109,12 @@ mkdir -p "$build_dir"
     LD="$WASIXCC_DIR/bin/wasixld" \
     CFLAGS="--target=wasm32-wasix -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -ftls-model=local-exec -fno-trapping-math -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -DUSE_TIMEGM -DOPENSSL_NO_SECURE_MEMORY -DOPENSSL_NO_DGRAM -DOPENSSL_THREADS -O2" \
     LDFLAGS="-Wl,--allow-undefined" \
-    "$source_dir/Configure" linux-generic32 \
+    "$source_dir/Configure" --config="$lib_dir/wasix.conf" wasix-wasm32 \
       --prefix="$install_dir" \
       --libdir=lib \
       -static \
       no-shared \
       no-pic \
-      no-asm \
       no-dso \
       no-tests \
       no-apps \
@@ -119,4 +128,5 @@ mkdir -p "$build_dir"
 
 make -C "$build_dir" -j"$jobs" build_libs
 make -C "$build_dir" install_dev
+cp "$lib_dir/wasix.conf" "$install_dir/wasix.conf"
 openssl_ready || { sc_fail "OpenSSL verification failed after installation"; exit 1; }
