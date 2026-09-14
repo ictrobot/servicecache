@@ -76,9 +76,14 @@ install_wrapper() {
   [[ ! -e "$WASIXCC_DIR" ]] ||
     fail "incomplete wasixcc installation at $WASIXCC_DIR; move it aside and retry"
 
-  local archive="$SC_ROOT/work/downloads/toolchain/wasixcc-${WASIXCC_VERSION}-linux-x86_64.tar.gz"
-  local url="https://github.com/wasix-org/wasixcc/releases/download/v${WASIXCC_VERSION}/wasixcc-x86_64-unknown-linux-gnu.tar.gz"
-  download "$url" "$archive" "$WASIXCC_SHA256"
+  # wasixccenv then downloads LLVM and binaryen for the architecture it was
+  # built for, so the host's architecture only has to be chosen here.
+  local arch checksum_pin
+  arch="$(uname -m)"
+  checksum_pin="WASIXCC_SHA256_${arch^^}"
+  local archive="$SC_ROOT/work/downloads/toolchain/wasixcc-${WASIXCC_VERSION}-linux-${arch}.tar.gz"
+  local url="https://github.com/wasix-org/wasixcc/releases/download/v${WASIXCC_VERSION}/wasixcc-${arch}-unknown-linux-gnu.tar.gz"
+  download "$url" "$archive" "${!checksum_pin}"
 
   mkdir -p "$WASIXCC_DIR"
   tar -xzf "$archive" -C "$WASIXCC_DIR"
@@ -311,7 +316,7 @@ load_service_set() {
   local service_versions="${version_file%/versions/*}/versions.sh"
 
   unset WASIXCC_VERSION WASIX_SYSROOT_TAG WASIX_LLVM_TAG BINARYEN_TAG WASMER_VERSION
-  unset WASIXCC_SHA256
+  unset WASIXCC_SHA256_X86_64 WASIXCC_SHA256_AARCH64
   source "$version_file"
   if [[ -f "$service_versions" ]]; then
     source "$service_versions"
@@ -320,8 +325,10 @@ load_service_set() {
   source "$SC_ROOT/toolchain/env.sh"
 }
 
-[[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] ||
-  fail "the pinned binary toolchain is supported only on Linux x86_64"
+case "$(uname -s) $(uname -m)" in
+  "Linux x86_64" | "Linux aarch64") ;;
+  *) fail "the pinned binary toolchain is supported only on Linux x86_64 and aarch64" ;;
+esac
 for command_name in curl sha256sum tar git make; do
   require_command "$command_name"
 done

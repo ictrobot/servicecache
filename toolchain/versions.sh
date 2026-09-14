@@ -13,4 +13,6 @@
 : "${BINARYEN_TAG:=version_132}"
 : "${WASMER_VERSION:=7.3.0}"
 
-: "${WASIXCC_SHA256:=7f9644bb94e3a14d8d2594b022fdf1ab44e22cfd365e6bf4bd324d8064cc908a}"
+# The wasixcc release archive for each supported host architecture (uname -m).
+: "${WASIXCC_SHA256_X86_64:=7f9644bb94e3a14d8d2594b022fdf1ab44e22cfd365e6bf4bd324d8064cc908a}"
+: "${WASIXCC_SHA256_AARCH64:=aa21613ceee2edc0c6b8918d1c86cb84b40996ac5533c06d3940e3ecd8a64373}"

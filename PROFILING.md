@@ -80,8 +80,7 @@ Settings:
 
 ```sh
 make build-release service-valkey-9.1.1
-tools/profile.sh "$(mktemp -d)" \
-  target/release/servicecache --services-dir work/services run valkey@9.1.1
+tools/profile.sh "$(mktemp -d)" target/release/servicecache --services-dir work/services run valkey@9.1.1
 ```
 
 Drive a workload against the printed endpoint, then press Ctrl-C. With
@@ -108,6 +107,5 @@ to it.
 
 ```sh
 make wasmer-jitdump
-tools/profile.sh "$(mktemp -d)" \
-  work/wasmer/jitdump/bin/wasmer run --profiler jitdump module.wasm
+tools/profile.sh "$(mktemp -d)" work/wasmer/jitdump/bin/wasmer run --profiler jitdump module.wasm
 ```
