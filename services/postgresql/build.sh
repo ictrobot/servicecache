@@ -3,7 +3,14 @@ set -euo pipefail
 
 source "$(dirname "$0")/../../toolchain/lib.sh"
 sc_init postgresql "${1:?usage: $0 version}"
-sc_clean_if_toolchain_changed
+source "$SC_SERVICE_DIR/deps.sh" "$SC_VERSION"
+# PostgreSQL's makefiles, without --enable-depend, rebuild nothing when
+# configure rewrites pg_config.h, and relink nothing when OpenSSL's libraries
+# change, so this script and those libraries count as build inputs.
+sc_clean_if_toolchain_changed "$(
+  cat "$0" "$POSTGRESQL_OPENSSL_DIR/lib/libcrypto.a" "$POSTGRESQL_OPENSSL_DIR/lib/libssl.a" |
+    sha256sum | cut -d' ' -f1
+)"
 : "${SC_SOURCE_URL:=https://github.com/postgres/postgres.git}"
 : "${POSTGRESQL_TAG:=REL_${SC_VERSION//./_}}"
 sc_checkout "$SC_SOURCE_URL" "$POSTGRESQL_TAG" "$SC_SRC"
@@ -34,12 +41,19 @@ atomic_sigatomic_header="$SC_SRC/src/include/port/wasix_atomic_sigatomic.h"
 export WASIXCC_AUTOCONF_WORKAROUNDS=yes
 export WASIXCC_GENERATE_SHELL_SCRIPT=no
 
+# OpenSSL is the one library the server is configured against: it gives the
+# backend and libpq their TLS code, and SCRAM and the SHA and HMAC functions
+# libcrypto's implementations rather than the copies src/common carries for
+# builds without one.
 configure_args=(
   --host=wasm32-wasix
   --with-template=linux
   --prefix="$SC_BUILD/install"
   --disable-rpath
   --disable-nls
+  --with-ssl=openssl
+  --with-includes="$POSTGRESQL_OPENSSL_DIR/include"
+  --with-libraries="$POSTGRESQL_OPENSSL_DIR/lib"
   --without-icu
   --without-libxml
   --without-libxslt

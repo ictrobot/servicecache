@@ -60,27 +60,49 @@ if [[ "$ready" != true ]]; then
   exit 1
 fi
 
-"${probe[@]}" \
-  "CREATE TABLE smoke (id int PRIMARY KEY, value text)" \
-  "INSERT INTO smoke VALUES (1, 'standalone')" \
-  "SELECT value FROM smoke WHERE id = 1" \
-  "SELECT count(*)::text FROM pg_stat_activity"
+# check description expected sql: one probe call, a session of its own, and
+# its whole output. Statements that return no rows expect "".
+check() {
+  local actual
+  actual="$("${probe[@]}" "$3")" || { echo "$1: the query failed" >&2; exit 1; }
+  [[ "$actual" == "$2" ]] || { echo "$1: expected '$2', got '$actual'" >&2; exit 1; }
+}
+
+check "create a table" "" "CREATE TABLE smoke (id int PRIMARY KEY, value text)"
+check "insert a row" "" "INSERT INTO smoke VALUES (1, 'standalone')"
+check "read the row back" "standalone" "SELECT value FROM smoke WHERE id = 1"
+check "the connection's backend" "client backend" \
+  "SELECT backend_type FROM pg_stat_activity WHERE pid = pg_backend_pid()"
+
+# The server is built against OpenSSL. It names OpenSSL as its TLS library
+# even though TLS is off, with no certificate configured, and SHA-256 and
+# the random bytes of a version 4 UUID come from libcrypto.
+check "TLS library" "OpenSSL" "SELECT setting FROM pg_settings WHERE name = 'ssl_library'"
+check "TLS" "off" "SELECT setting FROM pg_settings WHERE name = 'ssl'"
+check "SHA-256 of 'abc'" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" \
+  "SELECT encode(sha256('abc'), 'hex')"
+check "UUID version" "4" "SELECT uuid_extract_version(gen_random_uuid())::text"
+check "two UUIDs differ" "true" "SELECT (gen_random_uuid() <> gen_random_uuid())::text"
 
 # A forced parallel aggregate exercises what the extension exists for:
 # postmaster children cooperating through shared memory. The full worker
 # accounting stays in the host trials' adapter; one plan proving four
-# launched workers is enough here.
-parallel="$("${probe[@]}" \
-  "CREATE TABLE parallel_smoke AS SELECT id FROM generate_series(1, 20000) id" \
-  "ANALYZE parallel_smoke" \
-  "SET max_parallel_workers_per_gather = 4; SET min_parallel_table_scan_size = 0; SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET parallel_leader_participation = off; ALTER TABLE parallel_smoke SET (parallel_workers = 4)" \
-  "SELECT sum(id)::text FROM parallel_smoke" \
-  "EXPLAIN (ANALYZE) SELECT sum(id) FROM parallel_smoke")"
-[[ "$parallel" == *"200010000"* ]] ||
-  { echo "the parallel aggregate returned the wrong sum" >&2; exit 1; }
-[[ "$parallel" == *"Workers Launched: 4"* ]] || {
+# launched workers is enough here. The session settings go in the same
+# probe call as each query they apply to.
+parallel_settings="SET max_parallel_workers_per_gather = 4; SET min_parallel_table_scan_size = 0; SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET parallel_leader_participation = off"
+check "create the parallel table" "" \
+  "CREATE TABLE parallel_smoke AS SELECT id FROM generate_series(1, 20000) id"
+check "analyze the parallel table" "" "ANALYZE parallel_smoke"
+check "set its parallel workers" "" "ALTER TABLE parallel_smoke SET (parallel_workers = 4)"
+check "the parallel aggregate's sum" "200010000" \
+  "$parallel_settings; SELECT sum(id)::text FROM parallel_smoke"
+# The plan's text varies, so only its worker count is checked, as a whole
+# line of that plan.
+plan="$("${probe[@]}" "$parallel_settings; EXPLAIN (ANALYZE) SELECT sum(id) FROM parallel_smoke")" ||
+  { echo "the parallel plan: the query failed" >&2; exit 1; }
+grep -qxE ' *Workers Launched: 4' <<<"$plan" || {
   echo "the parallel plan did not launch 4 workers" >&2
-  printf '%s\n' "$parallel" >&2
+  printf '%s\n' "$plan" >&2
   exit 1
 }
 

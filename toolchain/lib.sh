@@ -465,15 +465,22 @@ sc_reset_build_state() {
 # toolchain that built it; when that is missing or differs from the current
 # one, the build state is reset before building. Call it after sc_init and
 # before sc_checkout.
+#
+# A build whose make also misses other inputs changing, such as its configure
+# options or a library it links, passes an identity for them as the optional
+# argument; it is stamped beside the toolchain's.
 sc_clean_if_toolchain_changed() {
   local stamp="$SC_BUILD/.sc-toolchain" identity
   identity="$(sc_toolchain_identity)"
+  if [[ $# -gt 0 ]]; then
+    identity+=$'\n'"Build inputs: $1"
+  fi
   if [[ -f "$stamp" && "$(cat "$stamp")" == "$identity" ]]; then
     return 0
   fi
   if [[ -e "$SC_BUILD" || -e "$SC_SRC/.git" ]]; then
     echo "$SC_SERVICE $SC_VERSION: the build tree is not stamped with the" \
-      "current toolchain; building from a clean tree" >&2
+      "current toolchain and build inputs; building from a clean tree" >&2
     sc_reset_build_state
   fi
   mkdir -p "$SC_BUILD"
