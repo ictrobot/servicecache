@@ -1,0 +1,779 @@
+Subject: compiler-cranelift, compiler: keep the unwind information of
+ trampolines
+
+Cranelift describes the frames of the function call trampolines, through
+which the host calls into a module, and of the dynamic trampolines,
+through which a module calls a host function, as it does the module's
+own functions. Both generators passed that description through
+maybe_into_to_windows_unwind, which keeps only the Windows form, so on a
+System V target a trampoline had no unwind information: the module's
+.eh_frame covered its functions but not the frames between them and the
+host, and a DWARF unwinder, the runtime's own backtraces or a profiler's,
+stopped at the first trampoline it reached.
+
+The generators now return a trampoline with its System V FDE, and the
+module places it with the rest. A traditional artifact's frame table
+gains an FDE for every trampoline, under a CIE of their own with no
+personality or LSDA, since no exception is handled in a trampoline. The
+table is built for any module with imports or signatures, not only for
+one with function bodies, because such a module still has trampolines.
+A dynamic trampoline's FDE is relocated against the existing
+DynamicTrampoline target; a call trampoline had none, so relocations
+gain a FunctionCallTrampoline target, which linking resolves to the
+allocated trampoline and object emission to its symbol. In a native ELF
+artifact each trampoline object carries its own .eh_frame section, as
+each function's does.
+
+The new relocation target changes the archived format, so the metadata
+version changes with it, but not to 24, which a later upstream format
+would likely claim. The version's low byte is the upstream version the
+format extends, 23, and its upper bytes spell "SC", far beyond where
+upstream's count of versions is likely to reach. An artifact serialized
+under any other version is refused as incompatible and compiled again.
+
+Unit tests cover a module with one import and no function bodies getting
+FDEs for both of its trampolines, relocated against each, and x86-64 and
+AArch64 trampoline objects each carrying one relocatable FDE.
+
+diff --git a/lib/compiler-cranelift/src/compiler.rs b/lib/compiler-cranelift/src/compiler.rs
+index cdb90d2..167d45b 100644
+--- a/lib/compiler-cranelift/src/compiler.rs
++++ b/lib/compiler-cranelift/src/compiler.rs
+@@ -16,7 +16,7 @@ use crate::{
+     config::{Cranelift, CraneliftOptLevel},
+     func_environ::{FuncEnvironment, get_function_name},
+     trampoline::{
+-        FunctionBuilderContext, make_trampoline_dynamic_function, make_trampoline_function_call,
++        FunctionBuilderContext, compile_trampoline_function_call, make_trampoline_dynamic_function,
+     },
+     translator::{
+         FuncTranslator, compiled_function_unwind_info, irlibcall_to_libcall,
+@@ -164,10 +164,12 @@ impl CraneliftCompiler {
+ 
+         // Generate the frametable
+         #[cfg(feature = "unwind")]
+-        let dwarf_frametable = if function_body_inputs.is_empty() {
+-            // If we have no function body inputs, we don't need to
+-            // construct the `FrameTable`. Constructing it, with empty
+-            // FDEs will cause some issues in Linux.
++        let dwarf_frametable = if function_body_inputs.is_empty()
++            && module.signatures.is_empty()
++            && module.num_imported_functions == 0
++        {
++            // Do not register an empty table, but retain unwind data for
++            // import-only modules that still generate trampolines.
+             None
+         } else {
+             match target.triple().default_calling_convention() {
+@@ -438,7 +440,7 @@ impl CraneliftCompiler {
+                     *sig_index,
+                     (*sig).clone(),
+                 );
+-                let trampoline = make_trampoline_function_call(
++                let trampoline = compile_trampoline_function_call(
+                     &self.config().callbacks,
+                     &*isa,
+                     target.triple().architecture,
+@@ -452,7 +454,13 @@ impl CraneliftCompiler {
+                 }
+                 if self.config.experimental_artifact {
+                     Ok(CompileOutput::Object(
+-                        wasmer_compiler::elf::emit_function_body(target, &kind, &trampoline)?,
++                        crate::elf::emit_trampoline(
++                            #[cfg(feature = "unwind")]
++                            &*isa,
++                            target,
++                            &kind,
++                            &trampoline,
++                        )?,
+                         None,
+                     ))
+                 } else {
+@@ -489,7 +497,13 @@ impl CraneliftCompiler {
+                 }
+                 if self.config.experimental_artifact {
+                     Ok(CompileOutput::Object(
+-                        wasmer_compiler::elf::emit_function_body(target, &kind, &trampoline)?,
++                        crate::elf::emit_trampoline(
++                            #[cfg(feature = "unwind")]
++                            &*isa,
++                            target,
++                            &kind,
++                            &trampoline,
++                        )?,
+                         None,
+                     ))
+                 } else {
+@@ -592,6 +606,13 @@ impl CraneliftCompiler {
+                 (None, None, vec![None; functions.len()])
+             };
+ 
++        #[cfg_attr(not(feature = "unwind"), allow(unused_mut))]
++        let mut function_call_trampolines =
++            compile_output_in_memory(function_call_trampoline_outputs);
++        #[cfg_attr(not(feature = "unwind"), allow(unused_mut))]
++        let mut dynamic_function_trampolines =
++            compile_output_in_memory(dynamic_function_trampoline_outputs);
++
+         #[cfg_attr(not(feature = "unwind"), allow(unused_mut))]
+         let mut unwind_info = UnwindInfo::default();
+ 
+@@ -627,7 +648,7 @@ impl CraneliftCompiler {
+             if let Some(lsda_section_index) = lsda_section_index {
+                 for (func_idx, offset) in function_lsda_offsets.iter().enumerate() {
+                     if let Some(offset) = offset {
+-                        writer.register_lsda_symbol(
++                        writer.register_symbol(
+                             WriterRelocate::lsda_symbol(LocalFunctionIndex::new(func_idx)),
+                             RelocationTarget::CustomSection(lsda_section_index),
+                             *offset,
+@@ -636,6 +657,42 @@ impl CraneliftCompiler {
+                 }
+             }
+ 
++            // Trampolines do not need a personality or LSDA, but do need
++            // the CFI that describes their native stack frames.
++            let trampoline_cie = dwarf_frametable.add_cie(isa.create_systemv_cie().unwrap());
++            let first_symbol = WriterRelocate::LSDA_SYMBOL_BASE + functions.len();
++            for (index, trampoline) in function_call_trampolines.iter_mut().enumerate() {
++                if let Some(fde) = &trampoline.fde {
++                    let symbol = first_symbol + index;
++                    writer.register_symbol(
++                        symbol,
++                        RelocationTarget::FunctionCallTrampoline(SignatureIndex::new(index)),
++                        0,
++                    );
++                    dwarf_frametable.add_fde(
++                        trampoline_cie,
++                        fde.to_fde(Address::Symbol { symbol, addend: 0 }),
++                    );
++                    trampoline.body.unwind_info = Some(CompiledFunctionUnwindInfo::Dwarf);
++                }
++            }
++            let first_symbol = first_symbol + function_call_trampolines.len();
++            for (index, trampoline) in dynamic_function_trampolines.iter_mut().enumerate() {
++                if let Some(fde) = &trampoline.fde {
++                    let symbol = first_symbol + index;
++                    writer.register_symbol(
++                        symbol,
++                        RelocationTarget::DynamicTrampoline(FunctionIndex::new(index)),
++                        0,
++                    );
++                    dwarf_frametable.add_fde(
++                        trampoline_cie,
++                        fde.to_fde(Address::Symbol { symbol, addend: 0 }),
++                    );
++                    trampoline.body.unwind_info = Some(CompiledFunctionUnwindInfo::Dwarf);
++                }
++            }
++
+             let mut eh_frame = EhFrame(writer);
+             dwarf_frametable.write_eh_frame(&mut eh_frame).unwrap();
+             eh_frame.write(&[0, 0, 0, 0]).unwrap(); // Write a 0 length at the end of the table.
+@@ -667,13 +724,14 @@ impl CraneliftCompiler {
+             }
+         }
+ 
+-        let function_call_trampolines = compile_output_in_memory(function_call_trampoline_outputs)
++        let function_call_trampolines = function_call_trampolines
+             .into_iter()
++            .map(|t| t.body)
++            .collect();
++        let dynamic_function_trampolines = dynamic_function_trampolines
++            .into_iter()
++            .map(|t| t.body)
+             .collect();
+-        let dynamic_function_trampolines =
+-            compile_output_in_memory(dynamic_function_trampoline_outputs)
+-                .into_iter()
+-                .collect();
+ 
+         let mut got = wasmer_compiler::types::function::GOT::empty();
+ 
+@@ -863,3 +921,123 @@ fn translate_ir_trapcode(trap: ir::TrapCode) -> TrapCode {
+         unimplemented!("Trap code {trap:?} not supported")
+     }
+ }
++
++#[cfg(all(test, feature = "unwind", target_os = "linux"))]
++mod tests {
++    use super::*;
++    use cranelift_codegen::gimli::{BaseAddresses, CieOrFde, EhFrame, LittleEndian, UnwindSection};
++    use object::{Object, ObjectSection};
++    use wasmer_compiler::ModuleEnvironment;
++
++    fn fde_count(bytes: &[u8]) -> usize {
++        let mut frame = EhFrame::new(bytes, LittleEndian);
++        frame.set_address_size(8);
++        let bases = BaseAddresses::default().set_eh_frame(0);
++        let mut entries = frame.entries(&bases);
++        let mut count = 0;
++        while let Some(entry) = entries.next().unwrap() {
++            if let CieOrFde::Fde(fde) = entry {
++                let fde = fde.parse(EhFrame::cie_from_offset).unwrap();
++                assert!(fde.len() > 0);
++                count += 1;
++            }
++        }
++        count
++    }
++
++    #[test]
++    fn import_only_module_retains_both_trampoline_fdes() {
++        // (module (import "env" "f" (func))) -- no local function bodies.
++        let wasm = b"\0asm\x01\0\0\0\x01\x04\x01\x60\0\0\x02\x09\x01\x03env\x01f\0\0";
++        let translation = ModuleEnvironment::new().translate(wasm).unwrap();
++        let info = CompileModuleInfo {
++            module: Arc::new(translation.module),
++            features: Default::default(),
++            memory_styles: Default::default(),
++            table_styles: Default::default(),
++            function_max_stack_usage: Default::default(),
++        };
++        let result = CraneliftCompiler::new(Cranelift::default())
++            .compile_module(
++                &Target::default(),
++                &info,
++                &[],
++                translation.module_translation_state.as_ref().unwrap(),
++                translation.function_body_inputs,
++                None,
++            )
++            .unwrap();
++        let Compilation::Rkyv { compilation, .. } = result else {
++            panic!("expected rkyv");
++        };
++        let frame = &compilation.custom_sections[compilation.unwind_info.eh_frame.unwrap()];
++        assert_eq!(fde_count(frame.bytes.as_slice()), 2);
++        for target in [
++            RelocationTarget::FunctionCallTrampoline(SignatureIndex::from_u32(0)),
++            RelocationTarget::DynamicTrampoline(FunctionIndex::from_u32(0)),
++        ] {
++            assert!(frame.relocations.iter().any(|r| r.reloc_target == target));
++        }
++        for body in compilation
++            .function_call_trampolines
++            .values()
++            .chain(compilation.dynamic_function_trampolines.values())
++        {
++            assert_eq!(body.unwind_info, Some(CompiledFunctionUnwindInfo::Dwarf));
++        }
++    }
++
++    #[test]
++    fn native_trampolines_have_relocatable_cfi() {
++        for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
++            let mut cpu_features = wasmer_types::target::CpuFeature::set();
++            if triple.starts_with("x86_64") {
++                cpu_features.insert(wasmer_types::target::CpuFeature::SSE2);
++            }
++            let target = Target::new(triple.parse().unwrap(), cpu_features);
++            let isa = Cranelift::default().isa(&target).unwrap();
++            let signature = wasmer_types::FunctionType::new(
++                [wasmer_types::Type::I64; 10],
++                [wasmer_types::Type::I64],
++            );
++            let mut context = FunctionBuilderContext::new();
++            let call = wasmer_compiler::misc::CompiledKind::FunctionCallTrampoline(
++                SignatureIndex::from_u32(0),
++                signature.clone(),
++            );
++            let dynamic = wasmer_compiler::misc::CompiledKind::DynamicFunctionTrampoline(
++                FunctionIndex::from_u32(0),
++                signature.clone(),
++            );
++            let call_body = compile_trampoline_function_call(
++                &None,
++                &*isa,
++                target.triple().architecture,
++                &mut context,
++                &call,
++                &signature,
++                &None,
++            )
++            .unwrap();
++            let dynamic_body = make_trampoline_dynamic_function(
++                &None,
++                &*isa,
++                target.triple().architecture,
++                &wasmer_types::VMOffsets::new_for_trampolines(8),
++                &mut context,
++                &dynamic,
++                &signature,
++                &None,
++            )
++            .unwrap();
++            for (kind, body) in [(call, call_body), (dynamic, dynamic_body)] {
++                assert!(body.fde.is_some(), "{triple}: {kind:?}");
++                let bytes = crate::elf::emit_trampoline(&*isa, &target, &kind, &body).unwrap();
++                let object = object::File::parse(bytes.as_slice()).unwrap();
++                let frame = object.section_by_name(".eh_frame").unwrap();
++                assert_eq!(fde_count(frame.data().unwrap()), 1);
++                assert_eq!(frame.relocations().count(), 1);
++            }
++        }
++    }
++}
+diff --git a/lib/compiler-cranelift/src/dwarf.rs b/lib/compiler-cranelift/src/dwarf.rs
+index 9edf0f3..2e36b8c 100644
+--- a/lib/compiler-cranelift/src/dwarf.rs
++++ b/lib/compiler-cranelift/src/dwarf.rs
+@@ -11,7 +11,7 @@ use wasmer_types::{LibCall, LocalFunctionIndex, entity::EntityRef, target::Endia
+ pub struct WriterRelocate {
+     pub relocs: Vec<Relocation>,
+     writer: EndianVec<RunTimeEndian>,
+-    lsda_symbols: HashMap<usize, (RelocationTarget, u32)>,
++    symbols: HashMap<usize, (RelocationTarget, u32)>,
+ }
+ 
+ impl WriterRelocate {
+@@ -29,12 +29,12 @@ impl WriterRelocate {
+         Self {
+             relocs: Vec::new(),
+             writer: EndianVec::new(endianness),
+-            lsda_symbols: HashMap::new(),
++            symbols: HashMap::new(),
+         }
+     }
+ 
+-    pub fn register_lsda_symbol(&mut self, symbol: usize, target: RelocationTarget, offset: u32) {
+-        self.lsda_symbols.insert(symbol, (target, offset));
++    pub fn register_symbol(&mut self, symbol: usize, target: RelocationTarget, offset: u32) {
++        self.symbols.insert(symbol, (target, offset));
+     }
+ 
+     pub fn lsda_symbol(func_index: LocalFunctionIndex) -> usize {
+@@ -112,7 +112,7 @@ impl Writer for WriterRelocate {
+                         addend,
+                     });
+                     self.write_udata(0, size)
+-                } else if let Some((target, base)) = self.lsda_symbols.get(&symbol) {
++                } else if let Some((target, base)) = self.symbols.get(&symbol) {
+                     let offset = self.len() as u32;
+                     let kind = match size {
+                         4 => RelocationKind::Abs4,
+diff --git a/lib/compiler-cranelift/src/elf.rs b/lib/compiler-cranelift/src/elf.rs
+index 0684304..fb605d1 100644
+--- a/lib/compiler-cranelift/src/elf.rs
++++ b/lib/compiler-cranelift/src/elf.rs
+@@ -37,6 +37,47 @@ use wasmer_compiler::{
+ };
+ use wasmer_types::{CompileError, LocalFunctionIndex, target::Target};
+ 
++pub(crate) fn emit_trampoline(
++    #[cfg(feature = "unwind")] isa: &dyn TargetIsa,
++    target: &Target,
++    kind: &CompiledKind,
++    trampoline: &crate::trampoline::CompiledTrampoline,
++) -> Result<Vec<u8>, CompileError> {
++    #[allow(unused_mut, unused_variables)]
++    let (mut object, symbol) =
++        wasmer_compiler::elf::function_body_object(target, kind, &trampoline.body)?;
++    #[cfg(feature = "unwind")]
++    if let Some(fde) = &trampoline.fde
++        && let Some(mut cie) = isa.create_systemv_cie()
++    {
++        cie.fde_address_encoding = constants::DW_EH_PE_pcrel | constants::DW_EH_PE_sdata4;
++        let mut table = FrameTable::default();
++        let cie = table.add_cie(cie);
++        table.add_fde(
++            cie,
++            fde.to_fde(Address::Symbol {
++                symbol: WriterRelocate::FUNCTION_SYMBOL,
++                addend: 0,
++            }),
++        );
++        let mut frame = EhFrame(EhFrameWriter::new());
++        table
++            .write_eh_frame(&mut frame)
++            .map_err(|e| CompileError::Codegen(format!("failed to write trampoline CFI: {e}")))?;
++        let relocations = std::mem::take(&mut frame.0.relocs);
++        emit_eh_frame_section(
++            &mut object,
++            &frame.0.into_bytes(),
++            &relocations,
++            symbol,
++            None,
++        )?;
++    }
++    object
++        .write()
++        .map_err(|e| CompileError::Codegen(format!("failed to serialize trampoline: {e}")))
++}
++
+ /// A gimli [`Writer`] for the `.eh_frame` section that records the relocations
+ /// required against the function symbol, the personality routine and the LSDA.
+ ///
+diff --git a/lib/compiler-cranelift/src/trampoline/dynamic_function.rs b/lib/compiler-cranelift/src/trampoline/dynamic_function.rs
+index 8a89cd5..ec9320d 100644
+--- a/lib/compiler-cranelift/src/trampoline/dynamic_function.rs
++++ b/lib/compiler-cranelift/src/trampoline/dynamic_function.rs
+@@ -15,12 +15,12 @@ use cranelift_codegen::{
+ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+ use std::{cmp, mem};
+ use target_lexicon::Architecture;
+-use wasmer_compiler::{misc::CompiledKind, types::function::FunctionBody};
++use wasmer_compiler::misc::CompiledKind;
+ use wasmer_types::{CompileError, FunctionType, VMOffsets};
+ 
+ /// Create a trampoline for invoking a WebAssembly function.
+ #[allow(clippy::too_many_arguments)]
+-pub fn make_trampoline_dynamic_function(
++pub(crate) fn make_trampoline_dynamic_function(
+     callbacks: &Option<CraneliftCallbacks>,
+     isa: &dyn TargetIsa,
+     arch: Architecture,
+@@ -29,7 +29,7 @@ pub fn make_trampoline_dynamic_function(
+     kind: &CompiledKind,
+     func_type: &FunctionType,
+     module_hash: &Option<String>,
+-) -> Result<FunctionBody, CompileError> {
++) -> Result<super::CompiledTrampoline, CompileError> {
+     let pointer_type = isa.pointer_type();
+     let frontend_config = isa.frontend_config();
+     let signature = signature_to_cranelift_ir(func_type, frontend_config, arch);
+@@ -157,10 +157,8 @@ pub fn make_trampoline_dynamic_function(
+         callbacks.asm_memory_buffer(kind, module_hash, arch, &code_buf)?;
+     }
+ 
+-    let unwind_info = compiled_function_unwind_info(isa, &context)?.maybe_into_to_windows_unwind();
+-
+-    Ok(FunctionBody {
+-        body: code_buf,
+-        unwind_info,
+-    })
++    Ok(super::CompiledTrampoline::new(
++        code_buf,
++        compiled_function_unwind_info(isa, &context)?,
++    ))
+ }
+diff --git a/lib/compiler-cranelift/src/trampoline/function_call.rs b/lib/compiler-cranelift/src/trampoline/function_call.rs
+index e21f1ba..35914b4 100644
+--- a/lib/compiler-cranelift/src/trampoline/function_call.rs
++++ b/lib/compiler-cranelift/src/trampoline/function_call.rs
+@@ -33,6 +33,27 @@ pub fn make_trampoline_function_call(
+     func_type: &FunctionType,
+     module_hash: &Option<String>,
+ ) -> Result<FunctionBody, CompileError> {
++    Ok(compile_trampoline_function_call(
++        callbacks,
++        isa,
++        arch,
++        fn_builder_ctx,
++        kind,
++        func_type,
++        module_hash,
++    )?
++    .body)
++}
++
++pub(crate) fn compile_trampoline_function_call(
++    callbacks: &Option<CraneliftCallbacks>,
++    isa: &dyn TargetIsa,
++    arch: Architecture,
++    fn_builder_ctx: &mut FunctionBuilderContext,
++    kind: &CompiledKind,
++    func_type: &FunctionType,
++    module_hash: &Option<String>,
++) -> Result<super::CompiledTrampoline, CompileError> {
+     let pointer_type = isa.pointer_type();
+     let frontend_config = isa.frontend_config();
+     let signature = signature_to_cranelift_ir(func_type, frontend_config, arch);
+@@ -147,10 +168,8 @@ pub fn make_trampoline_function_call(
+         callbacks.asm_memory_buffer(kind, module_hash, arch, &code_buf)?;
+     }
+ 
+-    let unwind_info = compiled_function_unwind_info(isa, &context)?.maybe_into_to_windows_unwind();
+-
+-    Ok(FunctionBody {
+-        body: code_buf,
+-        unwind_info,
+-    })
++    Ok(super::CompiledTrampoline::new(
++        code_buf,
++        compiled_function_unwind_info(isa, &context)?,
++    ))
+ }
+diff --git a/lib/compiler-cranelift/src/trampoline/mod.rs b/lib/compiler-cranelift/src/trampoline/mod.rs
+index 3c8c402..ba1c468 100644
+--- a/lib/compiler-cranelift/src/trampoline/mod.rs
++++ b/lib/compiler-cranelift/src/trampoline/mod.rs
+@@ -3,7 +3,42 @@
+ mod dynamic_function;
+ mod function_call;
+ 
+-pub use self::dynamic_function::make_trampoline_dynamic_function;
++pub(crate) use self::dynamic_function::make_trampoline_dynamic_function;
++pub(crate) use self::function_call::compile_trampoline_function_call;
+ pub use self::function_call::make_trampoline_function_call;
+ 
+ pub use cranelift_frontend::FunctionBuilderContext;
++
++use crate::translator::CraneliftUnwindInfo;
++use wasmer_compiler::types::function::FunctionBody;
++
++/// A trampoline and the System V unwind program collected during codegen.
++/// The FDE is attached to its final symbol when the module is assembled.
++pub(crate) struct CompiledTrampoline {
++    pub body: FunctionBody,
++    #[cfg(feature = "unwind")]
++    pub fde: Option<cranelift_codegen::isa::unwind::systemv::UnwindInfo>,
++}
++
++impl CompiledTrampoline {
++    pub fn new(body: Vec<u8>, unwind: CraneliftUnwindInfo) -> Self {
++        #[cfg(feature = "unwind")]
++        if let CraneliftUnwindInfo::Fde(fde) = unwind {
++            return Self {
++                body: FunctionBody {
++                    body,
++                    unwind_info: None,
++                },
++                fde: Some(fde),
++            };
++        }
++        Self {
++            body: FunctionBody {
++                body,
++                unwind_info: unwind.maybe_into_to_windows_unwind(),
++            },
++            #[cfg(feature = "unwind")]
++            fde: None,
++        }
++    }
++}
+diff --git a/lib/compiler-cranelift/src/translator/mod.rs b/lib/compiler-cranelift/src/translator/mod.rs
+index bee59b3..fc6bdb2 100644
+--- a/lib/compiler-cranelift/src/translator/mod.rs
++++ b/lib/compiler-cranelift/src/translator/mod.rs
+@@ -11,7 +11,6 @@ pub use self::translation_utils::{
+     irlibcall_to_libcall, irreloc_to_relocationkind, signature_to_cranelift_ir,
+ };
+ pub(crate) use self::translation_utils::{materialize_global_value, type_to_irtype};
+-#[cfg(feature = "unwind")]
+ pub(crate) use self::unwind::CraneliftUnwindInfo;
+ pub(crate) use self::unwind::compiled_function_unwind_info;
+ 
+diff --git a/lib/compiler-cranelift/src/translator/unwind.rs b/lib/compiler-cranelift/src/translator/unwind.rs
+index ed0510e..227e718 100644
+--- a/lib/compiler-cranelift/src/translator/unwind.rs
++++ b/lib/compiler-cranelift/src/translator/unwind.rs
+@@ -24,8 +24,7 @@ pub(crate) enum CraneliftUnwindInfo {
+ impl CraneliftUnwindInfo {
+     /// Transform the `CraneliftUnwindInfo` to the Windows format.
+     ///
+-    /// We skip the DWARF as it is not needed for trampolines (which are the
+-    /// main users of this function)
++    /// System V callers retain their FDE separately in the module's frame table.
+     pub fn maybe_into_to_windows_unwind(self) -> Option<CompiledFunctionUnwindInfo> {
+         match self {
+             #[cfg(feature = "unwind")]
+diff --git a/lib/compiler/src/elf.rs b/lib/compiler/src/elf.rs
+index 3780b92..d71620c 100644
+--- a/lib/compiler/src/elf.rs
++++ b/lib/compiler/src/elf.rs
+@@ -178,6 +178,10 @@ pub fn add_relocations(
+                 CompiledKind::DynamicFunctionTrampoline(index, FunctionType::default())
+                     .linkage_name(),
+             ),
++            RelocationTarget::FunctionCallTrampoline(index) => add_undefined_symbol(
++                object,
++                CompiledKind::FunctionCallTrampoline(index, FunctionType::default()).linkage_name(),
++            ),
+         };
+         let flags = relocation_kind_to_flags(relocation.kind)?;
+         object
+@@ -327,6 +331,18 @@ pub fn emit_function_body(
+     kind: &CompiledKind,
+     body: &FunctionBody,
+ ) -> Result<Vec<u8>, CompileError> {
++    let (object, _) = function_body_object(target, kind, body)?;
++    object
++        .write()
++        .map_err(|e| CompileError::Codegen(format!("failed to serialize object: {e}")))
++}
++
++/// Create a trampoline object, allowing the backend to attach its unwind data.
++pub fn function_body_object(
++    target: &Target,
++    kind: &CompiledKind,
++    body: &FunctionBody,
++) -> Result<(Object<'static>, SymbolId), CompileError> {
+     let mut object = get_object_for_target(target.triple())
+         .map_err(|e| CompileError::Codegen(format!("cannot create object: {e}")))?;
+     let symbol = object.add_symbol(Symbol {
+@@ -341,9 +357,7 @@ pub fn emit_function_body(
+     });
+     let text = object.section_id(StandardSection::Text);
+     object.add_symbol_data(symbol, text, &body.body, 4);
+-    object
+-        .write()
+-        .map_err(|e| CompileError::Codegen(format!("failed to serialize object: {e}")))
++    Ok((object, symbol))
+ }
+ 
+ /// Serialize an import trampoline's custom section into its own relocatable object file.
+diff --git a/lib/compiler/src/engine/artifact.rs b/lib/compiler/src/engine/artifact.rs
+index 5658237..aabe7d2 100644
+--- a/lib/compiler/src/engine/artifact.rs
++++ b/lib/compiler/src/engine/artifact.rs
+@@ -589,6 +589,7 @@ impl Artifact {
+                     module_info,
+                     &finished_functions,
+                     &finished_dynamic_function_trampolines,
++                    &finished_function_call_trampolines,
+                     p.get_function_relocations()
+                         .expect("RKYV path expected")
+                         .iter()
+@@ -606,6 +607,7 @@ impl Artifact {
+                     module_info,
+                     &finished_functions,
+                     &finished_dynamic_function_trampolines,
++                    &finished_function_call_trampolines,
+                     a.get_function_relocations()
+                         .expect("RKYV path expected")
+                         .iter()
+diff --git a/lib/compiler/src/engine/link.rs b/lib/compiler/src/engine/link.rs
+index 105a38d..1f516c9 100644
+--- a/lib/compiler/src/engine/link.rs
++++ b/lib/compiler/src/engine/link.rs
+@@ -12,7 +12,10 @@ use std::{
+     ptr::{read_unaligned, write_unaligned},
+ };
+ 
+-use wasmer_types::{FunctionIndex, LocalFunctionIndex, ModuleInfo, entity::PrimaryMap};
++use wasmer_types::{
++    FunctionIndex, LocalFunctionIndex, ModuleInfo, SignatureIndex, entity::PrimaryMap,
++};
++use wasmer_vm::VMTrampoline;
+ use wasmer_vm::{FunctionBodyPtr, SectionBodyPtr, libcalls::function_pointer};
+ 
+ const LOW6_BITS_MASK: u8 = 0x3f;
+@@ -23,6 +26,7 @@ fn apply_relocation(
+     r: &impl RelocationLike,
+     allocated_functions: &PrimaryMap<LocalFunctionIndex, FunctionExtent>,
+     allocated_dynamic_function_trampolines: &PrimaryMap<FunctionIndex, FunctionBodyPtr>,
++    allocated_function_call_trampolines: &PrimaryMap<SignatureIndex, VMTrampoline>,
+     allocated_sections: &PrimaryMap<SectionIndex, SectionBodyPtr>,
+     libcall_trampolines_sec_idx: SectionIndex,
+     libcall_trampoline_len: usize,
+@@ -47,6 +51,9 @@ fn apply_relocation(
+             RelocationTarget::DynamicTrampoline(index) => {
+                 *allocated_dynamic_function_trampolines[index] as usize
+             }
++            RelocationTarget::FunctionCallTrampoline(index) => {
++                allocated_function_call_trampolines[index] as usize
++            }
+             RelocationTarget::LibCall(libcall) => {
+                 // Use the direct target of the libcall if the relocation supports
+                 // a full 64-bit address. Otherwise use a trampoline.
+@@ -503,6 +510,7 @@ pub fn link_module<'a>(
+     _module: &ModuleInfo,
+     allocated_functions: &PrimaryMap<LocalFunctionIndex, FunctionExtent>,
+     allocated_dynamic_function_trampolines: &PrimaryMap<FunctionIndex, FunctionBodyPtr>,
++    allocated_function_call_trampolines: &PrimaryMap<SignatureIndex, VMTrampoline>,
+     function_relocations: impl Iterator<
+         Item = (
+             LocalFunctionIndex,
+@@ -530,6 +538,7 @@ pub fn link_module<'a>(
+                 r,
+                 allocated_functions,
+                 allocated_dynamic_function_trampolines,
++                allocated_function_call_trampolines,
+                 allocated_sections,
+                 libcall_trampolines,
+                 trampoline_len,
+@@ -546,6 +555,7 @@ pub fn link_module<'a>(
+                 r,
+                 allocated_functions,
+                 allocated_dynamic_function_trampolines,
++                allocated_function_call_trampolines,
+                 allocated_sections,
+                 libcall_trampolines,
+                 trampoline_len,
+diff --git a/lib/compiler/src/object/module.rs b/lib/compiler/src/object/module.rs
+index 94f6865..f6df3fb 100644
+--- a/lib/compiler/src/object/module.rs
++++ b/lib/compiler/src/object/module.rs
+@@ -483,6 +483,23 @@ pub fn emit_compilation(
+                     }
+                 }
+                 RelocationTarget::DynamicTrampoline(_) => todo!("Not supported yet"),
++                RelocationTarget::FunctionCallTrampoline(index) => {
++                    let name =
++                        symbol_registry.symbol_to_name(Symbol::FunctionCallTrampoline(index));
++                    let symbol = obj
++                        .symbol_id(name.as_bytes())
++                        .expect("call trampoline symbol");
++                    obj.add_relocation(
++                        section_id,
++                        Relocation {
++                            offset: relocation_address,
++                            flags: relocation_flags,
++                            symbol,
++                            addend: r.addend,
++                        },
++                    )
++                    .map_err(ObjectError::Write)?;
++                }
+                 RelocationTarget::LibCall(libcall) => {
+                     let mut libcall_fn_name = libcall.to_function_name().to_string();
+                     if matches!(triple.binary_format, BinaryFormat::Macho) {
+diff --git a/lib/compiler/src/types/relocation.rs b/lib/compiler/src/types/relocation.rs
+index 19d30c1..ebb935d 100644
+--- a/lib/compiler/src/types/relocation.rs
++++ b/lib/compiler/src/types/relocation.rs
+@@ -20,7 +20,9 @@ use crate::{Addend, CodeOffset};
+ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+ #[cfg(feature = "enable-serde")]
+ use serde::{Deserialize, Serialize};
+-use wasmer_types::{FunctionIndex, LibCall, LocalFunctionIndex, entity::PrimaryMap};
++use wasmer_types::{
++    FunctionIndex, LibCall, LocalFunctionIndex, SignatureIndex, entity::PrimaryMap,
++};
+ 
+ /// Relocation kinds for every ISA.
+ #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+@@ -439,6 +441,8 @@ pub enum RelocationTarget {
+     LibCall(LibCall),
+     /// Custom sections generated by the compiler
+     CustomSection(SectionIndex),
++    /// A relocation to a function call trampoline.
++    FunctionCallTrampoline(SignatureIndex),
+ }
+ 
+ /// Relocations to apply to function bodies.
+diff --git a/lib/types/src/indexes.rs b/lib/types/src/indexes.rs
+index 232bd62..42d3cdc 100644
+--- a/lib/types/src/indexes.rs
++++ b/lib/types/src/indexes.rs
+@@ -218,7 +218,7 @@ entity_impl!(MemoryIndex);
+ )]
+ #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+ #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
+-#[rkyv(derive(Debug), compare(PartialOrd, PartialEq))]
++#[rkyv(derive(Debug, Hash, PartialEq, Eq), compare(PartialOrd, PartialEq))]
+ pub struct SignatureIndex(u32);
+ entity_impl!(SignatureIndex);
+ 
+diff --git a/lib/types/src/serialize.rs b/lib/types/src/serialize.rs
+index 2d1c8b2..5049ad0 100644
+--- a/lib/types/src/serialize.rs
++++ b/lib/types/src/serialize.rs
+@@ -12,9 +12,14 @@ pub struct MetadataHeader {
+ }
+ 
+ impl MetadataHeader {
+-    /// Current ABI version. Increment this any time breaking changes are made
++    /// Current ABI version. Change this any time breaking changes are made
+     /// to the format of the serialized data.
+-    pub const CURRENT_VERSION: u32 = 23;
++    ///
++    /// Upstream's version 23 plus a call-trampoline relocation target. The
++    /// low byte is the upstream version this format extends and the upper
++    /// bytes spell "SC", far beyond upstream's versions, which count up
++    /// from 1.
++    pub const CURRENT_VERSION: u32 = u32::from_le_bytes([23, 0, b'S', b'C']);
+ 
+     /// Magic number to identify wasmer metadata.
+     const MAGIC: [u8; 8] = *b"WASMER\0\0";
