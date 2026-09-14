@@ -10,7 +10,7 @@ args = ["--pgdata=/data", "--username=postgres", "--auth=trust", "--no-sync", "-
 
 [guest]
 module = "postgres.wasm"
-args = ["-D", "/data", "-h", "127.0.0.1", "-p", "5432", "-c", "listen_addresses=127.0.0.1", "-c", "unix_socket_directories=", "-c", "dynamic_shared_memory_type=posix", "-c", "io_method=sync", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off", "-c", "shared_buffers=16MB", "-c", "max_connections=50"]
+args = ["-D", "/data", "-h", "127.0.0.1", "-p", "5432", "-c", "listen_addresses=127.0.0.1", "-c", "unix_socket_directories=", "-c", "dynamic_shared_memory_type=posix", "-c", "io_method=sync", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off", "-c", "shared_buffers=16MB", "-c", "max_connections=50", "-c", "ssl=on"]
 listen_port = 5432
 
 # A starting postmaster accepts connections but answers each with

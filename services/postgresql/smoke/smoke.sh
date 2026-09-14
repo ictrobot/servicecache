@@ -19,6 +19,9 @@ done
 # their servers, and probe it over the wire with real SQL.
 port="${POSTGRESQL_WASIX_PORT:-54329}"
 probe=("$SC_SERVICE_DIR/smoke/postgresql-probe.py" --host 127.0.0.1 --port "$port")
+# The same probe over TLS, which it asks for before the startup packet,
+# accepting the server's own certificate.
+tls_probe=("${probe[@]}" --tls)
 
 mkdir -p "$SC_WORK"
 data_dir="$(mktemp -d "$SC_WORK/postgresql-smoke.XXXXXX")"
@@ -42,7 +45,7 @@ trap cleanup EXIT
   -c listen_addresses=127.0.0.1 -c unix_socket_directories= \
   -c dynamic_shared_memory_type=posix -c io_method=sync \
   -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
-  -c shared_buffers=16MB -c max_connections=50 \
+  -c shared_buffers=16MB -c max_connections=50 -c ssl=on \
   > "$data_dir/server.log" 2>&1 &
 server_pid=$!
 
@@ -61,11 +64,19 @@ if [[ "$ready" != true ]]; then
 fi
 
 # check description expected sql: one probe call, a session of its own, and
-# its whole output. Statements that return no rows expect "".
-check() {
+# its whole output. Statements that return no rows expect "". tls_check does
+# the same over a TLS connection.
+check_with() {
+  local -n probe_command="$1"
   local actual
-  actual="$("${probe[@]}" "$3")" || { echo "$1: the query failed" >&2; exit 1; }
-  [[ "$actual" == "$2" ]] || { echo "$1: expected '$2', got '$actual'" >&2; exit 1; }
+  actual="$("${probe_command[@]}" "$4")" || { echo "$2: the query failed" >&2; exit 1; }
+  [[ "$actual" == "$3" ]] || { echo "$2: expected '$3', got '$actual'" >&2; exit 1; }
+}
+check() {
+  check_with probe "$@"
+}
+tls_check() {
+  check_with tls_probe "$@"
 }
 
 check "create a table" "" "CREATE TABLE smoke (id int PRIMARY KEY, value text)"
@@ -74,15 +85,34 @@ check "read the row back" "standalone" "SELECT value FROM smoke WHERE id = 1"
 check "the connection's backend" "client backend" \
   "SELECT backend_type FROM pg_stat_activity WHERE pid = pg_backend_pid()"
 
-# The server is built against OpenSSL. It names OpenSSL as its TLS library
-# even though TLS is off, with no certificate configured, and SHA-256 and
-# the random bytes of a version 4 UUID come from libcrypto.
+# The server is built against OpenSSL, its TLS library, and SHA-256 and the
+# random bytes of a version 4 UUID come from libcrypto.
 check "TLS library" "OpenSSL" "SELECT setting FROM pg_settings WHERE name = 'ssl_library'"
-check "TLS" "off" "SELECT setting FROM pg_settings WHERE name = 'ssl'"
+check "TLS" "on" "SELECT setting FROM pg_settings WHERE name = 'ssl'"
 check "SHA-256 of 'abc'" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" \
   "SELECT encode(sha256('abc'), 'hex')"
 check "UUID version" "4" "SELECT uuid_extract_version(gen_random_uuid())::text"
 check "two UUIDs differ" "true" "SELECT (gen_random_uuid() <> gen_random_uuid())::text"
+
+# The cluster initdb made has no certificate, so the server generates one at
+# its first start, under the names ssl_cert_file and ssl_key_file give in the
+# data directory. WASIX keeps no file modes, so what can be checked is that
+# both files are there and hold the PEM objects they should.
+check_generated() {
+  local name="$1" first_line="$2" path="$data_dir/data/$1"
+  [[ -f "$path" ]] || { echo "the server did not generate $name in its data directory" >&2; exit 1; }
+  [[ "$(head -n 1 "$path")" == "$first_line" ]] ||
+    { echo "the generated $name does not begin with $first_line" >&2; exit 1; }
+}
+check_generated server.crt "-----BEGIN CERTIFICATE-----"
+check_generated server.key "-----BEGIN PRIVATE KEY-----"
+
+# A connection that asks for TLS gets it, over the generated certificate, and
+# pg_stat_ssl reports the session. Plain connections, which every other check
+# uses, are still served, unencrypted.
+tls_check "TLS session encrypted" "true" "SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+tls_check "TLS session version" "TLSv1.3" "SELECT version FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+check "plain session unencrypted" "false" "SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
 
 # A forced parallel aggregate exercises what the extension exists for:
 # postmaster children cooperating through shared memory. The full worker

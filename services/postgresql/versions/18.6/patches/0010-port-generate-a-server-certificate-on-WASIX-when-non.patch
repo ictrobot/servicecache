@@ -1,0 +1,214 @@
+Subject: port: generate a server certificate on WASIX when none is configured
+
+The server is built against OpenSSL and names it as its TLS library, but
+a cluster here is made by initdb and nothing else, and there is no step
+that could leave a certificate beside the data directory afterwards. So
+ssl stays off and every connection is served in the clear.
+
+Make the pair that is missing. When neither ssl_cert_file nor
+ssl_key_file is there, be_tls_init generates a self-signed certificate
+before it goes looking for one: a P-256 key, an X.509 v3 certificate
+carrying a random serial, valid from now for ten years, subject and
+issuer CN=localhost with a subjectAltName of DNS:localhost and
+IP:127.0.0.1, signed with SHA-256. P-256 is the curve to generate on
+here, since an RSA key of comparable strength costs seconds of
+WebAssembly where this costs a moment, and TLS 1.3 signs with ECDSA over
+it without anything further being arranged. Both settings default to
+relative names and the postmaster has already changed to the data
+directory, so the two files land in the cluster they belong to.
+
+They are files rather than a key and certificate held in the context the
+postmaster built because EXEC_BACKEND gives every child an address space
+of its own: each one runs be_tls_init again and loads the pair back from
+these paths. Each is written through a descriptor opened O_EXCL, the key
+asking open() for mode 0600 and the certificate for 0644 rather than
+leaving either to the umask. WASIX keeps no file modes of its own and
+reports every file as mode 0, so those requests only mean something to
+whatever ends up holding the files; the mode it does report is also what
+leaves check_ssl_key_file_permissions, which turns away a key with group
+or world access, content with what it stats.
+
+If one of the two files exists the cluster has been configured, so
+neither is touched and the loading below reports on what it finds as it
+does anywhere else. A failure to generate is reported at the level that
+loading reports at, FATAL at server start, and every OpenSSL object is
+freed on the way out.
+
+diff --git a/src/backend/libpq/be-secure-openssl.c b/src/backend/libpq/be-secure-openssl.c
+index b67b91a..8512b21 100644
+--- a/src/backend/libpq/be-secure-openssl.c
++++ b/src/backend/libpq/be-secure-openssl.c
+@@ -90,6 +90,162 @@ static const char *ssl_protocol_version_to_string(int v);
+ /* for passing data back from verify_cb() */
+ static const char *cert_errdetail;
+ 
++#ifdef __wasi__
++
++/* how long a generated certificate is valid for, in seconds */
++#define GENERATED_CERT_LIFETIME	((long) 10 * 365 * 24 * 60 * 60)
++
++/*
++ * Create the file one half of a generated certificate is written to.
++ *
++ * O_EXCL keeps a file that appeared since it was looked for from being
++ * overwritten, and the mode is asked of open() rather than left to the
++ * umask, so that a private key asks to be readable by nobody else. WASIX
++ * keeps no file modes of its own and reports every file as mode 0, which
++ * is also why check_ssl_key_file_permissions is content with the key.
++ */
++static FILE *
++create_generated_file(const char *filename, int mode, bool isServerStart)
++{
++	int			fd;
++	FILE	   *file;
++
++	fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, mode);
++	if (fd < 0)
++	{
++		ereport(isServerStart ? FATAL : LOG,
++				(errcode_for_file_access(),
++				 errmsg("could not create file \"%s\": %m", filename)));
++		return NULL;
++	}
++
++	file = fdopen(fd, "w");
++	if (file == NULL)
++	{
++		ereport(isServerStart ? FATAL : LOG,
++				(errcode_for_file_access(),
++				 errmsg("could not open file \"%s\": %m", filename)));
++		close(fd);
++	}
++	return file;
++}
++
++/*
++ * Generate the server's certificate and private key.
++ *
++ * A cluster is created here by initdb alone, with no way to put a
++ * certificate beside it, so a server that has never been given one has
++ * nothing to serve TLS with.  Make a self-signed certificate for
++ * "localhost" when neither ssl_cert_file nor ssl_key_file is there.  If
++ * either exists the cluster has been configured, so leave both alone and
++ * let the loading below report on what it finds, as it does anywhere else.
++ *
++ * The pair goes into the two files the settings already name rather than
++ * into memory, because each EXEC_BACKEND child runs be_tls_init again in
++ * an address space of its own and reads the certificate and key back from
++ * those files.
++ *
++ * The key is on P-256: generating one costs a moment where an RSA key of
++ * comparable strength costs seconds of WebAssembly, and TLS 1.3 signs with
++ * ECDSA over that curve without anything further being arranged.
++ */
++static void
++generate_server_certificate(bool isServerStart)
++{
++	struct stat statbuf;
++	EVP_PKEY   *key = NULL;
++	X509	   *cert = NULL;
++	BIGNUM	   *serial = NULL;
++	X509_EXTENSION *altname = NULL;
++	X509_NAME  *subject = NULL;
++	FILE	   *file;
++
++	if (stat(ssl_cert_file, &statbuf) == 0 || errno != ENOENT)
++		return;
++	if (stat(ssl_key_file, &statbuf) == 0 || errno != ENOENT)
++		return;
++
++	if ((key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256")) == NULL ||
++		(cert = X509_new()) == NULL ||
++		(serial = BN_new()) == NULL ||
++		!BN_rand(serial, 64, BN_RAND_TOP_ANY, BN_RAND_BOTTOM_ANY) ||
++		BN_to_ASN1_INTEGER(serial, X509_get_serialNumber(cert)) == NULL ||
++		!X509_set_version(cert, X509_VERSION_3) ||
++		X509_gmtime_adj(X509_getm_notBefore(cert), 0) == NULL ||
++		X509_gmtime_adj(X509_getm_notAfter(cert),
++						GENERATED_CERT_LIFETIME) == NULL ||
++		(subject = X509_get_subject_name(cert)) == NULL ||
++		!X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
++									(const unsigned char *) "localhost",
++									-1, -1, 0) ||
++		!X509_set_issuer_name(cert, subject) ||
++		!X509_set_pubkey(cert, key) ||
++		(altname = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name,
++									   "DNS:localhost,IP:127.0.0.1")) == NULL ||
++		!X509_add_ext(cert, altname, -1) ||
++		X509_sign(cert, key, EVP_sha256()) == 0)
++	{
++		ereport(isServerStart ? FATAL : LOG,
++				(errmsg("could not generate a server certificate: %s",
++						SSLerrmessage(ERR_get_error()))));
++		goto cleanup;
++	}
++
++	file = create_generated_file(ssl_key_file, S_IRUSR | S_IWUSR,
++								 isServerStart);
++	if (file == NULL)
++		goto cleanup;
++	if (PEM_write_PrivateKey(file, key, NULL, NULL, 0, NULL, NULL) != 1)
++	{
++		fclose(file);
++		ereport(isServerStart ? FATAL : LOG,
++				(errmsg("could not write private key file \"%s\": %s",
++						ssl_key_file, SSLerrmessage(ERR_get_error()))));
++		goto cleanup;
++	}
++	if (fclose(file) != 0)
++	{
++		ereport(isServerStart ? FATAL : LOG,
++				(errcode_for_file_access(),
++				 errmsg("could not write private key file \"%s\": %m",
++						ssl_key_file)));
++		goto cleanup;
++	}
++
++	file = create_generated_file(ssl_cert_file,
++								 S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH,
++								 isServerStart);
++	if (file == NULL)
++		goto cleanup;
++	if (PEM_write_X509(file, cert) != 1)
++	{
++		fclose(file);
++		ereport(isServerStart ? FATAL : LOG,
++				(errmsg("could not write server certificate file \"%s\": %s",
++						ssl_cert_file, SSLerrmessage(ERR_get_error()))));
++		goto cleanup;
++	}
++	if (fclose(file) != 0)
++	{
++		ereport(isServerStart ? FATAL : LOG,
++				(errcode_for_file_access(),
++				 errmsg("could not write server certificate file \"%s\": %m",
++						ssl_cert_file)));
++		goto cleanup;
++	}
++
++	ereport(LOG,
++			(errmsg("generated a self-signed certificate in \"%s\" with its private key in \"%s\"",
++					ssl_cert_file, ssl_key_file)));
++
++cleanup:
++	X509_EXTENSION_free(altname);
++	BN_free(serial);
++	X509_free(cert);
++	EVP_PKEY_free(key);
++}
++#endif									/* __wasi__ */
++
+ /* ------------------------------------------------------------ */
+ /*						 Public interface						*/
+ /* ------------------------------------------------------------ */
+@@ -101,6 +257,10 @@ be_tls_init(bool isServerStart)
+ 	int			ssl_ver_min = -1;
+ 	int			ssl_ver_max = -1;
+ 
++#ifdef __wasi__
++	generate_server_certificate(isServerStart);
++#endif
++
+ 	/*
+ 	 * Create a new SSL context into which we'll load all the configuration
+ 	 * settings.  If we fail partway through, we can avoid memory leakage by

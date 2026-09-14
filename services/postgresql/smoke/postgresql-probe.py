@@ -3,6 +3,7 @@
 
 import argparse
 import socket
+import ssl
 import struct
 import sys
 
@@ -70,26 +71,41 @@ def query(sock: socket.socket, sql: str) -> list[list[str | None]]:
             return rows
 
 
+def start_tls(sock: socket.socket) -> ssl.SSLSocket:
+    """Ask for TLS and wrap the socket, accepting a self-signed certificate."""
+    sock.sendall(struct.pack("!II", 8, 80877103))
+    reply = read_exact(sock, 1)
+    if reply != b"S":
+        raise RuntimeError(f"PostgreSQL refused TLS with {reply!r}")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context.wrap_socket(sock)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5432)
     parser.add_argument("--database", default="postgres")
+    parser.add_argument("--tls", action="store_true")
     parser.add_argument("sql", nargs="+")
     args = parser.parse_args()
 
-    with socket.create_connection((args.host, args.port), timeout=2) as sock:
-        startup = (
-            b"user\0postgres\0database\0"
-            + args.database.encode()
-            + b"\0client_encoding\0UTF8\0\0"
-        )
-        sock.sendall(struct.pack("!II", len(startup) + 8, 196608) + startup)
-        wait_ready(sock)
-        for statement in args.sql:
-            for row in query(sock, statement):
-                print("\t".join("" if value is None else value for value in row))
-        sock.sendall(packet(b"X", b""))
+    with socket.create_connection((args.host, args.port), timeout=2) as plain:
+        with (start_tls(plain) if args.tls else plain) as sock:
+            startup = (
+                b"user\0postgres\0database\0"
+                + args.database.encode()
+                + b"\0client_encoding\0UTF8\0\0"
+            )
+            sock.sendall(struct.pack("!II", len(startup) + 8, 196608) + startup)
+            wait_ready(sock)
+            for statement in args.sql:
+                for row in query(sock, statement):
+                    print("\t".join(
+                        "" if value is None else value for value in row))
+            sock.sendall(packet(b"X", b""))
     return 0
 
 
