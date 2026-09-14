@@ -29,29 +29,6 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required host command not found: $1"
 }
 
-verify_checksum() {
-  printf '%s  %s\n' "$2" "$1" | sha256sum --check --status
-}
-
-download() {
-  local url="$1"
-  local file="$2"
-  local checksum="$3"
-  local partial="${file}.part"
-
-  if [[ -f "$file" ]]; then
-    verify_checksum "$file" "$checksum" ||
-      fail "cached download has the wrong checksum: $file"
-    echo "using cached download: ${file#"$SC_ROOT"/}"
-    return
-  fi
-
-  echo "downloading: $url"
-  curl --fail --location --retry 3 --output "$partial" "$url"
-  verify_checksum "$partial" "$checksum" || fail "download checksum failed: $url"
-  mv "$partial" "$file"
-}
-
 wasixccenv() {
   "$WASIXCC_DIR/wasixccenv" \
     "-sSYSROOT_PREFIX=$WASIXCC_SYSROOT_PREFIX" \
@@ -83,7 +60,7 @@ install_wrapper() {
   checksum_pin="WASIXCC_SHA256_${arch^^}"
   local archive="$SC_ROOT/work/downloads/toolchain/wasixcc-${WASIXCC_VERSION}-linux-${arch}.tar.gz"
   local url="https://github.com/wasix-org/wasixcc/releases/download/v${WASIXCC_VERSION}/wasixcc-${arch}-unknown-linux-gnu.tar.gz"
-  download "$url" "$archive" "${!checksum_pin}"
+  sc_download "$url" "$archive" "${!checksum_pin}"
 
   mkdir -p "$WASIXCC_DIR"
   tar -xzf "$archive" -C "$WASIXCC_DIR"

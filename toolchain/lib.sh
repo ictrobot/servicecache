@@ -91,6 +91,53 @@ sc_git_cache() {
   echo "$cache"
 }
 
+# sc_lib_dir name version: prints the directory a library under
+# toolchain/libs builds that version into, work/build/<name>/<version>. It
+# holds the library's download, source and build tree beside the lib and
+# include directories that services compile and link against.
+sc_lib_dir() {
+  if [[ $# -ne 2 ]]; then
+    sc_fail "usage: sc_lib_dir name version"
+    return 1
+  fi
+  local root
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
+  echo "$root/work/build/$1/$2"
+}
+
+# sc_download url destination sha256: the URL fetched to destination and
+# checked against the hash, or nothing when a file with that hash is already
+# there. The download lands beside the destination first, so an interrupted
+# fetch is never mistaken for a complete one.
+sc_download() {
+  if [[ $# -ne 3 ]]; then
+    sc_fail "usage: sc_download url destination sha256"
+    return 1
+  fi
+
+  local url="$1"
+  local destination="$2"
+  local sha256="$3"
+  local partial="${destination}.part"
+
+  if [[ -f "$destination" ]]; then
+    printf '%s  %s\n' "$sha256" "$destination" | sha256sum --check --status || {
+      sc_fail "cached download has the wrong checksum: $destination"
+      return 1
+    }
+    echo "using cached download: ${destination#"$SC_ROOT/"}"
+    return
+  fi
+
+  echo "downloading: $url"
+  curl --fail --location --retry 3 --output "$partial" "$url" || return 1
+  printf '%s  %s\n' "$sha256" "$partial" | sha256sum --check --status || {
+    sc_fail "download checksum failed: $url"
+    return 1
+  }
+  mv "$partial" "$destination"
+}
+
 # sc_checkout url tag tree: the tag checked out at tree, detached, as a
 # worktree of the bare repository sc_git_cache keeps for the remote.
 sc_checkout() {
