@@ -1,0 +1,212 @@
+Subject: wasix: spawn an unchanged WebAssembly file without reading it again
+
+Spawning a plain WebAssembly file read all of it from the filesystem and
+hashed it, to find its compiled module in the runtime's cache, however
+often the same file had been spawned before. A process that starts the
+same binary for each of its children paid that for every child, in
+proportion to the size of the binary, however little each child then
+did.
+
+The BinFactory keeps the module each path compiled to, with the length
+and modification time the file's metadata gave before it was read. A
+spawn looks the path's metadata up first, and while both match, starts
+the module it has without opening the file. Anything else reads, hashes
+and loads the file as before and records what it loaded. The map is
+shared by the processes that share the factory, so it lasts as long as
+they do, and it holds only modules they spawned. Registering a package
+under a name drops any module kept for it, so the package is what that
+name then spawns.
+
+The tests check that a module is used while its file is unchanged, that
+a rewritten file's is not, and that only an absolute path to a file has
+an identity, on a host directory where a relative name finds the same
+file.
+
+diff --git a/lib/wasix/src/bin_factory/mod.rs b/lib/wasix/src/bin_factory/mod.rs
+index a39afd4..da76de0 100644
+--- a/lib/wasix/src/bin_factory/mod.rs
++++ b/lib/wasix/src/bin_factory/mod.rs
+@@ -11,7 +11,7 @@ use std::{
+ use anyhow::Context;
+ use shared_buffer::OwnedBuffer;
+ use virtual_fs::{AsyncReadExt, FileSystem};
+-use wasmer::FunctionEnvMut;
++use wasmer::{FunctionEnvMut, Module};
+ use wasmer_package::utils::from_bytes;
+ 
+ mod binary_package;
+@@ -33,11 +33,59 @@ use crate::{
+     runtime::module_cache::HashedModuleData,
+ };
+ 
++/// The length and modification time of a file, as its metadata gave them.
++type FileIdentity = (u64, u64);
++
++/// Modules compiled from plain WebAssembly files, by the path they were
++/// spawned from, each with the identity its file had before it was read.
++///
++/// Spawning a plain WebAssembly file reads all of it and hashes it to find
++/// its compiled module in the runtime's cache, however often the same file is
++/// spawned. A process that starts its own binary for each child pays that for
++/// every child. A file whose length and modification time are unchanged is
++/// taken to hold the same module, so its module is used without reading it.
++#[derive(Debug, Clone, Default)]
++struct WasmModules(Arc<RwLock<HashMap<String, (FileIdentity, Module)>>>);
++
++impl WasmModules {
++    /// The identity of the file at `path`, when it is an absolute path to a
++    /// file.
++    fn identity(path: &str, fs: &dyn FileSystem) -> Option<FileIdentity> {
++        // Only an absolute name is read from the filesystem, so only one can
++        // have a module kept for it; any other name needs no metadata.
++        if !path.starts_with('/') {
++            return None;
++        }
++        let metadata = fs.metadata(Path::new(path)).ok()?;
++        metadata
++            .is_file()
++            .then_some((metadata.len, metadata.modified))
++    }
++
++    fn get(&self, path: &str, identity: FileIdentity) -> Option<Module> {
++        let modules = self.0.read().unwrap();
++        modules
++            .get(path)
++            .filter(|(cached, _)| *cached == identity)
++            .map(|(_, module)| module.clone())
++    }
++
++    fn insert(&self, path: &str, identity: FileIdentity, module: &Module) {
++        let mut modules = self.0.write().unwrap();
++        modules.insert(path.to_string(), (identity, module.clone()));
++    }
++
++    fn remove(&self, path: &str) {
++        self.0.write().unwrap().remove(path);
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub struct BinFactory {
+     pub(crate) commands: Commands,
+     runtime: Arc<dyn Runtime + Send + Sync + 'static>,
+     pub(crate) local: Arc<RwLock<HashMap<String, Option<Arc<BinaryPackage>>>>>,
++    wasm_modules: WasmModules,
+ }
+ 
+ impl BinFactory {
+@@ -46,6 +94,7 @@ impl BinFactory {
+             commands: Commands::new_with_builtins(runtime.clone()),
+             runtime,
+             local: Arc::new(RwLock::new(HashMap::new())),
++            wasm_modules: WasmModules::default(),
+         }
+     }
+ 
+@@ -90,6 +139,7 @@ impl BinFactory {
+     pub fn set_binary(&self, name: &str, binary: &Arc<BinaryPackage>) {
+         let mut cache = self.local.write().unwrap();
+         cache.insert(name.to_string(), Some(binary.clone()));
++        self.wasm_modules.remove(name);
+     }
+ 
+     #[allow(clippy::await_holding_lock)]
+@@ -112,6 +162,15 @@ impl BinFactory {
+         env: WasiEnv,
+     ) -> Pin<Box<dyn Future<Output = Result<TaskJoinHandle, SpawnError>> + 'a>> {
+         Box::pin(async move {
++            // The file's identity is taken before it is read, so a file that
++            // changes while it is read is read again on its next spawn.
++            let identity = WasmModules::identity(&name, env.fs_root());
++            if let Some(module) =
++                identity.and_then(|identity| self.wasm_modules.get(&name, identity))
++            {
++                return spawn_exec_module(module, env, &self.runtime);
++            }
++
+             // Find the binary (or die trying) and make the spawn type
+             let res = self
+                 .get_executable(name.as_str(), Some(env.fs_root()))
+@@ -124,8 +183,12 @@ impl BinFactory {
+             // Execute
+             match executable {
+                 Executable::Wasm(bytes) => {
+-                    let data = HashedModuleData::new(bytes.clone());
+-                    spawn_exec_wasm(data, name.as_str(), env, &self.runtime).await
++                    let data = HashedModuleData::new(bytes);
++                    let module = spawn_load_module(name.as_str(), data, &self.runtime).await?;
++                    if let Some(identity) = identity {
++                        self.wasm_modules.insert(&name, identity, &module);
++                    }
++                    spawn_exec_module(module, env, &self.runtime)
+                 }
+                 Executable::BinaryPackage(pkg) => {
+                     {
+@@ -257,3 +320,67 @@ async fn load_executable_from_filesystem(
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use virtual_fs::{AsyncWriteExt, mem_fs};
++
++    use super::*;
++
++    async fn write(fs: &mem_fs::FileSystem, path: &str, contents: &[u8]) {
++        let mut file = fs
++            .new_open_options()
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(path)
++            .unwrap();
++        file.write_all(contents).await.unwrap();
++        file.flush().await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn a_wasm_module_is_used_until_its_file_changes() {
++        let fs = mem_fs::FileSystem::default();
++        let module = Module::new(&wasmer::Engine::default(), "(module)").unwrap();
++        let modules = WasmModules::default();
++
++        write(&fs, "/tool.wasm", b"first").await;
++        let identity = WasmModules::identity("/tool.wasm", &fs).unwrap();
++        assert!(modules.get("/tool.wasm", identity).is_none());
++        modules.insert("/tool.wasm", identity, &module);
++        let identity = WasmModules::identity("/tool.wasm", &fs).unwrap();
++        assert!(modules.get("/tool.wasm", identity).is_some());
++        assert!(modules.get("/other.wasm", identity).is_none());
++
++        write(&fs, "/tool.wasm", b"a different module").await;
++        let identity = WasmModules::identity("/tool.wasm", &fs).unwrap();
++        assert!(modules.get("/tool.wasm", identity).is_none());
++
++        modules.insert("/tool.wasm", identity, &module);
++        modules.remove("/tool.wasm");
++        assert!(modules.get("/tool.wasm", identity).is_none());
++    }
++
++    #[cfg(feature = "host-fs")]
++    #[tokio::test]
++    async fn only_an_absolute_path_to_a_file_has_an_identity() {
++        let root = tempfile::tempdir().unwrap();
++        std::fs::write(root.path().join("tool.wasm"), b"module").unwrap();
++        std::fs::create_dir(root.path().join("dir")).unwrap();
++        let fs =
++            virtual_fs::host_fs::FileSystem::new(tokio::runtime::Handle::current(), root.path())
++                .unwrap();
++
++        assert_eq!(
++            WasmModules::identity("/tool.wasm", &fs).map(|(len, _)| len),
++            Some(6)
++        );
++        // The host filesystem finds the file by its relative name too, so it
++        // is the name alone that leaves it without an identity.
++        assert!(fs.metadata(Path::new("tool.wasm")).unwrap().is_file());
++        assert!(WasmModules::identity("tool.wasm", &fs).is_none());
++        assert!(WasmModules::identity("/dir", &fs).is_none());
++        assert!(WasmModules::identity("/missing.wasm", &fs).is_none());
++    }
++}
