@@ -9,8 +9,10 @@
 //! given but can neither listen nor connect: a clone must never bind a real
 //! host port, and wasix-libc decides the byte order of every port it reads
 //! back by binding a throwaway socket and reading its address, so refusing the
-//! bind outright would leave the guest with swapped ports. Outbound
-//! connections (the initializer's) go to the host network unchanged.
+//! bind outright would leave the guest with swapped ports.
+//!
+//! The guest and its initializer may make outbound connections only to the
+//! guest's own endpoint.
 //!
 //! Every connection the guest accepts is handed over wrapped in a guard
 //! that records its descriptor and forgets it when the guest drops the
@@ -261,16 +263,24 @@ impl VirtualNetworking for HostNetworking {
         addr: SocketAddr,
         peer: SocketAddr,
     ) -> virtual_net::Result<Box<dyn VirtualTcpSocket + Sync>> {
-        self.inner.connect_tcp(addr, peer).await
+        if self.endpoint().is_ok_and(|endpoint| endpoint == peer) {
+            return self.inner.connect_tcp(addr, peer).await;
+        }
+        tracing::debug!(%peer, "connection to another address refused");
+        Err(NetworkError::PermissionDenied)
     }
 
     async fn resolve(
         &self,
         host: &str,
-        port: Option<u16>,
-        dns_server: Option<std::net::IpAddr>,
+        _port: Option<u16>,
+        _dns_server: Option<std::net::IpAddr>,
     ) -> virtual_net::Result<Vec<std::net::IpAddr>> {
-        self.inner.resolve(host, port, dns_server).await
+        if host.eq_ignore_ascii_case("localhost") {
+            return Ok(vec![std::net::Ipv4Addr::LOCALHOST.into()]);
+        }
+        tracing::debug!(host, "name lookup refused");
+        Err(NetworkError::PermissionDenied)
     }
 }
 

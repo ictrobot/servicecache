@@ -255,9 +255,10 @@ fn fork_a_clone_through_cli(manifest_path: &Path) {
 }
 
 /// The toolchain smoke fixture `netprobe.wasm` as a package of its own, in a
-/// fresh directory named for `tag`: its manifest, or None when the fixture
-/// is not built and the test is skipped.
-fn netprobe_package(tag: &str) -> Option<PathBuf> {
+/// fresh directory named for `tag`, run with `args` after the listening
+/// port 4000: its manifest, or None when the fixture is not built and the
+/// test is skipped.
+fn netprobe_package(tag: &str, args: &[&str]) -> Option<PathBuf> {
     let fixture = repo_root().join("work/build/toolchain-smoke/netprobe.wasm");
     if !fixture.is_file() {
         eprintln!(
@@ -275,9 +276,14 @@ fn netprobe_package(tag: &str) -> Option<PathBuf> {
     // Copied, not symlinked: a manifest path must resolve inside the
     // package.
     std::fs::copy(&fixture, dir.join("netprobe.wasm")).expect("copy the fixture");
+    let args: Vec<&str> = std::iter::once("4000")
+        .chain(args.iter().copied())
+        .collect();
     std::fs::write(
         dir.join("service.toml"),
-        "[service]\nname = \"netprobe\"\nversion = \"0\"\n\n[guest]\nmodule = \"netprobe.wasm\"\nargs = [\"4000\"]\nlisten_port = 4000\n",
+        format!(
+            "[service]\nname = \"netprobe\"\nversion = \"0\"\n\n[guest]\nmodule = \"netprobe.wasm\"\nargs = {args:?}\nlisten_port = 4000\n"
+        ),
     )
     .expect("write the manifest");
     Some(dir.join("service.toml"))
@@ -298,7 +304,7 @@ fn spawn_host(manifest: &Path) -> HostProcess {
 fn guest_sees_correct_ports() {
     use std::io::Read as _;
 
-    let Some(manifest) = netprobe_package("ports") else {
+    let Some(manifest) = netprobe_package("ports", &[]) else {
         return;
     };
     let dir = manifest.parent().expect("the package directory").to_owned();
@@ -320,6 +326,49 @@ fn guest_sees_correct_ports() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A guest may make outbound connections only to its own endpoint. Uses
+/// `netprobe.wasm`, given another port to try.
+fn guest_connects_only_to_its_endpoint() {
+    use std::io::Read as _;
+
+    let outside = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the outside listener");
+    outside
+        .set_nonblocking(true)
+        .expect("make the outside listener nonblocking");
+    let outside_port = outside
+        .local_addr()
+        .expect("outside addr")
+        .port()
+        .to_string();
+    let Some(manifest) = netprobe_package("outbound", &[&outside_port]) else {
+        return;
+    };
+    let dir = manifest.parent().expect("the package directory").to_owned();
+    let mut host = spawn_host(&manifest);
+    let endpoint = host.start().expect("start");
+
+    let mut stream = std::net::TcpStream::connect(endpoint).expect("connect");
+    let client_port = stream.local_addr().expect("local addr").port();
+    let mut report = String::new();
+    stream
+        .read_to_string(&mut report)
+        .expect("read the guest's report");
+    assert_eq!(
+        report,
+        format!(
+            "local={} peer={client_port}\noutbound=EPERM self=connected localhost=127.0.0.1 other=failed\n",
+            endpoint.port()
+        ),
+        "the guest's report"
+    );
+    match outside.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the guest reached the outside listener: {other:?}"),
+    }
+    assert_eq!(host.wait_exit().expect("the guest exits"), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A clone forked from a guest frozen in a blocking `accept()` answers its
 /// first connection at once. The clone resumes that accept on a thread and
 /// a task of its own, so the listening socket has to wake whoever polled it
@@ -329,7 +378,7 @@ fn clone_answers_from_a_frozen_accept() {
     use std::io::Read as _;
     use std::time::{Duration, Instant};
 
-    let Some(manifest) = netprobe_package("clone") else {
+    let Some(manifest) = netprobe_package("clone", &[]) else {
         return;
     };
     let dir = manifest.parent().expect("the package directory").to_owned();
@@ -472,6 +521,13 @@ fn main() {
         "guest_sees_correct_ports",
         || {
             guest_sees_correct_ports();
+            Ok(())
+        },
+    ));
+    trials.push(libtest_mimic::Trial::test(
+        "guest_connects_only_to_its_endpoint",
+        || {
+            guest_connects_only_to_its_endpoint();
             Ok(())
         },
     ));

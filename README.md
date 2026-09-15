@@ -72,8 +72,9 @@ Each service is built from an exact upstream release plus a small patch series f
 ServiceCache is intended for trusted local development and CI environments: it is not a production service host or a
 multi-tenant security boundary. Service packages, their manifests and the compiled-module cache are trusted input.
 
-Guests receive isolated in-memory writable filesystems, package content explicitly mounted read-only by their manifests,
-and host networking for outbound connections.
+Guests receive isolated in-memory writable filesystems and package content explicitly mounted read-only by their
+manifests. They accept connections through a manager-provided listening socket. The runtime permits guests and
+initializers to make outbound connections only to that service’s own endpoint.
 
 The manager API is intended to be used by the same local user through its Unix socket.
 
