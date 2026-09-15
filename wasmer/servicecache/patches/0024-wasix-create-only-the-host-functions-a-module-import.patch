@@ -1,0 +1,581 @@
+Subject: wasix: create only the host functions a module imports
+
+Instantiating a WASIX module built every function of every WASI namespace
+- wasi, wasi_unstable, wasi_snapshot_preview1, wasix_32v1 and wasix_64v1,
+several hundred in all - into the new store, whatever the module imported,
+then found each of the module's imports in that import object again by
+name. Each function is an object the store keeps until it is dropped, so a
+spawned process paid to create and then to free every one of them, when a
+module imports a few dozen from one or two namespaces.
+
+Each namespace table now answers for a single name as well as for all of
+its names: given a name, it creates only the function of that name, if it
+has one. wasix_import chooses the table by namespace. WasiEnv::instantiate
+resolves the module's imports one by one, in the module's order - the
+memory it was given for env.memory, else the WASIX function the import
+names, else what the runtime adds - and instantiates the module from that
+list. The precedence is the one the import object gave, an import nothing
+provides fails to link with the same error, and a runtime import that
+duplicates a WASIX one is still skipped with a warning, now when the
+module imports it. The dynamic linker still takes an import object, which
+holds only the module's WASIX imports. generate_import_object_from_env,
+which is given no module, still provides every function of the version
+it is asked for. The tables are unchanged apart from each one's signature
+and the macro that builds it.
+
+The tests check that every function of every namespace is found by its
+name, that a module is instantiated from its imports and runs, that an
+import nothing provides fails to link with that error, and that the
+linker's import object holds only what the module imports.
+
+diff --git a/lib/wasix/src/lib.rs b/lib/wasix/src/lib.rs
+index 52b1008..1fb1f63 100644
+--- a/lib/wasix/src/lib.rs
++++ b/lib/wasix/src/lib.rs
+@@ -86,7 +86,7 @@ pub use wasmer_wasix_types;
+ 
+ use wasmer::{
+     AsStoreMut, Exports, FunctionEnv, Imports, Memory32, MemoryAccessError, MemorySize,
+-    RuntimeError, imports, namespace,
++    RuntimeError, imports,
+ };
+ 
+ pub use virtual_fs;
+@@ -400,6 +400,73 @@ impl Clone for WasiVFork {
+     }
+ }
+ 
++/// What a namespace table gives: the one host function a name was asked for, or
++/// every function of the namespace.
++enum HostFunctions {
++    One(Option<wasmer::Extern>),
++    All(Exports),
++}
++
++impl HostFunctions {
++    fn one(self) -> Option<wasmer::Extern> {
++        match self {
++            Self::One(function) => function,
++            Self::All(_) => unreachable!("a table asked for one name gives one function"),
++        }
++    }
++
++    fn all(self) -> Exports {
++        match self {
++            Self::All(namespace) => namespace,
++            Self::One(_) => unreachable!("a table asked for no name gives every function"),
++        }
++    }
++}
++
++/// A namespace table, written as for `namespace!`. Given `Some(name)`, it
++/// creates only the function of that name, if the table has one; given `None`,
++/// it creates every function, as `namespace!` does. Each function created is an
++/// object in the store until the store is dropped.
++macro_rules! host_functions {
++    ($name:expr; $( $import_name:literal => $import_item:expr ),* $(,)?) => {
++        match $name {
++            Some(name) => HostFunctions::One(match name {
++                $( $import_name => Some(wasmer::Extern::from($import_item)), )*
++                _ => None,
++            }),
++            None => {
++                let mut namespace = Exports::new();
++                $( namespace.insert($import_name, $import_item); )*
++                HostFunctions::All(namespace)
++            }
++        }
++    };
++}
++
++/// The WASIX host function `namespace`.`name`, created in `store`, if WASIX
++/// provides one. It is the only function created, so a module's imports are
++/// built one by one rather than by building every namespace they come from.
++fn wasix_import(
++    store: &mut impl AsStoreMut,
++    env: &FunctionEnv<WasiEnv>,
++    namespace: &str,
++    name: &str,
++) -> Option<wasmer::Extern> {
++    let name = Some(name);
++    let functions = match namespace {
++        "wasi" => wasi_exports_generic(store, env, name),
++        "wasi_unstable" => wasi_unstable_exports(store, env, name),
++        "wasi_snapshot_preview1" => wasi_snapshot_preview1_exports(store, env, name),
++        "wasix_32v1" => wasix_exports_32(store, env, name),
++        "wasix_64v1" => wasix_exports_64(store, env, name),
++        "ictrobot_shm_v1" if extension_enabled(store, env, "ictrobot_shm_v1") => {
++            ictrobot_shm_exports(store, env, name)
++        }
++        _ => return None,
++    };
++    functions.one()
++}
++
+ /// Create an [`Imports`] with an existing [`WasiEnv`]. [`WasiEnv`] values are
+ /// typically constructed with [`WasiEnvBuilder`].
+ pub fn generate_import_object_from_env(
+@@ -416,7 +483,7 @@ pub fn generate_import_object_from_env(
+         WasiVersion::Wasix64v1 => generate_import_object_wasix64_v1(store, ctx),
+     };
+ 
+-    let exports_wasi_generic = wasi_exports_generic(store, ctx);
++    let exports_wasi_generic = wasi_exports_generic(store, ctx, None).all();
+ 
+     let imports_wasi_generic = imports! {
+         "wasi" => exports_wasi_generic,
+@@ -430,7 +497,10 @@ pub fn generate_import_object_from_env(
+     if !matches!(version, WasiVersion::Wasix64v1)
+         && extension_enabled(store, ctx, "ictrobot_shm_v1")
+     {
+-        imports.register_namespace("ictrobot_shm_v1", ictrobot_shm_exports(store, ctx));
++        imports.register_namespace(
++            "ictrobot_shm_v1",
++            ictrobot_shm_exports(store, ctx, None).all(),
++        );
+     }
+ 
+     imports
+@@ -448,25 +518,37 @@ fn extension_enabled(store: &impl AsStoreMut, ctx: &FunctionEnv<WasiEnv>, namesp
+         .is_none_or(|enabled| enabled.contains(namespace))
+ }
+ 
+-fn ictrobot_shm_exports(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
++fn ictrobot_shm_exports(
++    mut store: &mut impl AsStoreMut,
++    env: &FunctionEnv<WasiEnv>,
++    name: Option<&str>,
++) -> HostFunctions {
+     use syscalls::*;
+-    namespace! {
++    host_functions! { name;
+         "fd_map" => Function::new_typed_with_env(&mut store, env, fd_map32),
+         "fd_unmap" => Function::new_typed_with_env(&mut store, env, fd_unmap32),
+     }
+ }
+ 
+-fn wasi_exports_generic(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
++fn wasi_exports_generic(
++    mut store: &mut impl AsStoreMut,
++    env: &FunctionEnv<WasiEnv>,
++    name: Option<&str>,
++) -> HostFunctions {
+     use syscalls::*;
+-    let namespace = namespace! {
++    let namespace = host_functions! { name;
+         "thread-spawn" => Function::new_typed_with_env(&mut store, env, thread_spawn::<Memory32>),
+     };
+     namespace
+ }
+ 
+-fn wasi_unstable_exports(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
++fn wasi_unstable_exports(
++    mut store: &mut impl AsStoreMut,
++    env: &FunctionEnv<WasiEnv>,
++    name: Option<&str>,
++) -> HostFunctions {
+     use syscalls::*;
+-    let namespace = namespace! {
++    let namespace = host_functions! { name;
+         "args_get" => Function::new_typed_with_env(&mut store, env, args_get::<Memory32>),
+         "args_sizes_get" => Function::new_typed_with_env(&mut store, env, args_sizes_get::<Memory32>),
+         "clock_res_get" => Function::new_typed_with_env(&mut store, env, clock_res_get::<Memory32>),
+@@ -520,9 +602,10 @@ fn wasi_unstable_exports(mut store: &mut impl AsStoreMut, env: &FunctionEnv<Wasi
+ fn wasi_snapshot_preview1_exports(
+     mut store: &mut impl AsStoreMut,
+     env: &FunctionEnv<WasiEnv>,
+-) -> Exports {
++    name: Option<&str>,
++) -> HostFunctions {
+     use syscalls::*;
+-    let namespace = namespace! {
++    let namespace = host_functions! { name;
+         "args_get" => Function::new_typed_with_env(&mut store, env, args_get::<Memory32>),
+         "args_sizes_get" => Function::new_typed_with_env(&mut store, env, args_sizes_get::<Memory32>),
+         "clock_res_get" => Function::new_typed_with_env(&mut store, env, clock_res_get::<Memory32>),
+@@ -574,11 +657,15 @@ fn wasi_snapshot_preview1_exports(
+     namespace
+ }
+ 
+-fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
++fn wasix_exports_32(
++    mut store: &mut impl AsStoreMut,
++    env: &FunctionEnv<WasiEnv>,
++    name: Option<&str>,
++) -> HostFunctions {
+     let engine_supports_async = store.as_store_ref().engine().supports_async();
+ 
+     use syscalls::*;
+-    let namespace = namespace! {
++    let namespace = host_functions! { name;
+         "args_get" => Function::new_typed_with_env(&mut store, env, args_get::<Memory32>),
+         "args_sizes_get" => Function::new_typed_with_env(&mut store, env, args_sizes_get::<Memory32>),
+         "call_dynamic" => Function::new_typed_with_env(&mut store, env, call_dynamic::<Memory32>),
+@@ -723,11 +810,15 @@ fn wasix_exports_32(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
+     namespace
+ }
+ 
+-fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>) -> Exports {
++fn wasix_exports_64(
++    mut store: &mut impl AsStoreMut,
++    env: &FunctionEnv<WasiEnv>,
++    name: Option<&str>,
++) -> HostFunctions {
+     let engine_supports_async = store.as_store_ref().engine().supports_async();
+ 
+     use syscalls::*;
+-    let namespace = namespace! {
++    let namespace = host_functions! { name;
+         "args_get" => Function::new_typed_with_env(&mut store, env, args_get::<Memory64>),
+         "args_sizes_get" => Function::new_typed_with_env(&mut store, env, args_sizes_get::<Memory64>),
+         "call_dynamic" => Function::new_typed_with_env(&mut store, env, call_dynamic::<Memory64>),
+@@ -875,29 +966,18 @@ fn wasix_exports_64(mut store: &mut impl AsStoreMut, env: &FunctionEnv<WasiEnv>)
+ // TODO: split function into two variants, one for JS and one for sys.
+ // (this will make code less messy)
+ fn import_object_for_all_wasi_versions(
+-    _module: &wasmer::Module,
++    module: &wasmer::Module,
+     store: &mut impl AsStoreMut,
+     env: &FunctionEnv<WasiEnv>,
+ ) -> Imports {
+-    let exports_wasi_generic = wasi_exports_generic(store, env);
+-    let exports_wasi_unstable = wasi_unstable_exports(store, env);
+-    let exports_wasi_snapshot_preview1 = wasi_snapshot_preview1_exports(store, env);
+-    let exports_wasix_32v1 = wasix_exports_32(store, env);
+-    let exports_wasix_64v1 = wasix_exports_64(store, env);
+-
+-    // Allowed due to JS feature flag complications.
+-    #[allow(unused_mut)]
+-    let mut imports = imports! {
+-        "wasi" => exports_wasi_generic,
+-        "wasi_unstable" => exports_wasi_unstable,
+-        "wasi_snapshot_preview1" => exports_wasi_snapshot_preview1,
+-        "wasix_32v1" => exports_wasix_32v1,
+-        "wasix_64v1" => exports_wasix_64v1,
+-    };
+-    if extension_enabled(store, env, "ictrobot_shm_v1") {
+-        imports.register_namespace("ictrobot_shm_v1", ictrobot_shm_exports(store, env));
++    // Only the functions the module imports are created: the namespaces
++    // provide several hundred, and every one created is kept in the store.
++    let mut imports = Imports::new();
++    for import in module.imports() {
++        if let Some(function) = wasix_import(store, env, import.module(), import.name()) {
++            imports.define(import.module(), import.name(), function);
++        }
+     }
+-
+     imports
+ }
+ 
+@@ -906,7 +986,7 @@ fn generate_import_object_snapshot0(
+     store: &mut impl AsStoreMut,
+     env: &FunctionEnv<WasiEnv>,
+ ) -> Imports {
+-    let exports_unstable = wasi_unstable_exports(store, env);
++    let exports_unstable = wasi_unstable_exports(store, env, None).all();
+     imports! {
+         "wasi_unstable" => exports_unstable
+     }
+@@ -916,7 +996,7 @@ fn generate_import_object_snapshot1(
+     store: &mut impl AsStoreMut,
+     env: &FunctionEnv<WasiEnv>,
+ ) -> Imports {
+-    let exports_wasi_snapshot_preview1 = wasi_snapshot_preview1_exports(store, env);
++    let exports_wasi_snapshot_preview1 = wasi_snapshot_preview1_exports(store, env, None).all();
+     imports! {
+         "wasi_snapshot_preview1" => exports_wasi_snapshot_preview1
+     }
+@@ -927,7 +1007,7 @@ fn generate_import_object_wasix32_v1(
+     store: &mut impl AsStoreMut,
+     env: &FunctionEnv<WasiEnv>,
+ ) -> Imports {
+-    let exports_wasix_32v1 = wasix_exports_32(store, env);
++    let exports_wasix_32v1 = wasix_exports_32(store, env, None).all();
+     imports! {
+         "wasix_32v1" => exports_wasix_32v1
+     }
+@@ -937,7 +1017,7 @@ fn generate_import_object_wasix64_v1(
+     store: &mut impl AsStoreMut,
+     env: &FunctionEnv<WasiEnv>,
+ ) -> Imports {
+-    let exports_wasix_64v1 = wasix_exports_64(store, env);
++    let exports_wasix_64v1 = wasix_exports_64(store, env, None).all();
+     imports! {
+         "wasix_64v1" => exports_wasix_64v1
+     }
+@@ -1006,3 +1086,151 @@ pub(crate) fn flatten_runtime_error(err: RuntimeError) -> RuntimeError {
+         _ => err,
+     }
+ }
++
++#[cfg(all(test, feature = "sys"))]
++mod import_object_tests {
++    use super::*;
++
++    fn tokio_runtime() -> tokio::runtime::Runtime {
++        tokio::runtime::Builder::new_multi_thread()
++            .enable_all()
++            .build()
++            .unwrap()
++    }
++
++    #[test]
++    fn every_function_of_a_namespace_is_found_by_its_name() {
++        let runtime = tokio_runtime();
++        let _guard = runtime.enter();
++        let engine = wasmer::Engine::default();
++        let mut store = wasmer::Store::new(engine.clone());
++        let func_env = WasiEnv::builder("test_prog")
++            .engine(engine)
++            .finalize(&mut store)
++            .unwrap();
++        let env = &func_env.env;
++
++        let namespaces = [
++            ("wasi", wasi_exports_generic(&mut store, env, None).all()),
++            (
++                "wasi_unstable",
++                wasi_unstable_exports(&mut store, env, None).all(),
++            ),
++            (
++                "wasi_snapshot_preview1",
++                wasi_snapshot_preview1_exports(&mut store, env, None).all(),
++            ),
++            ("wasix_32v1", wasix_exports_32(&mut store, env, None).all()),
++            ("wasix_64v1", wasix_exports_64(&mut store, env, None).all()),
++            (
++                "ictrobot_shm_v1",
++                ictrobot_shm_exports(&mut store, env, None).all(),
++            ),
++        ];
++        for (namespace, functions) in &namespaces {
++            assert!(!functions.is_empty(), "{namespace} is empty");
++            for (name, _) in functions.iter() {
++                assert!(
++                    wasix_import(&mut store, env, namespace, name).is_some(),
++                    "{namespace}.{name} is not found by its name"
++                );
++            }
++        }
++        assert!(wasix_import(&mut store, env, "wasix_32v1", "no_such_function").is_none());
++        assert!(wasix_import(&mut store, env, "no_such_namespace", "args_get").is_none());
++    }
++
++    #[test]
++    fn a_module_is_instantiated_from_its_imports_alone() {
++        let runtime = tokio_runtime();
++        let _guard = runtime.enter();
++        let engine = wasmer::Engine::default();
++        let mut store = wasmer::Store::new(engine.clone());
++        let module = wasmer::Module::new(
++            &engine,
++            r#"(module
++                (import "wasi_snapshot_preview1" "fd_write"
++                    (func (param i32 i32 i32 i32) (result i32)))
++                (memory (export "memory") 1)
++                (func (export "_start")))"#,
++        )
++        .unwrap();
++        let (instance, _func_env) = WasiEnv::builder("test_prog")
++            .engine(engine.clone())
++            .instantiate(module, &mut store)
++            .unwrap();
++        instance
++            .exports
++            .get_function("_start")
++            .unwrap()
++            .call(&mut store, &[])
++            .unwrap();
++
++        // An import no namespace provides fails to link, with the error
++        // instantiating from an import object gives.
++        let module = wasmer::Module::new(
++            &engine,
++            r#"(module
++                (import "wasix_32v1" "no_such_function" (func))
++                (memory (export "memory") 1))"#,
++        )
++        .unwrap();
++        let error = WasiEnv::builder("test_prog")
++            .engine(engine)
++            .instantiate(module, &mut store)
++            .unwrap_err();
++        let WasiRuntimeError::Thread(WasiThreadError::InstanceCreateFailed(error)) = error else {
++            panic!("expected an instantiation failure, got {error}");
++        };
++        assert!(
++            matches!(
++                &*error,
++                wasmer::InstantiationError::Link(wasmer::LinkError::Import(
++                    namespace,
++                    name,
++                    wasmer_types::ImportError::UnknownImport(_),
++                )) if namespace == "wasix_32v1" && name == "no_such_function"
++            ),
++            "{error}"
++        );
++    }
++
++    #[test]
++    fn only_the_functions_a_module_imports_are_created() {
++        let runtime = tokio_runtime();
++        let _guard = runtime.enter();
++        let engine = wasmer::Engine::default();
++        let mut store = wasmer::Store::new(engine.clone());
++        let module = wasmer::Module::new(
++            &engine,
++            r#"(module
++                (import "wasi_snapshot_preview1" "fd_write"
++                    (func (param i32 i32 i32 i32) (result i32)))
++                (import "wasix_32v1" "futex_wait"
++                    (func (param i32 i32 i32 i32) (result i32))))"#,
++        )
++        .unwrap();
++        let func_env = WasiEnv::builder("test_prog")
++            .engine(engine)
++            .finalize(&mut store)
++            .unwrap();
++
++        let imports = import_object_for_all_wasi_versions(&module, &mut store, &func_env.env);
++        let mut names: Vec<_> = imports
++            .iter()
++            .map(|(namespace, name, _)| format!("{namespace}.{name}"))
++            .collect();
++        names.sort();
++        assert_eq!(
++            names,
++            ["wasi_snapshot_preview1.fd_write", "wasix_32v1.futex_wait"]
++        );
++
++        // Without a module, every function of the version is still provided.
++        let all =
++            generate_import_object_from_env(&mut store, &func_env.env, WasiVersion::Wasix32v1);
++        assert!(all.exists("wasix_32v1", "futex_wait"));
++        assert!(all.exists("wasix_32v1", "args_get"));
++        assert!(all.exists("wasi", "thread-spawn"));
++    }
++}
+diff --git a/lib/wasix/src/state/env.rs b/lib/wasix/src/state/env.rs
+index bc515e7..47e1954 100644
+--- a/lib/wasix/src/state/env.rs
++++ b/lib/wasix/src/state/env.rs
+@@ -6,7 +6,6 @@ use crate::{
+     bin_factory::{BinFactory, BinaryPackage, BinaryPackageCommand},
+     capabilities::Capabilities,
+     fs::{WasiFsRoot, WasiInodes},
+-    import_object_for_all_wasi_versions,
+     os::task::{
+         control_plane::ControlPlaneError,
+         process::{WasiProcess, WasiProcessId},
+@@ -14,6 +13,7 @@ use crate::{
+     },
+     state::PreparedInstanceGroupData,
+     syscalls::platform_clock_time_get,
++    wasix_import,
+ };
+ use futures::future::BoxFuture;
+ use rand::RngExt;
+@@ -29,11 +29,11 @@ use virtual_fs::{FileSystem, FsError, VirtualFile};
+ use virtual_mio::block_on;
+ use virtual_net::DynVirtualNetworking;
+ use wasmer::{
+-    AsStoreMut, AsStoreRef, ExportError, FunctionEnvMut, Instance, Memory, MemoryType, MemoryView,
+-    Module,
++    AsStoreMut, AsStoreRef, ExportError, Extern, FunctionEnvMut, Instance, InstantiationError,
++    LinkError, Memory, MemoryType, MemoryView, Module,
+ };
+ use wasmer_config::package::PackageSource;
+-use wasmer_types::ModuleHash;
++use wasmer_types::{ImportError, ModuleHash};
+ use wasmer_wasix_types::{
+     types::Signal,
+     wasi::{Errno, ExitCode, Snapshot0Clockid},
+@@ -548,39 +548,62 @@ impl WasiEnv {
+             }
+         }
+ 
+-        // Let's instantiate the module with the imports.
+-        let mut import_object =
+-            import_object_for_all_wasi_versions(&module, &mut store, &func_env.env);
+-        if let Some(memory) = memory.clone() {
+-            import_object.define("env", "memory", memory);
+-        }
++        // Let's instantiate the module with the imports, resolved one by one in
++        // the module's order: the memory given for `env.memory`, else the WASIX
++        // host function the import names, created only now, else what the
++        // runtime adds. Downstream runtime imports must not override WASIX
++        // imports.
+         let runtime = func_env.data(&store).runtime.clone();
+         let (additional_imports, instantiation_state) = runtime
+             .additional_imports(&module, &mut store)
+             .map_err(|err| WasiThreadError::AdditionalImportCreationFailed(Arc::new(err)))?;
+ 
+-        for ((namespace, name), value) in &additional_imports {
+-            // Downstream runtime imports must not override WASIX imports.
+-            if import_object.exists(&namespace, &name) {
+-                tracing::warn!(
+-                    "Skipping duplicate additional import {}.{}",
+-                    namespace,
+-                    name
+-                );
+-            } else {
+-                import_object.define(&namespace, &name, value);
+-            }
+-        }
+-
+-        let imported_memory = import_object
+-            .get_export("env", "memory")
+-            .and_then(|ext| match ext {
+-                wasmer::Extern::Memory(memory) => Some(memory),
+-                _ => None,
+-            });
++        let imported_memory =
++            memory
++                .clone()
++                .or_else(|| match additional_imports.get_export("env", "memory") {
++                    Some(Extern::Memory(memory)) => Some(memory),
++                    _ => None,
++                });
++
++        let externs = module
++            .imports()
++            .map(|import| {
++                let (namespace, name) = (import.module(), import.name());
++                let provided = match memory.clone() {
++                    Some(memory) if (namespace, name) == ("env", "memory") => {
++                        Some(Extern::from(memory))
++                    }
++                    _ => wasix_import(&mut store, &func_env.env, namespace, name),
++                };
++                match provided {
++                    Some(external) => {
++                        if additional_imports.exists(namespace, name) {
++                            tracing::warn!(
++                                "Skipping duplicate additional import {}.{}",
++                                namespace,
++                                name
++                            );
++                        }
++                        Ok(external)
++                    }
++                    None => additional_imports
++                        .get_export(namespace, name)
++                        .ok_or_else(|| {
++                            InstantiationError::Link(LinkError::Import(
++                                namespace.to_string(),
++                                name.to_string(),
++                                ImportError::UnknownImport(import.ty().clone()),
++                            ))
++                        }),
++                }
++            })
++            .collect::<Result<Vec<_>, _>>();
+ 
+         // Construct the instance.
+-        let instance = match Instance::new(&mut store, &module, &import_object) {
++        let instance = match externs
++            .and_then(|externs| Instance::new_by_index(&mut store, &module, &externs))
++        {
+             Ok(a) => a,
+             Err(err) => {
+                 tracing::error!(

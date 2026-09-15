@@ -21,3 +21,4 @@
 0021-wasix-poll-a-socket-s-descriptor-on-the-thread-that-.patch
 0022-wasix-wait-for-a-blocking-socket-operation-on-its-ow.patch
 0023-wasix-spawn-an-unchanged-WebAssembly-file-without-re.patch
+0024-wasix-create-only-the-host-functions-a-module-import.patch
