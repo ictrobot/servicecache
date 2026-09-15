@@ -45,9 +45,9 @@ done
 
 # Whether the directory already holds a complete WASIX build of this version of
 # OpenSSL: both static libraries, headers that announce the version asked for,
-# the datagram support this target does without, the target wasix.conf
-# describes, built from the wasix.conf in this directory, and real pthread
-# locking rather than the no-op the configuration falls back to when it
+# the datagram support and exit cleanup this build does without, the target
+# wasix.conf describes, built from the wasix.conf in this directory, and real
+# pthread locking rather than the no-op the configuration falls back to when it
 # decides the platform has no threads.
 openssl_ready() {
   local version_header="$install_dir/include/openssl/opensslv.h"
@@ -63,6 +63,7 @@ openssl_ready() {
   grep -Eq "^# *define OPENSSL_VERSION_PATCH +${version_patch}$" "$version_header" || return 1
   grep -Eq '^# *define OPENSSL_VERSION_PRE_RELEASE +""$' "$version_header" || return 1
   grep -Eq '^# *define OPENSSL_NO_DGRAM$' "$config_header" || return 1
+  grep -Eq '^# *define OPENSSL_NO_ATEXIT$' "$config_header" || return 1
   grep -Eq '^# *define SIXTY_FOUR_BIT$' "$config_header" || return 1
   ! grep -q 'OPENSSL_NO_ASM' "$config_header" || return 1
   ! grep -q 'OPENSSL_NO_EC_NISTP_64_GCC_128' "$config_header" || return 1
@@ -99,7 +100,8 @@ mkdir -p "$build_dir"
 (
   cd "$build_dir"
   # The wasix-wasm32 target keeps assembly enabled, so there is no no-asm
-  # here; see wasix.conf.
+  # here; see wasix.conf. no-atexit leaves libcrypto's tables to go with the
+  # process's memory rather than freeing each of them as the process exits.
   env \
     CC="$WASIXCC_DIR/bin/wasixcc" \
     CXX="$WASIXCC_DIR/bin/wasix++" \
@@ -120,6 +122,7 @@ mkdir -p "$build_dir"
       no-apps \
       no-afalgeng \
       no-dgram \
+      no-atexit \
       -DUSE_TIMEGM \
       -DOPENSSL_NO_SECURE_MEMORY \
       -DOPENSSL_NO_DGRAM \
