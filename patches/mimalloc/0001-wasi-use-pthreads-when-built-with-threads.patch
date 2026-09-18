@@ -1,0 +1,94 @@
+Subject: wasi: use pthreads when the program is built with threads
+
+The WASI port is written for a single thread. It takes none of the pthread
+mutexes the other POSIX ports take, so its locks are loops around an atomic
+flag and `sbrk` is called unguarded, and it has no hook for a thread ending,
+so a thread's heap is never released: a program that keeps starting threads
+keeps growing, by the memory each ended thread had claimed.
+
+WASIX is WASI with pthreads, and a program built with `-pthread` there has
+`_REENTRANT` defined. With it, select the pthread locks, and release a
+thread's heap from the destructor of a pthread key, which is how the unix
+port learns that a thread ended.
+
+The port yields with `sleep(0)`, in the loops that wait for another thread to
+finish with a page or a heap. wasi-libc's `sleep` is a `poll_oneoff` on a
+clock, so each pass of such a loop sets up a timer and waits for it to fire.
+Yield with `sched_yield`, as the unix port does.
+
+diff --git a/include/mimalloc/atomic.h b/include/mimalloc/atomic.h
+--- a/include/mimalloc/atomic.h
++++ b/include/mimalloc/atomic.h
+@@ -15,7 +15,7 @@ terms of the MIT license. A copy of the license can be found in the file
+ #endif
+ #include <windows.h>
+ #endif
+-#if MI_TLS_MODEL_PTHREADS || (!defined(_WIN32) && !defined(__wasi__) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)))
++#if MI_TLS_MODEL_PTHREADS || (!defined(_WIN32) && (!defined(__wasi__) || defined(_REENTRANT)) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)))
+ #define  MI_USE_PTHREADS        1
+ #include <pthread.h>
+ #endif
+diff --git a/src/prim/wasi/prim.c b/src/prim/wasi/prim.c
+--- a/src/prim/wasi/prim.c
++++ b/src/prim/wasi/prim.c
+@@ -13,7 +13,8 @@ terms of the MIT license. A copy of the license can be found in the file
+ 
+ #include <stdio.h>   // fputs
+ #include <stdlib.h>  // getenv
+-#include <unistd.h>  // sbrk, sleep
++#include <unistd.h>  // sbrk
++#include <sched.h>   // sched_yield
+ 
+ //---------------------------------------------
+ // Initialize
+@@ -276,6 +277,36 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
+ // Thread init/done
+ //----------------------------------------------------------------
+ 
++#if defined(MI_USE_PTHREADS)
++
++// With threads, a thread's theap is the value of a key whose destructor
++// releases it when the thread ends.
++static pthread_key_t mi_theap_key;
++static bool mi_theap_key_created;
++
++static void mi_theap_key_done(void* value) {
++  _mi_thread_done((mi_theap_t*)value);
++}
++
++void _mi_prim_thread_init_auto_done(void) {
++  mi_theap_key_created = (pthread_key_create(&mi_theap_key, &mi_theap_key_done) == 0);
++}
++
++void _mi_prim_thread_done_auto_done(void) {
++  if (mi_theap_key_created) {
++    mi_theap_key_created = false;
++    pthread_key_delete(mi_theap_key);
++  }
++}
++
++void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
++  if (mi_theap_key_created) {
++    pthread_setspecific(mi_theap_key, theap);
++  }
++}
++
++#else
++
+ void _mi_prim_thread_init_auto_done(void) {
+   // nothing
+ }
+@@ -288,10 +319,12 @@ void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
+   MI_UNUSED(theap);
+ }
+ 
++#endif
++
+ bool _mi_prim_thread_is_in_threadpool(void) {
+   return false;
+ }
+ 
+ void _mi_prim_thread_yield(void) {
+-  sleep(0);
++  sched_yield();
+ }

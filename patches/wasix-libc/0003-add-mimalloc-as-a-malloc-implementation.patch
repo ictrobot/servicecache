@@ -1,0 +1,193 @@
+Subject: Add mimalloc as a malloc implementation
+
+dlmalloc takes one lock around every allocation and release, so the threads
+of a program that allocates often spend their time waiting for each other;
+with spin locks, as built here, they spin and yield while they wait.
+mimalloc gives each thread its own heap.
+
+`MALLOC_IMPL=mimalloc` builds libc with mimalloc in dlmalloc's place, from
+the mimalloc source tree `MIMALLOC_DIR` names. `mimalloc/malloc.c` is to
+mimalloc what `dlmalloc/src/dlmalloc.c` is to dlmalloc: it includes the
+allocator's single-file build and defines libc's allocation functions over
+it, so libc.a gains one object and takes libc's own flags, its thread model
+among them. mimalloc's WASI port needs thread support for a libc with
+threads.
+
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -1,3 +1,4 @@
++# Modified for ServiceCache: add MALLOC_IMPL=mimalloc.
+ # These variables are specifically meant to be overridable via the make
+ # command-line.
+ # ?= doesn't work for CC and AR because make has a default value for them.
+@@ -15,8 +16,10 @@ SYSROOT ?= $(CURDIR)/sysroot
+ INSTALL_DIR ?= /usr/local
+ # single or posix; note that pthread support is still a work-in-progress.
+ THREAD_MODEL ?= posix
+-# dlmalloc or none
++# dlmalloc, mimalloc or none
+ MALLOC_IMPL ?= dlmalloc
++# For MALLOC_IMPL=mimalloc, a mimalloc source tree.
++MIMALLOC_DIR ?=
+ # yes or no
+ BUILD_LIBC_TOP_HALF ?= yes
+ # The directory where we will store intermediate artifacts.
+@@ -53,6 +56,7 @@ DLMALLOC_SOURCES = $(DLMALLOC_SRC_DIR)/dlmalloc.c
+ DLMALLOC_INC = $(DLMALLOC_DIR)/include
+ EMMALLOC_DIR = emmalloc
+ EMMALLOC_SOURCES = $(EMMALLOC_DIR)/emmalloc.c
++MIMALLOC_SOURCES = mimalloc/malloc.c
+ LIBC_BOTTOM_HALF_DIR = libc-bottom-half
+ LIBC_BOTTOM_HALF_CLOUDLIBC_SRC = $(LIBC_BOTTOM_HALF_DIR)/cloudlibc/src
+ LIBC_BOTTOM_HALF_CLOUDLIBC_SRC_INC = $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/include
+@@ -433,12 +437,15 @@ objs = $(patsubst %.c,$(OBJDIR)/%.o,$(1))
+ asmobjs = $(patsubst %.s,$(OBJDIR)/%.o,$(1))
+ DLMALLOC_OBJS = $(call objs,$(DLMALLOC_SOURCES))
+ EMMALLOC_OBJS = $(call objs,$(EMMALLOC_SOURCES))
++MIMALLOC_OBJS = $(call objs,$(MIMALLOC_SOURCES))
+ LIBC_BOTTOM_HALF_ALL_OBJS = $(call objs,$(LIBC_BOTTOM_HALF_ALL_SOURCES))
+ LIBC_TOP_HALF_ALL_OBJS = $(call asmobjs,$(call objs,$(LIBC_TOP_HALF_ALL_SOURCES)))
+ ifeq ($(MALLOC_IMPL),dlmalloc)
+ LIBC_OBJS += $(DLMALLOC_OBJS)
+ else ifeq ($(MALLOC_IMPL),emmalloc)
+ LIBC_OBJS += $(EMMALLOC_OBJS)
++else ifeq ($(MALLOC_IMPL),mimalloc)
++LIBC_OBJS += $(MIMALLOC_OBJS)
+ else ifeq ($(MALLOC_IMPL),none)
+ # No object files to add.
+ else
+@@ -616,6 +623,12 @@ $(OBJDIR)/%.o: %.s include_dirs
+ $(DLMALLOC_OBJS): CFLAGS += \
+     -I$(DLMALLOC_INC)
+ 
++# MI_FREE_USE_PAGEMAP is what mimalloc's own build sets for WASI.
++$(MIMALLOC_OBJS): CFLAGS += \
++    -I$(MIMALLOC_DIR) \
++    -I$(MIMALLOC_DIR)/include \
++    -DMI_FREE_USE_PAGEMAP=1
++
+ startup_files $(LIBC_BOTTOM_HALF_ALL_OBJS): CFLAGS += \
+     -I$(LIBC_BOTTOM_HALF_HEADERS_PRIVATE) \
+     -I$(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC_INC) \
+diff --git a/Makefile-eh b/Makefile-eh
+--- a/Makefile-eh
++++ b/Makefile-eh
+@@ -1,3 +1,4 @@
++# Modified for ServiceCache: add MALLOC_IMPL=mimalloc.
+ # These variables are specifically meant to be overridable via the make
+ # command-line.
+ # ?= doesn't work for CC and AR because make has a default value for them.
+@@ -15,8 +16,10 @@ SYSROOT ?= $(CURDIR)/sysroot
+ INSTALL_DIR ?= /usr/local
+ # single or posix; note that pthread support is still a work-in-progress.
+ THREAD_MODEL ?= posix
+-# dlmalloc or none
++# dlmalloc, mimalloc or none
+ MALLOC_IMPL ?= dlmalloc
++# For MALLOC_IMPL=mimalloc, a mimalloc source tree.
++MIMALLOC_DIR ?=
+ # yes or no
+ BUILD_LIBC_TOP_HALF ?= yes
+ # The directory where we will store intermediate artifacts.
+@@ -61,6 +64,7 @@ DLMALLOC_SOURCES = $(DLMALLOC_SRC_DIR)/dlmalloc.c
+ DLMALLOC_INC = $(DLMALLOC_DIR)/include
+ EMMALLOC_DIR = emmalloc
+ EMMALLOC_SOURCES = $(EMMALLOC_DIR)/emmalloc.c
++MIMALLOC_SOURCES = mimalloc/malloc.c
+ LIBC_BOTTOM_HALF_DIR = libc-bottom-half
+ LIBC_BOTTOM_HALF_CLOUDLIBC_SRC = $(LIBC_BOTTOM_HALF_DIR)/cloudlibc/src
+ LIBC_BOTTOM_HALF_CLOUDLIBC_SRC_INC = $(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC)/include
+@@ -456,12 +460,15 @@ objs = $(patsubst %.c,$(OBJDIR)/%.o,$(1))
+ asmobjs = $(patsubst %.s,$(OBJDIR)/%.o,$(1))
+ DLMALLOC_OBJS = $(call objs,$(DLMALLOC_SOURCES))
+ EMMALLOC_OBJS = $(call objs,$(EMMALLOC_SOURCES))
++MIMALLOC_OBJS = $(call objs,$(MIMALLOC_SOURCES))
+ LIBC_BOTTOM_HALF_ALL_OBJS = $(call objs,$(LIBC_BOTTOM_HALF_ALL_SOURCES))
+ LIBC_TOP_HALF_ALL_OBJS = $(call asmobjs,$(call objs,$(LIBC_TOP_HALF_ALL_SOURCES)))
+ ifeq ($(MALLOC_IMPL),dlmalloc)
+ LIBC_OBJS += $(DLMALLOC_OBJS)
+ else ifeq ($(MALLOC_IMPL),emmalloc)
+ LIBC_OBJS += $(EMMALLOC_OBJS)
++else ifeq ($(MALLOC_IMPL),mimalloc)
++LIBC_OBJS += $(MIMALLOC_OBJS)
+ else ifeq ($(MALLOC_IMPL),none)
+ # No object files to add.
+ else
+@@ -643,6 +650,12 @@ $(OBJDIR)/%.o: %.s include_dirs
+ $(DLMALLOC_OBJS): CFLAGS += \
+     -I$(DLMALLOC_INC)
+ 
++# MI_FREE_USE_PAGEMAP is what mimalloc's own build sets for WASI.
++$(MIMALLOC_OBJS): CFLAGS += \
++    -I$(MIMALLOC_DIR) \
++    -I$(MIMALLOC_DIR)/include \
++    -DMI_FREE_USE_PAGEMAP=1
++
+ startup_files $(LIBC_BOTTOM_HALF_ALL_OBJS): CFLAGS += \
+     -I$(LIBC_BOTTOM_HALF_HEADERS_PRIVATE) \
+     -I$(LIBC_BOTTOM_HALF_CLOUDLIBC_SRC_INC) \
+diff --git a/mimalloc/malloc.c b/mimalloc/malloc.c
+new file mode 100644
+--- /dev/null
++++ b/mimalloc/malloc.c
+@@ -0,0 +1,59 @@
++// libc's malloc for MALLOC_IMPL=mimalloc: mimalloc's single-file build, from
++// the source tree MIMALLOC_DIR names, and libc's allocation functions
++// forwarded to it, as dlmalloc/src/dlmalloc.c wraps dlmalloc.
++//
++// mimalloc can define the functions itself (MI_MALLOC_OVERRIDE), but that
++// also defines strdup and strndup, which libc defines, and
++// std::get_new_handler, which libc++abi defines. libc++abi's operator new and
++// delete call malloc and free, so they need nothing here.
++
++#include "src/static.c"
++
++// mimalloc does not always report a failure in errno: calloc's overflow
++// check leaves it alone in a release build, and the other failures set it only
++// when it was zero. libc's functions set it themselves.
++
++void *malloc(size_t size) {
++    void *result = mi_malloc(size);
++    if (result == NULL) errno = ENOMEM;
++    return result;
++}
++
++void free(void *ptr) {
++    mi_free(ptr);
++}
++
++void *calloc(size_t nmemb, size_t size) {
++    void *result = mi_calloc(nmemb, size);
++    if (result == NULL) errno = ENOMEM;
++    return result;
++}
++
++void *realloc(void *ptr, size_t size) {
++    void *result = mi_realloc(ptr, size);
++    if (result == NULL) errno = ENOMEM;
++    return result;
++}
++
++int posix_memalign(void **memptr, size_t alignment, size_t size) {
++    return mi_posix_memalign(memptr, alignment, size);
++}
++
++void *aligned_alloc(size_t alignment, size_t bytes) {
++    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
++        errno = EINVAL;
++        return NULL;
++    }
++    void *result = mi_aligned_alloc(alignment, bytes);
++    if (result == NULL) errno = ENOMEM;
++    return result;
++}
++
++size_t malloc_usable_size(void *ptr) {
++    return mi_usable_size(ptr);
++}
++
++// Define these to satisfy musl references.
++void *__libc_malloc(size_t) __attribute__((alias("malloc")));
++void __libc_free(void *) __attribute__((alias("free")));
++void *__libc_calloc(size_t nmemb, size_t size) __attribute__((alias("calloc")));

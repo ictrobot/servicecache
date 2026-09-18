@@ -5,7 +5,9 @@ toolchain/bootstrap.sh checks wasix-libc out at the sysroot's tag under
 work/wasix-libc, applies the series, builds libc from it with wasix-libc's
 own build for each sysroot variant wasixcc can target, and puts that libc.a
 into the downloaded sysroot. A patch goes away when the sysroot tag carries
-the fix.
+the fix. The libc is built with mimalloc as its malloc, the option 0003 adds,
+from mimalloc at MIMALLOC_TAG (toolchain/versions.sh) with patches/mimalloc
+applied.
 
 Except where otherwise noted, Copyright (c) 2026 Ethan Jones.
 

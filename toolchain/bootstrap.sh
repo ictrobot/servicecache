@@ -90,11 +90,14 @@ install_sysroot() {
 # is checked out at the sysroot's tag under work/wasix-libc, the series is
 # applied, and libc is built from it with wasix-libc's own build for every
 # sysroot variant wasixcc can target; that libc.a replaces the downloaded
-# one. A stamp next to each archive holds the series hash, so a fresh
-# download or a changed series is rebuilt. The legacy exception-handling
-# variants (sysroot-eh, sysroot-ehpic) cannot be selected through wasixcc
-# and are left as downloaded. The make arguments are the ones wasix-libc's
-# build32-general.sh uses for each variant.
+# one. Its malloc is mimalloc, built in through the series' MALLOC_IMPL option
+# from a checkout at MIMALLOC_TAG under work/mimalloc that carries
+# patches/mimalloc. A stamp next to each archive holds the hash of both series
+# and the tag, so a fresh download or a change to any of them is rebuilt. The
+# symbols wasix-libc checks a build for are dlmalloc's, so that check is off.
+# The legacy exception-handling variants (sysroot-eh, sysroot-ehpic) cannot be
+# selected through wasixcc and are left as downloaded. The make arguments are
+# the ones wasix-libc's build32-general.sh uses for each variant.
 SYSROOT_PATCH_VARIANTS=(
   "sysroot:-f Makefile PIC=no"
   "sysroot-exnref-eh:-f Makefile-eh EXNREF_EH=yes PIC=no"
@@ -123,6 +126,12 @@ patch_sysroot() {
     sc_reset_if_stale "$checkout" "$SC_ROOT/patches/wasix-libc"
     sc_apply_series "$SC_ROOT/patches/wasix-libc" "$checkout"
   ) || fail "could not prepare the wasix-libc checkout"
+  local mimalloc="$SC_ROOT/work/mimalloc"
+  (
+    sc_checkout https://github.com/microsoft/mimalloc.git "$MIMALLOC_TAG" "$mimalloc"
+    sc_reset_if_stale "$mimalloc" "$SC_ROOT/patches/mimalloc"
+    sc_apply_series "$SC_ROOT/patches/mimalloc" "$mimalloc"
+  ) || fail "could not prepare the mimalloc checkout"
 
   local hash entry variant flags lib
   hash="$(sc_sysroot_patch_hash)"
@@ -134,7 +143,8 @@ patch_sysroot() {
     # shellcheck disable=SC2086
     (cd "$checkout" && PATH="$WASIXCC_LLVM_LOCATION/bin:$PATH" \
       TARGET_ARCH=wasm32 TARGET_OS=wasix CC=clang CXX=clang++ \
-      make --silent CHECK_SYMBOLS=yes -j"$(nproc)" $flags) > "$checkout/build.log" 2>&1 ||
+      make --silent CHECK_SYMBOLS=no MALLOC_IMPL=mimalloc MIMALLOC_DIR="$mimalloc" \
+        -j"$(nproc)" $flags) > "$checkout/build.log" 2>&1 ||
       fail "building wasix-libc for $variant failed; see $checkout/build.log"
     cp "$checkout/sysroot/lib/wasm32-wasi/libc.a" "$lib"
     echo "$hash" > "$lib.sc-patched"
@@ -202,11 +212,12 @@ run_smoke() {
   "$WASIXCC_DIR/bin/wasixcc" -O2 \
     "$SC_ROOT/toolchain/smoke/netprobe.c" -o "$build_dir/netprobe.wasm"
 
-  # The libc patches (patches/wasix-libc), once per patched sysroot variant
-  # that runs as a plain module; each fixture fails on the unpatched libc.
-  # Two threads making relative-path syscalls at once must not corrupt each
-  # other's paths, and select() and pselect() must wait for a timeout under
-  # one second rather than return at once.
+  # The libc patches (patches/wasix-libc, patches/mimalloc), once per patched
+  # sysroot variant that runs as a plain module; each fixture fails on the
+  # unpatched libc. Two threads making relative-path syscalls at once must not
+  # corrupt each other's paths, select() and pselect() must wait for a timeout
+  # under one second rather than return at once, and threads that end must
+  # give their memory back to malloc.
   local flags
   for flags in "" "-fno-exceptions"; do
     # shellcheck disable=SC2086
@@ -221,9 +232,17 @@ run_smoke() {
       fail "select timeout smoke test failed (wasixcc ${flags:-default flags})"
     [[ "$output" == "WASIX select and pselect wait for their timeouts" ]] ||
       fail "select timeout smoke test returned unexpected output: $output"
+    # shellcheck disable=SC2086
+    "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread $flags \
+      "$SC_ROOT/toolchain/smoke/malloc-threads.c" -o "$build_dir/malloc-threads.wasm"
+    output="$("$WASMER_DIR/bin/wasmer" run "$build_dir/malloc-threads.wasm")" ||
+      fail "malloc threads smoke test failed (wasixcc ${flags:-default flags})"
+    [[ "$output" == "WASIX malloc works across threads" ]] ||
+      fail "malloc threads smoke test returned unexpected output: $output"
   done
   echo "WASIX relative-path race test passed"
   echo "WASIX select and pselect wait for their timeouts"
+  echo "WASIX malloc works across threads"
 
   # Guest fixtures for the fixes patch set run under the fixes variant:
   # stock does not carry the behaviour they test. PATH covers their
@@ -293,6 +312,7 @@ load_service_set() {
   local service_versions="${version_file%/versions/*}/versions.sh"
 
   unset WASIXCC_VERSION WASIX_SYSROOT_TAG WASIX_LLVM_TAG BINARYEN_TAG WASMER_VERSION
+  unset MIMALLOC_TAG
   unset WASIXCC_SHA256_X86_64 WASIXCC_SHA256_AARCH64
   source "$version_file"
   if [[ -f "$service_versions" ]]; then
@@ -313,11 +333,11 @@ done
 mkdir -p "$SC_ROOT/work/downloads/toolchain"
 
 set_key() {
-  printf '%s|%s|%s|%s|%s' "$WASIXCC_VERSION" "$WASIX_SYSROOT_TAG" \
-    "$WASIX_LLVM_TAG" "$BINARYEN_TAG" "$WASMER_VERSION"
+  printf '%s|%s|%s|%s|%s|%s' "$WASIXCC_VERSION" "$WASIX_SYSROOT_TAG" \
+    "$WASIX_LLVM_TAG" "$BINARYEN_TAG" "$WASMER_VERSION" "$MIMALLOC_TAG"
 }
 
-# Sets are identified by their five pins; a set already handled is skipped so
+# Sets are identified by their six pins; a set already handled is skipped so
 # services that share the default pins do not repeat its checks and smoke test.
 declare -A handled_sets=()
 

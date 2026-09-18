@@ -12,6 +12,8 @@
 : "${WASIX_LLVM_TAG:=21.1.206}"
 : "${BINARYEN_TAG:=version_132}"
 : "${WASMER_VERSION:=7.3.0}"
+# The sysroot's libc is built with this mimalloc as its malloc.
+: "${MIMALLOC_TAG:=v3.5.3}"
 
 # The wasixcc release archive for each supported host architecture (uname -m).
 : "${WASIXCC_SHA256_X86_64:=7f9644bb94e3a14d8d2594b022fdf1ab44e22cfd365e6bf4bd324d8064cc908a}"

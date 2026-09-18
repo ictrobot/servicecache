@@ -420,17 +420,23 @@ sc_check_guest_imports() {
   [[ $bad -eq 0 ]]
 }
 
-# The content hash of the patch series the sysroot's libc carries
-# (patches/wasix-libc, in series order): what toolchain/bootstrap.sh stamps
-# each rebuilt libc.a with, and what BUILD-INFO records.
+# The content hash of what the sysroot's libc carries beyond its tag: the
+# patch series for wasix-libc and for the mimalloc built into it
+# (patches/wasix-libc, patches/mimalloc, each in series order) and the
+# mimalloc tag. It is what toolchain/bootstrap.sh stamps each rebuilt libc.a
+# with, and what BUILD-INFO records.
 sc_sysroot_patch_hash() {
   local root patch_dir patch
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  patch_dir="$root/patches/wasix-libc"
-  while IFS= read -r patch; do
-    [[ -z "$patch" || "$patch" == \#* ]] && continue
-    cat "$patch_dir/$patch"
-  done < "$patch_dir/series" | sha256sum | cut -d' ' -f1
+  {
+    for patch_dir in "$root/patches/wasix-libc" "$root/patches/mimalloc"; do
+      while IFS= read -r patch; do
+        [[ -z "$patch" || "$patch" == \#* ]] && continue
+        cat "$patch_dir/$patch"
+      done < "$patch_dir/series"
+    done
+    echo "mimalloc ${MIMALLOC_TAG:?}"
+  } | sha256sum | cut -d' ' -f1
 }
 
 # The toolchain a service version is compiled and linked with, and the
@@ -441,6 +447,7 @@ sc_toolchain_identity() {
   echo "wasixcc: $WASIXCC_VERSION"
   echo "WASIX sysroot: $WASIX_SYSROOT_TAG"
   echo "WASIX sysroot patches: $(sc_sysroot_patch_hash)"
+  echo "mimalloc: $MIMALLOC_TAG"
   echo "WASIX LLVM: $WASIX_LLVM_TAG"
   echo "Binaryen: $BINARYEN_TAG"
   echo "Debug info: names"

@@ -1,0 +1,91 @@
+Subject: wasi: keep large and over-aligned allocations in the arenas
+
+WASI cannot shrink linear memory, and its primitive free is a no-op. An
+allocation that bypasses the arenas is therefore lost when it is freed. Two
+kinds of request bypass them: objects above the arena object limit, which is
+256 MiB with 32-bit sizes, and alignments above the over-allocation limit,
+which is one 32 KiB arena slice.
+
+Raise the default object limit to 2 GiB; `mi_arena_max_object_size` still
+applies the arena's own bound. Raise the over-allocation limit to half of
+MI_LARGE_PAGE_SIZE, 512 KiB with 32-bit sizes. That is as far as the page
+map allows: an over-aligned pointer lies up to `alignment` bytes into its
+page, and a page larger than MI_LARGE_PAGE_SIZE registers only its first
+MI_LARGE_PAGE_SIZE minus one slice, 992 KiB, so `mi_free` would not always
+find a pointer aligned to 1 MiB. With that limit at 1 MiB, the pointers lost
+were exactly those 992 KiB and 1 MiB into their page.
+
+What an arena still cannot satisfy, a larger alignment among it, fails with
+ENOMEM instead of falling back to a direct allocation. That trades the
+fallback for an earlier failure under fragmentation or near the memory
+limit; arena reservation already retries with a small arena. Builds for
+other systems are unchanged.
+
+diff --git a/include/mimalloc/types.h b/include/mimalloc/types.h
+--- a/include/mimalloc/types.h
++++ b/include/mimalloc/types.h
+@@ -507,7 +507,18 @@ typedef struct mi_page_s {
+ #define MI_PAGE_MIN_START_BLOCK_ALIGN     MI_MAX_ALIGN_SIZE         // minimal block alignment for the first block in a page (16b)
+ #define MI_PAGE_MAX_START_BLOCK_ALIGN2    (4*MI_KiB)                // maximal block alignment for "power of 2"-sized blocks (such that we guarantee natural alignment)
+ #define MI_PAGE_OSPAGE_BLOCK_ALIGN2       (4*MI_KiB)                // also aligns any multiple of this size to avoid TLB misses.
++#if defined(__wasi__)
++// WASI never gets a direct OS allocation back, so over-allocate in the arenas
++// for as large an alignment as the page map allows (512 KiB with 32-bit
++// sizes). An over-aligned pointer lies at most `alignment` bytes into its
++// page, and `mi_free` finds the page through the page map, where a page larger
++// than MI_LARGE_PAGE_SIZE registers only its first
++// MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE bytes (`mi_page_map_get_idx`): half
++// of MI_LARGE_PAGE_SIZE is always inside that, and all of it is not.
++#define MI_PAGE_MAX_OVERALLOC_ALIGN       (MI_LARGE_PAGE_SIZE/2)
++#else
+ #define MI_PAGE_MAX_OVERALLOC_ALIGN       MI_ARENA_SLICE_SIZE       // (64 KiB) limit for which we overallocate in arena pages, beyond this use OS allocation
++#endif
+ 
+ // The max object sizes are intended to not waste more than ~ 12.5% internally over the page sizes.
+ #define MI_SMALL_MAX_OBJ_SIZE             ((MI_SMALL_PAGE_SIZE-MI_PAGE_OSPAGE_BLOCK_ALIGN2)/6)   // = 10 KiB
+diff --git a/src/arena.c b/src/arena.c
+--- a/src/arena.c
++++ b/src/arena.c
+@@ -573,6 +573,15 @@ static void* mi_arena_os_alloc_aligned(
+   bool commit, bool allow_large,
+   mi_arena_id_t req_arena_id, mi_memid_t* memid)
+ {
++#if defined(__wasi__)
++  // The WASI primitive free is a no-op, so a direct allocation would be lost
++  // when freed: fail what an arena cannot satisfy. Arena reservations and the
++  // page map do not come through here; they call `_mi_os_alloc_aligned`.
++  MI_UNUSED(subproc); MI_UNUSED(size); MI_UNUSED(alignment); MI_UNUSED(align_offset);
++  MI_UNUSED(commit); MI_UNUSED(allow_large); MI_UNUSED(req_arena_id); MI_UNUSED(memid);
++  errno = ENOMEM;
++  return NULL;
++#else
+   // if we cannot use OS allocation, return NULL
+   if (mi_option_is_enabled(mi_option_disallow_os_alloc) || req_arena_id != _mi_arena_id_none()) {
+     errno = ENOMEM;
+@@ -585,6 +594,7 @@ static void* mi_arena_os_alloc_aligned(
+   else {
+     return _mi_os_alloc_aligned(subproc, size, alignment, commit, allow_large, memid);
+   }
++#endif
+ }
+ 
+ 
+diff --git a/src/options.c b/src/options.c
+--- a/src/options.c
++++ b/src/options.c
+@@ -57,8 +57,15 @@ int mi_version(void) {
+ #endif
+ 
+ #ifndef MI_DEFAULT_ARENA_MAX_OBJECT_SIZE
++#if defined(__wasi__)
++// 2 GiB, in KiB: keep large allocations in the arenas on WASI, where a direct
++// OS allocation is never reclaimed. `mi_arena_max_object_size` still applies
++// the arena's own limit.
++#define MI_DEFAULT_ARENA_MAX_OBJECT_SIZE   (2L*1024L*1024L)
++#else
+ #define MI_DEFAULT_ARENA_MAX_OBJECT_SIZE   ((MI_SIZE_BITS * MI_ARENA_MAX_CHUNK_OBJ_SIZE)/MI_KiB)  /* 2 GiB (or 256 MiB on 32-bit), larger than this is alloc'd by the OS */
+ #endif
++#endif
+ 
+ #ifndef MI_DEFAULT_DISALLOW_ARENA_ALLOC
+ #define MI_DEFAULT_DISALLOW_ARENA_ALLOC 0

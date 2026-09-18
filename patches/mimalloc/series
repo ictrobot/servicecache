@@ -1,0 +1,2 @@
+0001-wasi-use-pthreads-when-built-with-threads.patch
+0002-wasi-keep-large-and-over-aligned-allocations-in-the.patch

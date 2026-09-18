@@ -1,2 +1,3 @@
 0001-chdir-lock-relative-path-resolution.patch
 0002-pselect-encode-a-relative-timeout-in-nanoseconds.patch
+0003-add-mimalloc-as-a-malloc-implementation.patch

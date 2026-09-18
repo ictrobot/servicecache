@@ -4,7 +4,7 @@ SC_ENV_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ -z "${WASIXCC_VERSION:-}" || -z "${WASIX_SYSROOT_TAG:-}" ||
       -z "${WASIX_LLVM_TAG:-}" || -z "${BINARYEN_TAG:-}" ||
-      -z "${WASMER_VERSION:-}" ]]; then
+      -z "${WASMER_VERSION:-}" || -z "${MIMALLOC_TAG:-}" ]]; then
   source "$SC_ENV_ROOT/toolchain/versions.sh"
 fi
 

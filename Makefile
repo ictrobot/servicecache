@@ -59,7 +59,7 @@ help:
 	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
 	@echo "clean-services                  remove every service's build and output; keep source checkouts"
 	@echo "clean-wasmer                    reset every Wasmer variant (also clean-wasmer-<variant>)"
-	@echo "clean-wasix-libc                reset work/wasix-libc to the pristine tag so bootstrap re-applies the series"
+	@echo "clean-wasix-libc                reset work/wasix-libc and work/mimalloc to their pristine tags so bootstrap re-applies the series"
 	@echo "clean-service-<name>-<version>  the same for one service version"
 	@echo "purge-service-<name>-<version>  also remove its source checkout"
 	@echo "service-<name>                  (also smoke-/clean-/purge-/lifecycle-service-<name>) the same across every installed version"
@@ -122,6 +122,7 @@ clean-wasmer: $(CLEAN_WASMER_TARGETS)
 
 clean-wasix-libc:
 	git -C work/wasix-libc reset --quiet --hard && git -C work/wasix-libc clean --quiet -fdx
+	git -C work/mimalloc reset --quiet --hard && git -C work/mimalloc clean --quiet -fdx
 
 purge:
 	rm -rf work target
@@ -168,7 +169,8 @@ work/services/$(1)-$(2)/BUILD-INFO: services/$(1)/build.sh services/$(1)/service
     $$(wildcard services/$(1)/deps.sh) $$(shell find -L services/$(1)/libs -type f 2>/dev/null) \
     services/$(1)/versions/$(2)/version.env \
     $$(shell find -L services/$(1)/versions/$(2)/patches -type f) \
-    toolchain/versions.sh patches/wasix-libc/series $$(wildcard patches/wasix-libc/*.patch) | bootstrap
+    toolchain/versions.sh patches/wasix-libc/series $$(wildcard patches/wasix-libc/*.patch) \
+    patches/mimalloc/series $$(wildcard patches/mimalloc/*.patch) | bootstrap
 	services/$(1)/build.sh $(2)
 
 smoke-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO
