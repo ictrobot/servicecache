@@ -79,7 +79,8 @@ def main():
             try:
                 response = read_response(stream)
             except RuntimeError as exc:
-                if args.command[0].upper() == "SHUTDOWN" and str(exc) == "server closed the connection":
+                closed = str(exc) == "server closed the connection"
+                if args.command[0].upper() == "SHUTDOWN" and closed:
                     response = "OK"
                 else:
                     raise
@@ -97,4 +98,4 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         print(exc, file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

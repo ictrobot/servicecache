@@ -23,7 +23,7 @@ CLEAN_WASMER_TARGETS := $(addprefix clean-wasmer-,$(WASMER_VARIANTS))
 EXTENSION_NAMES := $(patsubst extensions/%/smoke.sh,%,$(wildcard extensions/*/smoke.sh))
 SMOKE_EXTENSION_TARGETS := $(addprefix smoke-extension-,$(EXTENSION_NAMES))
 
-.PHONY: help bootstrap setup-wasmer setup-wasmer-dev build build-release test lint check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions smoke-openssl lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
+.PHONY: help bootstrap setup-wasmer setup-wasmer-dev build build-release test lint lint-python check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions smoke-openssl lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
 .PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
 .PHONY: $(SERVICE_NAME_TARGETS) $(WASMER_TARGETS) $(TEST_WASMER_TARGETS) $(CLEAN_WASMER_TARGETS) $(SMOKE_EXTENSION_TARGETS)
@@ -45,7 +45,7 @@ help:
 	@echo "build                           setup-wasmer, then cargo build"
 	@echo "build-release                   setup-wasmer, then cargo build --release"
 	@echo "test                            setup-wasmer, then cargo test"
-	@echo "lint                            setup-wasmer, then cargo fmt --check, cargo clippy, cargo deny and the patch header checks"
+	@echo "lint                            setup-wasmer, then ruff (through uv), cargo fmt --check, cargo clippy, cargo deny and the patch header checks"
 	@echo "lifecycle-tests                 freeze and fork every built service through the host (quick matrix)"
 	@echo "lifecycle-tests-long            the same plus the long cases (thousands of forks)"
 	@echo "lifecycle-tests-release         the quick matrix on a release build, for latency figures"
@@ -86,12 +86,19 @@ build-release: setup-wasmer
 test: setup-wasmer
 	cargo test --workspace
 
-lint: setup-wasmer
+lint: setup-wasmer lint-python
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo deny -L error --config deny.toml check licenses bans
 	! grep -rniE 'mysql|mariadb|postgres|valkey|beanstalkd' crates/servicecache
 	toolchain/check-patches.sh
+
+# The developer tools, from the locked dev group in pyproject.toml. Nothing
+# a build runs needs them, or anything beyond an interpreter.
+lint-python:
+	uv sync --locked
+	uv run ruff check .
+	uv run ruff format --check .
 
 check: lint test smoke-toolchain
 

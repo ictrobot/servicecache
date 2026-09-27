@@ -1,0 +1,31 @@
+# The tooling is run from the checkout, never installed, so this table says
+# only what interpreter it requires and what ruff targets. `package = false`
+# keeps uv from building or installing anything from it.
+[project]
+name = "servicecache-tooling"
+version = "0"
+requires-python = ">=3.11"
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "ruff==0.16.6",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# The smoke adapters are Python scripts without the extension.
+extend-include = ["services/*/smoke/adapter"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # imports
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "SIM", # simplify
+]

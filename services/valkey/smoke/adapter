@@ -122,7 +122,7 @@ def blocking_request(host, port):
     client = Client(host, port, 12)
     try:
         reply = client.command("BLPOP", "adapter-block", "8")
-    except (socket.timeout, OSError) as exc:
+    except (TimeoutError, OSError) as exc:
         print(f"BLPOP ended with {exc}")
         return
     print(f"BLPOP ended with {reply}")

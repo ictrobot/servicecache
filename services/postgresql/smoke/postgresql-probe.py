@@ -92,20 +92,19 @@ def main() -> int:
     parser.add_argument("sql", nargs="+")
     args = parser.parse_args()
 
-    with socket.create_connection((args.host, args.port), timeout=2) as plain:
-        with (start_tls(plain) if args.tls else plain) as sock:
-            startup = (
-                b"user\0postgres\0database\0"
-                + args.database.encode()
-                + b"\0client_encoding\0UTF8\0\0"
-            )
-            sock.sendall(struct.pack("!II", len(startup) + 8, 196608) + startup)
-            wait_ready(sock)
-            for statement in args.sql:
-                for row in query(sock, statement):
-                    print("\t".join(
-                        "" if value is None else value for value in row))
-            sock.sendall(packet(b"X", b""))
+    with (
+        socket.create_connection((args.host, args.port), timeout=2) as plain,
+        start_tls(plain) if args.tls else plain as sock,
+    ):
+        startup = (
+            b"user\0postgres\0database\0" + args.database.encode() + b"\0client_encoding\0UTF8\0\0"
+        )
+        sock.sendall(struct.pack("!II", len(startup) + 8, 196608) + startup)
+        wait_ready(sock)
+        for statement in args.sql:
+            for row in query(sock, statement):
+                print("\t".join("" if value is None else value for value in row))
+        sock.sendall(packet(b"X", b""))
     return 0
 
 
@@ -114,4 +113,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (OSError, RuntimeError) as error:
         print(error, file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from error

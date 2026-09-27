@@ -96,7 +96,9 @@ def check_initialized(host, port):
 
 
 def metric(s, name):
-    return int(s.scalar(f"SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = '{name}'"))
+    return int(
+        s.scalar(f"SELECT COUNT FROM information_schema.INNODB_METRICS WHERE NAME = '{name}'")
+    )
 
 
 def status(s, name):
@@ -151,7 +153,12 @@ def diverge(host, port, tag):
 
 def check_diverged(host, port, tag):
     s = Session(host, port)
-    ids = [row[0] for row in s.rows("SELECT id FROM adapter.t WHERE id >= 1000000 AND id < 2000000 ORDER BY id")]
+    ids = [
+        row[0]
+        for row in s.rows(
+            "SELECT id FROM adapter.t WHERE id >= 1000000 AND id < 2000000 ORDER BY id"
+        )
+    ]
     expect(ids, [str(1000000 + int(tag))], f"clone {tag}'s own row")
     s.close()
 
@@ -159,9 +166,15 @@ def check_diverged(host, port, tag):
 def blocking_request(host, port):
     result = subprocess.run(
         [
-            "timeout", "20", sys.executable,
+            "timeout",
+            "20",
+            sys.executable,
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "mysql-probe.py"),
-            "--host", host, "--port", str(port), "SELECT SLEEP(3)",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "SELECT SLEEP(3)",
         ],
         capture_output=True,
         text=True,

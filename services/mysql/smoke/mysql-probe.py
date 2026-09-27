@@ -6,7 +6,6 @@ import socket
 import struct
 import sys
 
-
 CLIENT_LONG_PASSWORD = 0x00000001
 CLIENT_LONG_FLAG = 0x00000004
 CLIENT_PROTOCOL_41 = 0x00000200
@@ -69,9 +68,7 @@ def connect(host, port, user):
     position += 2
     if len(handshake) >= position + 13:
         position += 1 + 2
-        server_capabilities |= (
-            int.from_bytes(handshake[position : position + 2], "little") << 16
-        )
+        server_capabilities |= int.from_bytes(handshake[position : position + 2], "little") << 16
 
     wanted = (
         CLIENT_LONG_PASSWORD
@@ -179,4 +176,4 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         print(exc, file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

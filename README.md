@@ -16,7 +16,7 @@ Early development prototype. Interfaces, service packages and runtime patches ma
 
 - Linux on x86-64 or AArch64.
 - Rust, normally installed through [rustup](https://rustup.rs/).
-- Bash, Git, GNU Make, CMake, Perl, Bison, Flex, Python 3, curl, tar, `sha256sum` and `zic` (the tz compiler, from your libc or tzdata package).
+- Bash, Git, GNU Make, CMake, Perl, Bison, Flex, Python 3.11 or newer, curl, tar, `sha256sum` and `zic` (the tz compiler, from your libc or tzdata package).
 - Enough time and disk space for source builds. The pinned WASIX toolchain, source checkouts and database build trees can occupy multiple gigabytes.
 
 Project-generated toolchain, source and service state is kept below `work/`. Rust build output goes below `target/`.
@@ -80,7 +80,7 @@ The manager API is intended to be used by the same local user through its Unix s
 
 ## Development
 
-Common checks are exposed as Make targets:
+Common checks (`make lint` needs `uv` and `cargo-deny`):
 
 ```sh
 make lint                 # formatting and static checks

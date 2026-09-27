@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse
-from contextlib import ExitStack
 import os
 import socket
 import time
+from contextlib import ExitStack
 
 
 def read_line(stream):
@@ -34,13 +34,12 @@ def main():
 
     body = b"hello wasix"
     with ExitStack() as stack:
+
         def connect():
             deadline = time.monotonic() + 10
             while True:
                 try:
-                    connection = socket.create_connection(
-                        (args.host, args.port), timeout=5
-                    )
+                    connection = socket.create_connection((args.host, args.port), timeout=5)
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
