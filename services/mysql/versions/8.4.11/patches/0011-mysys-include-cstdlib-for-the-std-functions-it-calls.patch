@@ -1,0 +1,21 @@
+Subject: mysys: include <cstdlib> for the std:: functions it calls
+Last-Update: 2026-09-27
+
+my_malloc.cc calls std::malloc, std::calloc, std::realloc and std::free and
+includes only <stdlib.h>, which declares them in the global namespace.
+<cstdlib> declares them in std. Earlier libc++ releases brought <cstdlib>
+in through other standard headers; libc++ 23 does not, and the file does not
+compile against it. It includes the header it uses.
+
+diff --git a/mysys/my_malloc.cc b/mysys/my_malloc.cc
+index c2f72e3..aea00ed 100644
+--- a/mysys/my_malloc.cc
++++ b/mysys/my_malloc.cc
+@@ -30,6 +30,7 @@
+   @file mysys/my_malloc.cc
+ */
+ 
++#include <cstdlib>
+ #include <errno.h>
+ #include <stdlib.h>
+ #include <string.h>

@@ -1,0 +1,46 @@
+Subject: mysys: include <cstdlib> for the std:: functions it calls
+Last-Update: 2026-09-27
+
+my_malloc.cc and my_default.cc call std::malloc, std::free and their kin
+and include only <stdlib.h>, which declares them in the global namespace,
+and my_time.cc calls std::abs and includes neither. <cstdlib> declares all
+of them in std. Earlier libc++ releases brought <cstdlib> in through other
+standard headers; libc++ 23 does not, and the three files do not compile
+against it. Each includes the header it uses.
+
+diff --git a/mysys/my_default.cc b/mysys/my_default.cc
+index f39968f..c919be0 100644
+--- a/mysys/my_default.cc
++++ b/mysys/my_default.cc
+@@ -53,6 +53,7 @@
+ 
+ #include "my_config.h"
+ 
++#include <cstdlib>
+ #include <fcntl.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+diff --git a/mysys/my_malloc.cc b/mysys/my_malloc.cc
+index df7dcd5..3a13fd8 100644
+--- a/mysys/my_malloc.cc
++++ b/mysys/my_malloc.cc
+@@ -30,6 +30,7 @@
+   @file mysys/my_malloc.cc
+ */
+ 
++#include <cstdlib>
+ #include <errno.h>
+ #include <stdlib.h>
+ #include <string.h>
+diff --git a/mysys/my_time.cc b/mysys/my_time.cc
+index 7d57188..05cc326 100644
+--- a/mysys/my_time.cc
++++ b/mysys/my_time.cc
+@@ -51,6 +51,7 @@
+ #include <cctype>     // std::isspace
+ #include <climits>    // UINT_MAX
+ #include <cstdio>     // std::sprintf
++#include <cstdlib>    // std::abs
+ #include <cstring>    // std::memset
+ 
+ #include "field_types.h"     // enum_field_types

@@ -161,7 +161,7 @@ index 865abc2e..19c15b78 100644
  
 -IF(NOT CMAKE_CROSSCOMPILING)
 +# WASIX build tools can be executed by CMake through
-+# CMAKE_CROSSCOMPILING_EMULATOR (the workspace-local Wasmer runner).
++# CMAKE_CROSSCOMPILING_EMULATOR (the configured WASIX runner).
 +IF(NOT CMAKE_CROSSCOMPILING OR WASIX)
    MYSQL_ADD_EXECUTABLE(comp_err
      comp_err.cc

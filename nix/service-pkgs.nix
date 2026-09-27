@@ -30,7 +30,13 @@
   '';
 
   lib = {
-    inherit (pkgs.lib) optional;
+    inherit (pkgs.lib)
+      hasPrefix
+      optional
+      optionalAttrs
+      optionals
+      ;
+
     fileset = {
       inherit (pkgs.lib.fileset) toSource unions;
     };

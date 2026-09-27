@@ -2,10 +2,10 @@ Subject: innodb: use fsync() instead of fdatasync() under Wasmer
 Last-Update: 2026-09-27
 
 Works around a Wasmer bug, not a WASIX limitation. Observed with Wasmer
-7.3.0 (WASIX sysroot v2026-07-30.1, wasixcc 0.4.5), the newest release on
-2026-08-29: fdatasync() on a file that another thread is concurrently
-writing eventually never returns, and once it has stalled the process can
-no longer exit either. fsync() under the same concurrency is fine.
+7.3.0 (WASIX sysroot v2026-07-30.1), the newest release on 2026-08-29:
+fdatasync() on a file that another thread is concurrently writing
+eventually never returns, and once it has stalled the process can no longer
+exit either. fsync() under the same concurrency is fine.
 
 A small standalone WASIX program reproduces it without MySQL: one thread
 pwrite()s 8 KiB blocks to a file while a second thread loops fdatasync() on

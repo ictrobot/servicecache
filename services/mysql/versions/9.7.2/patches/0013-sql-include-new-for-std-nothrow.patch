@@ -1,0 +1,21 @@
+Subject: sql: include <new> for std::nothrow
+Last-Update: 2026-09-27
+
+The file service's implementation allocates with new (std::nothrow) and
+includes no header that declares std::nothrow; <new> does. Earlier libc++
+releases brought <new> in through other standard headers; libc++ 23 does
+not, and the file does not compile against it. It includes the header it
+uses.
+
+diff --git a/sql/server_component/mysql_file_imp.cc b/sql/server_component/mysql_file_imp.cc
+index 346b38f..7b5b7ad 100644
+--- a/sql/server_component/mysql_file_imp.cc
++++ b/sql/server_component/mysql_file_imp.cc
+@@ -25,6 +25,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+ 
+ #include <fcntl.h>
+ #include <mysql/components/service_implementation.h>
++#include <new>
+ #include "my_io.h"
+ #include "my_sys.h"
+ 

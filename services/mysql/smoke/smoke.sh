@@ -59,7 +59,7 @@ common_args=(
 # two guest threads resolving relative paths at once corrupted each other's
 # paths (wasix-libc chdir.c; the fix is
 # toolchain/sources/wasix-libc/patches/0001-chdir-lock-relative-path-resolution.patch,
-# built into the sysroot by toolchain/bootstrap.sh). A guest built against an
+# built into the sysroot by toolchain/libc.sh). A guest built against an
 # unpatched sysroot still has it, so a failed initialize is retried once,
 # loudly.
 initialized=false
