@@ -63,8 +63,10 @@ exampledb-1.2.3/
 ├── exampledbd.wasm      server
 ├── exampledb-cli.wasm   upstream client, used as the initializer
 ├── share/               read-only support files the server needs at runtime
-└── BUILD-INFO           upstream tag, ServiceCache commit, toolchain pins
+└── build-info.json      target and toolchain versions
 ```
+
+A service version built on the host by its `build.sh` records its upstream tag, ServiceCache commit and toolchain pins in `BUILD-INFO` instead.
 
 ### Manifest
 
@@ -98,3 +100,13 @@ args   = ["--host", "{host}", "--port", "{port}"]
 - `ready`, if present, is bytes the host writes to the guest's endpoint and a bytes regex the response must match before the guest is reported ready. It delays ready, and the initializer with it, where a server has a startup phase in which it answers connections with an error; and it ensures the server is actually in its accept loop before the template freezes. `send` is a byte string, printable ASCII with `\xNN` escapes, omitted where the server speaks first; write both fields in single-quoted TOML strings. Absent, listening is readiness.
 - `[initializer]` runs against the guest's endpoint with `{host}` and `{port}` substituted, receives the recipe on stdin, and must exit 0. The manager never interprets its arguments.
 - Manifests are plain files; the manager never merges or inherits them.
+
+## How guests are built
+
+A service version whose directory holds a `version.nix` is built through Nix; one with a `version.env` is built on the host by the service's `build.sh`, with the toolchain that `toolchain/bootstrap.sh` installs. `make service-<name>-<version>` does whichever applies.
+
+For a Nix-built service, `services/<name>/shared/` holds the package definition, the build script and the manifest, and `services/<name>/versions/<version>/` the upstream pins and patches. `nix/collect-services.nix` finds every such version, and the flake exposes it as `<name>-<version>` with dots replaced by underscores, such as `beanstalkd-1_13`, beside the smoke fixtures. The shared Nix helpers live in `nix/`, and `toolchain/` builds the guest toolchain from LLVM, wasix-libc and mimalloc, with every compiler flag in `toolchain/guest/guest.cfg`.
+
+The package definition names the upstream sources, which are fetched with only the files the build reads and kept as tars, and the ServiceCache files the build reads. The flake assembles those into a source directory with a manifest naming the tars, imports it (import from derivation) and builds the service from it with the guest toolchain. make links the output into `work/services` as a garbage-collection root.
+
+That directory is also the service's `.source` output, as a zstd tar with a `build.sh`. Extracted, it builds the service offline in a private store from the tools a prepare step downloads first.

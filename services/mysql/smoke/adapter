@@ -30,6 +30,7 @@ _spec = importlib.util.spec_from_loader(
         "mysql_probe", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mysql-probe.py")
     ),
 )
+assert _spec is not None and _spec.loader is not None
 probe = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(probe)
 

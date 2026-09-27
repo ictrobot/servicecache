@@ -8,8 +8,19 @@ let
   sources = lib.genAttrs [ "wasix-libc" "mimalloc" "llvm-project" ] (
     name: import (./sources + "/${name}") { inherit pkgs sc; }
   );
+  metadata = sc.collectMetadata (builtins.attrValues sources);
+  support = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions (
+      map (path: ./. + "/${path}") [
+        "guest-lib.sh"
+        "guest_artifacts.py"
+      ]
+    );
+  };
   runtimeRelease = sources.llvm-project.version;
   libcRelease = sources.wasix-libc.version;
+  mimallocRelease = sources.mimalloc.version;
   compiler = pkgs.llvmPackages_23;
   compilerDirectories = {
     SC_CLANG_DIR = compiler.clang-unwrapped;
@@ -79,18 +90,64 @@ let
         SC_OUT_DIR="$out" bash ${assembly}/assemble.sh
       '';
 
-  programs = [ guest ];
+  programs = [
+    guest
+    pkgs.binaryen
+  ];
+  requiredPrograms = [
+    compiler.clang-unwrapped
+    compiler.lld
+    compiler.llvm
+    pkgs.cmakeMinimal
+    pkgs.python3Minimal
+    pkgs.binaryen
+  ]
+  ++ lib.concatMap (source: source.requiredPrograms) (builtins.attrValues sources);
+  environment = {
+    SC_SYSROOT_DIR = "${sysroot}";
+  };
 in
 assert lib.versions.major compiler.release_version == lib.versions.major runtimeRelease;
 {
   inherit
     sources
+    support
     libc
     runtime
     sysroot
     guest
     programs
+    requiredPrograms
+    environment
     ;
+
+  buildMetadata = {
+    target = "wasm32-wasix";
+    tools = {
+      compiler = compiler.clang-unwrapped.version;
+      linker = compiler.lld.version;
+      wasm_opt = pkgs.binaryen.version;
+      wasix_sysroot = libcRelease;
+      mimalloc = mimallocRelease;
+      llvm_runtime = runtimeRelease;
+      debug_info = "names";
+    };
+  };
+
+  inherit (metadata) upstreamSources;
+  servicecacheFiles =
+    metadata.servicecacheFiles
+    // lib.listToAttrs (
+      map (name: lib.nameValuePair "toolchain/${name}" (./. + "/${name}")) [
+        "default.nix"
+        "guest"
+        "guest-lib.sh"
+        "guest_artifacts.py"
+        "libc.sh"
+        "runtime.sh"
+        "sysroot.sh"
+      ]
+    );
 
   smoke = pkgs.runCommand "toolchain-smoke" { nativeBuildInputs = programs; } ''
     SC_OUT_DIR="$out" bash ${script "smoke"}/build.sh

@@ -30,9 +30,62 @@ sc_patch_names() {
   done
 }
 
+# Use the configured interpreter, or python3, for all host Python commands.
+sc_python() {
+  SC_PYTHON="${SC_PYTHON:-python3}"
+  if ! "$SC_PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+    sc_fail "$SC_PYTHON must be Python 3.11 or newer; set SC_PYTHON to the interpreter to use"
+    return 1
+  fi
+  export SC_PYTHON
+  printf '%s\n' "$SC_PYTHON"
+}
+
+# sc_init service version: what a service's smoke test begins with. It sets
+# where the built service is looked for, work/services (SC_OUT), and the
+# Wasmer CLI toolchain/run-wasix.sh runs its modules under (SC_WASMER): stock,
+# or the extensions variant when the manifest declares extensions.
 sc_init() {
   if [[ $# -ne 2 ]]; then
     sc_fail "usage: sc_init service version"
+    return 1
+  fi
+
+  SC_SERVICE="$1"
+  SC_VERSION="$2"
+  SC_TOOLCHAIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  SC_ROOT="$(cd "$SC_TOOLCHAIN/.." && pwd)"
+  SC_WORK="$SC_ROOT/work"
+  SC_SERVICE_DIR="$SC_ROOT/services/$SC_SERVICE"
+  SC_OUT="$SC_WORK/services"
+
+  local manifest="$SC_OUT/$SC_SERVICE-$SC_VERSION/service.toml" extensions
+  [[ -f "$manifest" ]] || { sc_fail "built service manifest not found: $manifest"; return 1; }
+  extensions="$("$(sc_python)" -c 'import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    print(" ".join(tomllib.load(f)["service"].get("extensions", [])))' "$manifest")" || return 1
+
+  local variant=stock
+  if [[ -n "$extensions" ]]; then
+    variant=extensions
+  fi
+  "$SC_ROOT/wasmer/build.sh" "$variant" >/dev/null || return 1
+  SC_WASMER="$SC_WORK/wasmer/$variant/bin/wasmer"
+  if [[ -n "$extensions" ]]; then
+    echo "$SC_SERVICE $SC_VERSION: extensions $extensions," \
+      "modules run under ${SC_WASMER#"$SC_ROOT/"}" >&2
+  fi
+
+  export SC_SERVICE SC_VERSION SC_ROOT SC_WORK SC_TOOLCHAIN SC_WASMER
+  export SC_SERVICE_DIR SC_OUT
+}
+
+# sc_host_init service version: what a build.sh begins with for a service
+# version built on the host, with the toolchain toolchain/bootstrap.sh
+# installs and the pins its version.env and toolchain/versions.sh set.
+sc_host_init() {
+  if [[ $# -ne 2 ]]; then
+    sc_fail "usage: sc_host_init service version"
     return 1
   fi
 
@@ -316,7 +369,7 @@ sc_strip() {
 
   # Drop DWARF but keep the name section, which binaryen writes only with -g.
   mkdir -p "$(dirname "$output")"
-  "${SC_WASM_OPT:?sc_init must run before sc_strip}" --strip-dwarf -g "$input" -o "$output"
+  "${SC_WASM_OPT:?sc_host_init must run before sc_strip}" --strip-dwarf -g "$input" -o "$output"
   chmod +x "$output"
 }
 
@@ -479,7 +532,7 @@ sc_reset_build_state() {
 # relink nothing and its old binaries would be assembled under a BUILD-INFO
 # naming the new one. The build directory carries the identity of the
 # toolchain that built it; when that is missing or differs from the current
-# one, the build state is reset before building. Call it after sc_init and
+# one, the build state is reset before building. Call it after sc_host_init and
 # before sc_checkout.
 #
 # A build whose make also misses other inputs changing, such as its configure

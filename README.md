@@ -16,11 +16,12 @@ Early development prototype. Interfaces, service packages and runtime patches ma
 
 - Linux on x86-64 or AArch64.
 - Rust, normally installed through [rustup](https://rustup.rs/).
-- Bash, Git, GNU Make, CMake, Perl, Bison, Flex, Python 3.11 or newer, curl, tar, `sha256sum` and `zic` (the tz compiler, from your libc or tzdata package).
+- Bash, Git, GNU Make, CMake, Perl, Bison, Flex, curl, tar, `sha256sum` and `zic` (the tz compiler, from your libc or tzdata package).
+- Python 3.11 or newer as `python3` (`SC_PYTHON` overrides the interpreter).
 - An installed single-user or multi-user [Nix](https://nixos.org/download).
 - Enough time and disk space for source builds. The pinned WASIX toolchain, source checkouts and database build trees can occupy multiple gigabytes.
 
-Project-generated toolchain, source and service state is kept below `work/`. Rust build output goes below `target/`.
+Project-generated toolchain, source and service state is kept below `work/`. Services built through Nix live in its store, linked from `work/services`. Rust build output goes below `target/`.
 
 ## Quick start
 
@@ -85,17 +86,17 @@ Common checks (`make lint` needs `uv`, `cargo-deny`, and Nix):
 
 ```sh
 make lint                 # formatting and static checks
-make test                 # Rust unit and integration tests
+make test                 # Python and Rust tests
 make smoke-toolchain      # build and run the WASIX fixtures
-make smoke-services       # smoke-test the built service packages
-make lifecycle-tests      # freeze and fork every built service
+make smoke-services       # build and smoke-test every service version
+make lifecycle-tests      # build every service and test freeze/fork
 ```
 
 `make build` and `make test` develop the Rust host with Cargo and do not need Nix. Wasmer CLIs for smoke tests build through Nix.
 
-The smoke and lifecycle matrices use artifacts below `work/services`, so build the relevant services first. Most targets also come in per-service and per-version forms, such as `smoke-service-mariadb` and `lifecycle-service-mariadb-11.8.9`.
+Smoke and lifecycle targets build the services they need into `work/services`. Use targets such as `smoke-service-mariadb` or `lifecycle-service-mariadb-11.8.9` to test fewer versions.
 
-To profile a host and its guests with perf, see [PROFILING.md](PROFILING.md).
+See [ARCHITECTURE.md](ARCHITECTURE.md#how-guests-are-built) for the build layout and [PROFILING.md](PROFILING.md) for perf profiling.
 
 ## License
 

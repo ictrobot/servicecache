@@ -51,7 +51,10 @@ class Client:
         raise SystemExit(f"unexpected reply: {line}")
 
     def info(self, section, field):
-        for line in self.command("INFO", section).splitlines():
+        text = self.command("INFO", section)
+        if not isinstance(text, str):
+            raise SystemExit(f"unexpected INFO reply: {text!r}")
+        for line in text.splitlines():
             if line.startswith(field + ":"):
                 return line.split(":", 1)[1].strip()
         return None
@@ -97,9 +100,9 @@ def check_working(host, port):
     if not eventually(10, freed):
         raise SystemExit("lazy freeing did not progress")
     expect(client.command("DBSIZE"), "0")
-    uptime = int(client.info("server", "uptime_in_seconds"))
+    uptime = int(client.info("server", "uptime_in_seconds") or 0)
     time.sleep(1.1)
-    later = int(client.info("server", "uptime_in_seconds"))
+    later = int(client.info("server", "uptime_in_seconds") or 0)
     if later <= uptime:
         raise SystemExit(f"the server clock stopped: {uptime} -> {later}")
     expect(client.command("SET", "adapter-after", "ok"), "OK")

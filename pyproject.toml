@@ -1,6 +1,7 @@
 # The tooling is run from the checkout, never installed, so this table says
-# only what interpreter it requires and what ruff targets. `package = false`
-# keeps uv from building or installing anything from it.
+# only what interpreter it requires: the floor the tooling enforces,
+# what ruff targets and what pyright checks against. `package = false` keeps
+# uv from building or installing anything from it.
 [project]
 name = "servicecache-tooling"
 version = "0"
@@ -11,6 +12,7 @@ package = false
 
 [dependency-groups]
 dev = [
+    "pyright==1.1.411",
     "ruff==0.16.6",
 ]
 
@@ -19,6 +21,7 @@ target-version = "py311"
 line-length = 100
 # The smoke adapters are Python scripts without the extension.
 extend-include = ["services/*/smoke/adapter"]
+src = ["toolchain"]
 
 [tool.ruff.lint]
 select = [
@@ -29,3 +32,17 @@ select = [
     "B",   # bugbear
     "SIM", # simplify
 ]
+
+[tool.pyright]
+pythonVersion = "3.11"
+# The smoke adapters are Python scripts without the extension.
+include = [
+    "services",
+    "services/beanstalkd/smoke/adapter",
+    "services/mariadb/smoke/adapter",
+    "services/mysql/smoke/adapter",
+    "services/postgresql/smoke/adapter",
+    "services/valkey/smoke/adapter",
+    "toolchain",
+]
+strict = ["toolchain"]

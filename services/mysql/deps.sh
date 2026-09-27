@@ -2,7 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/../../toolchain/lib.sh"
-sc_init mysql "${1:?usage: ${BASH_SOURCE[0]} version}"
+sc_host_init mysql "${1:?usage: ${BASH_SOURCE[0]} version}"
 
 # MySQL 8.4 and later bundle Boost; 8.0 pins the release to download.
 case "${BOOST_VERSION:-}" in

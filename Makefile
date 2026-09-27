@@ -3,17 +3,34 @@
 
 .DEFAULT_GOAL := help
 
-SERVICE_VERSION_FILES := $(wildcard services/*/versions/*/version.env)
-SERVICE_TARGETS := $(foreach file,$(SERVICE_VERSION_FILES),service-$(word 2,$(subst /, ,$(file)))-$(word 4,$(subst /, ,$(file))))
+# One interpreter for every Python the tooling runs, checked once here and
+# exported so that scripts and sub-makes inherit it. sc_python in lib.sh
+# reports on standard error if the selected interpreter is unavailable or too old.
+SC_PYTHON := $(shell bash -c 'source toolchain/lib.sh && sc_python')
+ifeq ($(SC_PYTHON),)
+$(error Python 3.11 or newer is required; set SC_PYTHON to the interpreter to use)
+endif
+export SC_PYTHON
+
+# A service version with a version.nix is built through Nix; one with a
+# version.env is built on the host by its build.sh.
+NIX_SERVICE_VERSION_FILES := $(wildcard services/*/versions/*/version.nix)
+HOST_SERVICE_VERSION_FILES := $(wildcard services/*/versions/*/version.env)
+SERVICE_VERSION_FILES := $(NIX_SERVICE_VERSION_FILES) $(HOST_SERVICE_VERSION_FILES)
+NIX_SERVICE_TARGETS := $(foreach file,$(NIX_SERVICE_VERSION_FILES),service-$(word 2,$(subst /, ,$(file)))-$(word 4,$(subst /, ,$(file))))
+HOST_SERVICE_TARGETS := $(foreach file,$(HOST_SERVICE_VERSION_FILES),service-$(word 2,$(subst /, ,$(file)))-$(word 4,$(subst /, ,$(file))))
+SERVICE_TARGETS := $(NIX_SERVICE_TARGETS) $(HOST_SERVICE_TARGETS)
+SOURCE_TAR_BUILD_TARGETS := $(addsuffix -from-source-tar,$(NIX_SERVICE_TARGETS))
 SMOKE_SERVICE_TARGETS := $(addprefix smoke-,$(SERVICE_TARGETS))
 CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
-PURGE_SERVICE_TARGETS := $(addprefix purge-,$(SERVICE_TARGETS))
+PURGE_SERVICE_TARGETS := $(addprefix purge-,$(HOST_SERVICE_TARGETS))
 RUN_TARGETS := $(patsubst service-%,run-%,$(SERVICE_TARGETS))
 REQUEST_TARGETS := $(patsubst service-%,request-%,$(SERVICE_TARGETS))
 LIFECYCLE_SERVICE_TARGETS := $(addprefix lifecycle-,$(SERVICE_TARGETS))
 # Per-name aggregates that fan out to every installed version of a service.
 SERVICE_NAMES := $(sort $(foreach file,$(SERVICE_VERSION_FILES),$(word 2,$(subst /, ,$(file)))))
-SERVICE_NAME_TARGETS := $(foreach verb,service smoke-service clean-service purge-service lifecycle-service,$(addprefix $(verb)-,$(SERVICE_NAMES)))
+HOST_SERVICE_NAMES := $(sort $(foreach file,$(HOST_SERVICE_VERSION_FILES),$(word 2,$(subst /, ,$(file)))))
+SERVICE_NAME_TARGETS := $(foreach verb,service smoke-service clean-service lifecycle-service,$(addprefix $(verb)-,$(SERVICE_NAMES))) $(addprefix purge-service-,$(HOST_SERVICE_NAMES))
 
 # Wasmer variants: build, test and clean targets per wasmer/<variant>/.
 WASMER_VARIANTS := $(patsubst wasmer/%/patches.list,%,$(wildcard wasmer/*/patches.list))
@@ -23,18 +40,19 @@ CLEAN_WASMER_TARGETS := $(addprefix clean-wasmer-,$(WASMER_VARIANTS))
 EXTENSION_NAMES := $(patsubst extensions/%/smoke.sh,%,$(wildcard extensions/*/smoke.sh))
 SMOKE_EXTENSION_TARGETS := $(addprefix smoke-extension-,$(EXTENSION_NAMES))
 
-.PHONY: help bootstrap setup-wasmer setup-wasmer-dev build build-release test lint lint-python check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions smoke-openssl lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
+.PHONY: help bootstrap setup-wasmer setup-wasmer-dev build build-release test test-python lint lint-python check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions smoke-openssl lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer clean-wasix-libc purge
-.PHONY: $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
+.PHONY: $(SOURCE_TAR_BUILD_TARGETS) $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(PURGE_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
 .PHONY: $(SERVICE_NAME_TARGETS) $(WASMER_TARGETS) $(TEST_WASMER_TARGETS) $(CLEAN_WASMER_TARGETS) $(SMOKE_EXTENSION_TARGETS)
 
 help:
 	@echo "bootstrap                       install the pinned WASIX toolchain into work/toolchains"
 	@echo "services                        build every service version into work/services"
-	@echo "service-<name>-<version>        bootstrap if needed, then build one service version"
+	@echo "service-<name>-<version>        build through Nix and link the selected output into work/services; a version with a version.env: bootstrap if needed, then its build.sh"
+	@echo "service-<name>-<version>-from-source-tar build into work/services-from-source-tar"
 	@echo "smoke                           run every smoke test"
 	@echo "smoke-toolchain                 build the toolchain fixtures through Nix, copy them to work/build/toolchain-smoke and run them under Wasmer"
-	@echo "smoke-services                  smoke-test every built service version"
+	@echo "smoke-services                  build and smoke-test every service version"
 	@echo "smoke-service-<name>-<version>  build if needed, then smoke-test one service version"
 	@echo "smoke-extensions                run every Wasmer extension's demo ($(EXTENSION_NAMES))"
 	@echo "smoke-extension-<name>          run one extension's demo under the extensions CLI; stock must refuse it"
@@ -44,9 +62,9 @@ help:
 	@echo "test-wasmer-<variant>           run the Wasmer variant's unit tests through Nix"
 	@echo "build                           setup-wasmer, then cargo build"
 	@echo "build-release                   setup-wasmer, then cargo build --release"
-	@echo "test                            setup-wasmer, then cargo test"
-	@echo "lint                            setup-wasmer, then ruff (through uv), cargo fmt --check, cargo clippy, cargo deny, the patch header checks and the flake's checks"
-	@echo "lifecycle-tests                 freeze and fork every built service through the host (quick matrix)"
+	@echo "test                            setup-wasmer, then the Python unit tests and cargo test"
+	@echo "lint                            setup-wasmer, then ruff and pyright (through uv), cargo fmt --check, cargo clippy, cargo deny, the patch header checks and the flake's checks"
+	@echo "lifecycle-tests                 build every service, then freeze and fork each through the host (quick matrix)"
 	@echo "lifecycle-tests-long            the same plus the long cases (thousands of forks)"
 	@echo "lifecycle-tests-release         the quick matrix on a release build, for latency figures"
 	@echo "lifecycle-tests-long-release    the long matrix on a release build"
@@ -57,11 +75,11 @@ help:
 	@echo "request-<name>-<version>        request an instance from the running manager; RECIPE=<file> feeds the initializer"
 	@echo "check                           lint, test and smoke-toolchain"
 	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
-	@echo "clean-services                  remove every service's build and output; keep source checkouts"
+	@echo "clean-services                  remove every service's output, and host builds' build trees; keep source checkouts"
 	@echo "clean-wasmer                    remove Wasmer CLI output links (also clean-wasmer-<variant>)"
 	@echo "clean-wasix-libc                reset work/wasix-libc and work/mimalloc to their pristine tags so bootstrap re-applies the series"
 	@echo "clean-service-<name>-<version>  the same for one service version"
-	@echo "purge-service-<name>-<version>  also remove its source checkout"
+	@echo "purge-service-<name>-<version>  for a version built on the host, also remove its source checkout"
 	@echo "service-<name>                  (also smoke-/clean-/purge-/lifecycle-service-<name>) the same across every installed version"
 	@echo "purge                           remove work/ and target/ entirely, including the toolchain"
 
@@ -83,8 +101,11 @@ build: setup-wasmer
 build-release: setup-wasmer
 	cargo build --release --workspace
 
-test: setup-wasmer
+test: setup-wasmer test-python
 	cargo test --workspace
+
+test-python:
+	$(SC_PYTHON) -m unittest toolchain/guest_artifacts.py
 
 lint: setup-wasmer lint-python
 	cargo fmt --all --check
@@ -100,19 +121,20 @@ lint-python:
 	uv sync --locked
 	uv run ruff check .
 	uv run ruff format --check .
+	uv run pyright
 
 check: lint test smoke-toolchain
 
-lifecycle-tests: setup-wasmer
+lifecycle-tests: services setup-wasmer
 	SERVICECACHE_LIFECYCLE=1 cargo test --test lifecycle
 
-lifecycle-tests-long: setup-wasmer
+lifecycle-tests-long: services setup-wasmer
 	SERVICECACHE_LIFECYCLE=1 cargo test --test lifecycle -- --include-ignored
 
-lifecycle-tests-release: setup-wasmer
+lifecycle-tests-release: services setup-wasmer
 	SERVICECACHE_LIFECYCLE=1 cargo test --release --test lifecycle
 
-lifecycle-tests-long-release: setup-wasmer
+lifecycle-tests-long-release: services setup-wasmer
 	SERVICECACHE_LIFECYCLE=1 cargo test --release --test lifecycle -- --include-ignored
 
 serve: setup-wasmer
@@ -167,7 +189,34 @@ endef
 
 $(foreach variant,$(WASMER_VARIANTS),$(eval $(call wasmer_variant_rules,$(variant))))
 
-define service_version_rules
+# The targets that use a built service version wait for its build target:
+# Nix decides for itself whether anything needs building.
+define nix_service_version_rules
+service-$(1)-$(2):
+	toolchain/service.sh $(1) $(2)
+
+service-$(1)-$(2)-from-source-tar:
+	tools/build-source-tar.sh $(1) $(2)
+
+smoke-service-$(1)-$(2): service-$(1)-$(2)
+	services/$(1)/smoke/smoke.sh $(2)
+
+run-$(1)-$(2): service-$(1)-$(2) | setup-wasmer
+	SERVICECACHE_SERVICES_DIR=work/services cargo run --release -- run $(1)@$(2) $$(if $$(RECIPE),--recipe $$(RECIPE)) $$(if $$(CLONES),--clones $$(CLONES))
+
+request-$(1)-$(2): | setup-wasmer
+	cargo run -- request $(1)@$(2) $$(if $$(RECIPE),--recipe $$(RECIPE))
+
+lifecycle-service-$(1)-$(2): service-$(1)-$(2) | setup-wasmer
+	SERVICECACHE_LIFECYCLE=1 cargo test --test lifecycle -- '$(1)::$(2)::'
+
+clean-service-$(1)-$(2):
+	rm -rf work/services/$(1)-$(2)
+endef
+
+$(foreach file,$(NIX_SERVICE_VERSION_FILES),$(eval $(call nix_service_version_rules,$(word 2,$(subst /, ,$(file))),$(word 4,$(subst /, ,$(file))))))
+
+define host_service_version_rules
 service-$(1)-$(2): bootstrap
 	services/$(1)/build.sh $(2)
 
@@ -198,7 +247,7 @@ purge-service-$(1)-$(2):
 	toolchain/clean.sh --sources $(1) $(2)
 endef
 
-$(foreach file,$(SERVICE_VERSION_FILES),$(eval $(call service_version_rules,$(word 2,$(subst /, ,$(file))),$(word 4,$(subst /, ,$(file))))))
+$(foreach file,$(HOST_SERVICE_VERSION_FILES),$(eval $(call host_service_version_rules,$(word 2,$(subst /, ,$(file))),$(word 4,$(subst /, ,$(file))))))
 
 # service-<name>, smoke-service-<name>, clean-service-<name>,
 # purge-service-<name>, lifecycle-service-<name>: every version of that
@@ -209,8 +258,8 @@ define service_name_rules
 service-$(1): $(filter service-$(1)-%,$(SERVICE_TARGETS))
 smoke-service-$(1): $(filter smoke-service-$(1)-%,$(SMOKE_SERVICE_TARGETS))
 clean-service-$(1): $(filter clean-service-$(1)-%,$(CLEAN_SERVICE_TARGETS))
-purge-service-$(1): $(filter purge-service-$(1)-%,$(PURGE_SERVICE_TARGETS))
-lifecycle-service-$(1): $(patsubst service-$(1)-%,work/services/$(1)-%/BUILD-INFO,$(filter service-$(1)-%,$(SERVICE_TARGETS))) | setup-wasmer
+lifecycle-service-$(1): $(filter service-$(1)-%,$(NIX_SERVICE_TARGETS)) $(patsubst service-$(1)-%,work/services/$(1)-%/BUILD-INFO,$(filter service-$(1)-%,$(HOST_SERVICE_TARGETS))) | setup-wasmer
 	SERVICECACHE_LIFECYCLE=1 cargo test --test lifecycle -- '$(1)::'
 endef
 $(foreach name,$(SERVICE_NAMES),$(eval $(call service_name_rules,$(name))))
+$(foreach name,$(HOST_SERVICE_NAMES),$(eval purge-service-$(name): $(filter purge-service-$(name)-%,$(PURGE_SERVICE_TARGETS))))

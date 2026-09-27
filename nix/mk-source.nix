@@ -1,12 +1,23 @@
 { pkgs, lib }:
 {
   name,
+  key,
   version,
   upstream,
   tarHash,
   patches ? [ ],
+  servicecacheFiles ? { },
 }:
 let
+  upstreamInfo = builtins.intersectAttrs {
+    url = null;
+    urls = null;
+    rev = null;
+    gitRepoUrl = null;
+    outputHash = null;
+    outputHashAlgo = null;
+    outputHashMode = null;
+  } upstream;
   stage = ''
     set -euo pipefail
     staging="$NIX_BUILD_TOP/reduced-source"
@@ -33,14 +44,17 @@ let
     outputHashMode = "flat";
     outputHash = tarHash;
   };
+  # What extracting and patching the tar runs. An offline build's prepare step
+  # downloads them with the rest of the closure.
+  requiredPrograms = [
+    pkgs.gnutar
+    pkgs.gitMinimal
+  ];
   tree =
     pkgs.runCommand name
       {
         inherit version patches;
-        nativeBuildInputs = [
-          pkgs.gnutar
-          pkgs.gitMinimal
-        ];
+        nativeBuildInputs = requiredPrograms;
       }
       ''
         tar -xf ${tar}
@@ -58,5 +72,20 @@ assert lib.assertMsg (upstream ? scSelection) "mkSource requires a selected upst
     tar
     tree
     version
+    servicecacheFiles
+    requiredPrograms
     ;
+  upstreamSources.${key} = {
+    inherit tar;
+    metadata = {
+      file = tar.name;
+      upstream = upstreamInfo;
+      selection = upstream.scSelection;
+      sha256 = builtins.convertHash {
+        hash = tarHash;
+        hashAlgo = "sha256";
+        toHashFormat = "base16";
+      };
+    };
+  };
 }

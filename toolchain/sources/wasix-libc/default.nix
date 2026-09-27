@@ -8,6 +8,7 @@ let
 in
 sc.mkSource {
   inherit version;
+  key = "wasix-libc";
   name = "wasix-libc-${version}";
   upstream = sc.fetchSelectedArchive {
     url = "https://github.com/wasix-org/wasix-libc/archive/${pin.rev}.tar.gz";
@@ -21,4 +22,5 @@ sc.mkSource {
   };
   patches = sc.patchSeries ./patches;
   tarHash = "sha256-FJH7k/G93FDAA5n3G1Z9hSsFOmBYsL8Crw1FkSw+10g=";
+  servicecacheFiles."toolchain/sources/wasix-libc" = ./.;
 }

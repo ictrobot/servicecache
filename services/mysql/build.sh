@@ -2,7 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../../toolchain/lib.sh"
-sc_init mysql "${1:?usage: $0 version}"
+sc_host_init mysql "${1:?usage: $0 version}"
 sc_clean_if_toolchain_changed
 : "${SC_SOURCE_URL:=https://github.com/mysql/mysql-server.git}"
 : "${MYSQL_TAG:=mysql-$SC_VERSION}"

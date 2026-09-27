@@ -8,6 +8,7 @@ let
 in
 sc.mkSource {
   inherit version;
+  key = "llvm-project";
   name = "llvm-project-${version}";
   upstream = sc.fetchSelectedGit {
     url = "https://github.com/llvm/llvm-project.git";
@@ -128,4 +129,5 @@ sc.mkSource {
   };
   patches = sc.patchSeries ./patches;
   tarHash = "sha256-5CA38g7eltR9cUNnePCa6Dk9d9c0U9z/gRw1h9qh95o=";
+  servicecacheFiles."toolchain/sources/llvm-project" = ./.;
 }

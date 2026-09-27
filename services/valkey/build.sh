@@ -2,7 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../../toolchain/lib.sh"
-sc_init valkey "${1:?usage: $0 version}"
+sc_host_init valkey "${1:?usage: $0 version}"
 sc_clean_if_toolchain_changed
 : "${SC_SOURCE_URL:=https://github.com/valkey-io/valkey.git}"
 : "${VALKEY_TAG:=$SC_VERSION}"

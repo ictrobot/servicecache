@@ -35,8 +35,11 @@ options=(--extra-experimental-features "nix-command flakes")
 install="install single-user or multi-user Nix (https://nixos.org/download)"
 
 nix="$(command -v nix)" || fail "no nix on PATH; $install"
-"$nix" "${options[@]}" store info >/dev/null ||
+# nix store info reports on standard error; show it only when the check fails.
+if ! store_info="$("$nix" "${options[@]}" store info 2>&1 >/dev/null)"; then
+  printf '%s\n' "$store_info" >&2
   fail "$nix cannot access its store; check this user's Nix installation or daemon access"
+fi
 
 case "$command" in
   build)

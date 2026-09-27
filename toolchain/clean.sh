@@ -14,7 +14,7 @@ if [[ "${1:-}" == "--sources" ]]; then
   sources=1
   shift
 fi
-sc_init "${1:?usage: $0 [--sources] service version}" \
+sc_host_init "${1:?usage: $0 [--sources] service version}" \
   "${2:?usage: $0 [--sources] service version}"
 
 rm -rf "$SC_OUT/$SC_SERVICE-$SC_VERSION"

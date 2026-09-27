@@ -111,6 +111,8 @@ def query(sock, sql):
         return []
 
     column_count, _ = read_lenenc(first)
+    if column_count is None:
+        raise RuntimeError("NULL column count")
     columns = []
     for _ in range(column_count):
         _, packet = read_packet(sock)
@@ -118,6 +120,8 @@ def query(sock, sql):
         fields = []
         for _ in range(6):
             length, offset = read_lenenc(packet, offset)
+            if length is None:
+                raise RuntimeError("NULL column definition field")
             fields.append(packet[offset : offset + length].decode(errors="replace"))
             offset += length
         columns.append(fields[4])

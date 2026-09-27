@@ -8,6 +8,7 @@ let
 in
 sc.mkSource {
   inherit version;
+  key = "mimalloc";
   name = "mimalloc-${version}";
   upstream = sc.fetchSelectedArchive {
     url = "https://github.com/microsoft/mimalloc/archive/${pin.rev}.tar.gz";
@@ -36,4 +37,5 @@ sc.mkSource {
   };
   patches = sc.patchSeries ./patches;
   tarHash = "sha256-hK2JSpXDY9oh2UdGflz3VCpimpDokLKARm7HqmCMaIU=";
+  servicecacheFiles."toolchain/sources/mimalloc" = ./.;
 }

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../../toolchain/lib.sh"
-sc_init postgresql "${1:?usage: $0 version}"
+sc_host_init postgresql "${1:?usage: $0 version}"
 source "$SC_SERVICE_DIR/deps.sh" "$SC_VERSION"
 # PostgreSQL's makefiles, without --enable-depend, rebuild nothing when
 # configure rewrites pg_config.h, and relink nothing when OpenSSL's libraries

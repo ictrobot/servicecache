@@ -1,5 +1,8 @@
-# Shared constructors and the guest toolchain built with them.
-{ pkgs }:
+# Shared constructors and build context. Service discovery belongs to collect-services.nix.
+{
+  pkgs,
+  buildMetadata ? { },
+}:
 let
   inherit (pkgs) lib;
   base = {
@@ -7,10 +10,23 @@ let
     fetchSelectedGit = import ./fetch-selected-git.nix { inherit pkgs lib; };
     fetchSelectedArchive = import ./fetch-selected-archive.nix { inherit pkgs lib; };
     patchSeries = import ./patch-series.nix { inherit lib; };
+    collectMetadata = import ./collect-metadata.nix { inherit lib; };
+    mkServiceSource = import ./mk-service-source.nix { inherit pkgs lib; };
   };
   toolchain = import ../toolchain {
     inherit pkgs;
     sc = base;
   };
 in
-base // { inherit toolchain; }
+base
+// {
+  inherit toolchain;
+  mkGuestBuild = import ./mk-guest-build.nix {
+    inherit
+      pkgs
+      lib
+      toolchain
+      buildMetadata
+      ;
+  };
+}
