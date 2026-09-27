@@ -11,7 +11,7 @@ sc_copy_source "$SC_SOURCE_BEANSTALKD_DIR" "$tree"
 sc_guest make -C "$tree" -j"$JOBS" all \
   OS=linux \
   USE_SYSTEMD=no \
-  CC=guest-cc \
+  CC="${SC_CCACHE:+$SC_CCACHE }guest-cc" \
   CFLAGS=-O2 \
   LDLIBS=""
 

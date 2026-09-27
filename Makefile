@@ -14,6 +14,7 @@ export SC_PYTHON
 
 SERVICE_VERSION_FILES := $(wildcard services/*/versions/*/version.nix)
 SERVICE_TARGETS := $(foreach file,$(SERVICE_VERSION_FILES),service-$(word 2,$(subst /, ,$(file)))-$(word 4,$(subst /, ,$(file))))
+CCACHE_SERVICE_TARGETS := $(addprefix ccache-,$(SERVICE_TARGETS))
 SOURCE_TAR_BUILD_TARGETS := $(addsuffix -from-source-tar,$(SERVICE_TARGETS))
 SMOKE_SERVICE_TARGETS := $(addprefix smoke-,$(SERVICE_TARGETS))
 CLEAN_SERVICE_TARGETS := $(addprefix clean-,$(SERVICE_TARGETS))
@@ -34,12 +35,13 @@ SMOKE_EXTENSION_TARGETS := $(addprefix smoke-extension-,$(EXTENSION_NAMES))
 
 .PHONY: help setup-wasmer setup-wasmer-dev build build-release test test-python lint lint-python check serve services services-list smoke smoke-toolchain smoke-services smoke-extensions smoke-openssl lifecycle-tests lifecycle-tests-long lifecycle-tests-release lifecycle-tests-long-release
 .PHONY: clean clean-services clean-wasmer purge
-.PHONY: $(SOURCE_TAR_BUILD_TARGETS) $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
+.PHONY: $(CCACHE_SERVICE_TARGETS) $(SOURCE_TAR_BUILD_TARGETS) $(SERVICE_TARGETS) $(SMOKE_SERVICE_TARGETS) $(CLEAN_SERVICE_TARGETS) $(RUN_TARGETS) $(REQUEST_TARGETS) $(LIFECYCLE_SERVICE_TARGETS)
 .PHONY: $(SERVICE_NAME_TARGETS) $(WASMER_TARGETS) $(TEST_WASMER_TARGETS) $(CLEAN_WASMER_TARGETS) $(SMOKE_EXTENSION_TARGETS)
 
 help:
 	@echo "services                        build every service version into work/services"
 	@echo "service-<name>-<version>        build through Nix and link the selected output into work/services"
+	@echo "ccache-service-<name>-<version> build the separate ccache output and link it into work/services"
 	@echo "service-<name>-<version>-from-source-tar build into work/services-from-source-tar"
 	@echo "smoke                           run every smoke test"
 	@echo "smoke-toolchain                 build the toolchain fixtures through Nix, copy them to work/build/toolchain-smoke and run them under Wasmer"
@@ -176,6 +178,9 @@ $(foreach variant,$(WASMER_VARIANTS),$(eval $(call wasmer_variant_rules,$(varian
 define service_version_rules
 service-$(1)-$(2):
 	toolchain/service.sh $(1) $(2)
+
+ccache-service-$(1)-$(2):
+	toolchain/service.sh --ccache $(1) $(2)
 
 service-$(1)-$(2)-from-source-tar:
 	tools/build-source-tar.sh $(1) $(2)

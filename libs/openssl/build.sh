@@ -22,8 +22,8 @@ sc_copy_source "$SC_SOURCE_OPENSSL_DIR" "$build_dir"
 (
   cd "$build_dir"
   sc_guest env \
-    CC=guest-cc \
-    CXX=guest-c++ \
+    CC="${SC_CCACHE:+$SC_CCACHE }guest-cc" \
+    CXX="${SC_CCACHE:+$SC_CCACHE }guest-c++" \
     AR=guest-ar \
     RANLIB=guest-ranlib \
     CFLAGS="-DUSE_TIMEGM -DOPENSSL_NO_SECURE_MEMORY -DOPENSSL_NO_DGRAM -DOPENSSL_THREADS -O2" \

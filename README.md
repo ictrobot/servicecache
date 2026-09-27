@@ -96,6 +96,8 @@ make lifecycle-tests      # build every service and test freeze/fork
 
 Smoke and lifecycle targets build the services they need into `work/services`. Use targets such as `smoke-service-mariadb` or `lifecycle-service-mariadb-11.8.9` to test fewer versions.
 
+A service can also be built through ccache, for example with `make ccache-service-mariadb-11.8.9`. Trusted users (including single-user Nix) mount `work/ccache` at `/ccache` for that invocation; with a daemon the sandbox writes there as a `nixbld` user, so the directory must be writable by them. Untrusted users need the daemon configured with a writable `/ccache` mount.
+
 See [ARCHITECTURE.md](ARCHITECTURE.md#how-guests-are-built) for the build layout and [PROFILING.md](PROFILING.md) for perf profiling.
 
 ## License

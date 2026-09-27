@@ -48,7 +48,7 @@ configure_args=(
   sc_guest env \
     CONFIG_SHELL="$BASH" \
     ZIC="wasix-runner $build/src/timezone/zic" \
-    CC=guest-cc \
+    CC="${SC_CCACHE:+$SC_CCACHE }guest-cc" \
     AR=guest-ar \
     RANLIB=guest-ranlib \
     CPPFLAGS="-I$SC_EXTENSION_ICTROBOT_SHM_V1_DIR -include $atomic_sigatomic_header" \

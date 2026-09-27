@@ -38,7 +38,7 @@ sc_copy_source "$SC_SOURCE_VALKEY_DIR" "$tree"
 # a guest module is linked once and never relocated. The server and the
 # client build with the libraries' options plus their own.
 deps_options=(
-  CC=guest-cc
+  CC="${SC_CCACHE:+$SC_CCACHE }guest-cc"
   AR=guest-ar
   RANLIB=guest-ranlib
   BUILD_TLS=no

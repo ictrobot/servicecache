@@ -72,6 +72,14 @@ build_options=(
   -DWITH_ICU=bundled
   -DWITH_PROTOBUF=bundled
 )
+# An optional compiler launcher.
+launcher_options=()
+if [[ -n "${SC_CCACHE:-}" ]]; then
+  launcher_options=(
+    -DCMAKE_C_COMPILER_LAUNCHER="$SC_CCACHE"
+    -DCMAKE_CXX_COMPILER_LAUNCHER="$SC_CCACHE"
+  )
+fi
 
 # CMake compiles by absolute path, so paths under the build directory are
 # mapped to relative ones before they reach the modules. No install prefix:
@@ -80,6 +88,7 @@ build_options=(
 file_prefix_map="-ffile-prefix-map=$SC_BUILD_DIR/="
 sc_guest cmake -S "$source_dir" -B "$guest_build" \
   -G "Unix Makefiles" \
+  "${launcher_options[@]}" \
   "${build_options[@]}" \
   "${series_options[@]}" \
   -DCMAKE_TOOLCHAIN_FILE="$SC_TOOLCHAIN/guest/toolchain.cmake" \

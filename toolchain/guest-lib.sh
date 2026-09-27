@@ -21,9 +21,16 @@ sc_library_init() {
 sc_build_environment() {
   PATH="$(sc_store_path)" || return 1
   export PATH
+  if [[ -n "${SC_CCACHE:-}" ]]; then
+    SC_CCACHE="$(command -v "$SC_CCACHE")" || return 1
+    if [[ -n "${CCACHE_DIR:-}" && ! -w "$CCACHE_DIR" ]]; then
+      sc_fail "ccache requires a writable $CCACHE_DIR sandbox mount; configure its directory, permissions and Nix sandbox-paths"
+      return 1
+    fi
+  fi
   mkdir -p "$SC_BUILD_DIR" "$SC_OUT_DIR"
   export SOURCE_DATE_EPOCH=315532800 GIT_CEILING_DIRECTORIES="$SC_BUILD_DIR"
-  export SC_BUILD_DIR SC_OUT_DIR JOBS SC_VERSION
+  export SC_BUILD_DIR SC_OUT_DIR SC_CCACHE JOBS SC_VERSION
 }
 
 # Both native and guest steps run only the programs supplied by Nix.
@@ -41,7 +48,7 @@ sc_store_path() {
 # Nixpkgs' native compiler hooks and flags must not reach guest compilation.
 # A step can add a setting explicitly with sc_guest env NAME=value command.
 SC_GUEST_ENVIRONMENT=(
-  TMPDIR TERM JOBS SOURCE_DATE_EPOCH GIT_CEILING_DIRECTORIES 'SC_*'
+  TMPDIR TERM JOBS SOURCE_DATE_EPOCH GIT_CEILING_DIRECTORIES 'SC_*' 'CCACHE_*'
 )
 
 sc_guest() {
