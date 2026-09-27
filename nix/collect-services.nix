@@ -11,7 +11,7 @@ let
     else
       [ ];
   scope = lib.makeScope lib.callPackageWith (self: {
-    inherit sc;
+    inherit sc lib;
   });
   servicePackages = lib.concatMapAttrs (
     name: _:
