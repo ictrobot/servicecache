@@ -14,6 +14,8 @@ let
     fileset = lib.fileset.unions (
       map (path: ./. + "/${path}") [
         "guest-lib.sh"
+        "guest/toolchain.cmake"
+        "guest/no-pic.cmake"
         "guest_artifacts.py"
       ]
     );
@@ -70,7 +72,7 @@ let
   '';
 
   # What the assembly reads of the ServiceCache source: the script and the
-  # configuration file it fills in.
+  # configuration file it fills in, and not the CMake files beside them.
   assembly = lib.fileset.toSource {
     root = ./. + "/guest";
     fileset = lib.fileset.unions [

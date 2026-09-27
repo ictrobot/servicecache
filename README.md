@@ -25,7 +25,7 @@ Project-generated toolchain, source and service state is kept below `work/`. Ser
 
 ## Quick start
 
-Build a service. The first build also installs the pinned WASIX toolchain:
+Build a service. Nix builds or reuses its pinned sources and guest toolchain:
 
 ```sh
 make service-mariadb-11.8.9

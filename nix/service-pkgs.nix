@@ -3,6 +3,7 @@
 {
   inherit (pkgs)
     bison
+    cmakeMinimal
     flex
     perl
     python3Minimal

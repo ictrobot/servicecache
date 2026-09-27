@@ -1,0 +1,52 @@
+Subject: build: take libfmt and PCRE2 from prepared source trees
+Last-Update: 2026-09-27
+
+Both bundled libraries are fetched by ExternalProject_Add from a URL, which
+needs the network at configure time and unpacks a second copy of a tree the
+caller may already have. Accept LIBFMT_SOURCE_DIR and PCRE2_SOURCE_DIR: when
+either is set, the external project is given that directory as its source and
+no download or extraction step is configured. Unset, both are fetched from
+their URLs.
+
+diff --git a/cmake/libfmt.cmake b/cmake/libfmt.cmake
+--- a/cmake/libfmt.cmake
++++ b/cmake/libfmt.cmake
+@@ -12,7 +12,12 @@ MACRO(BUNDLE_LIBFMT)
+     SET(fmt_byproducts BUILD_BYPRODUCTS ${LIBFMT_INCLUDE_DIR}/fmt/format-inl.h)
+   ENDIF()
+
+-  IF(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "4.9")
++  IF(LIBFMT_SOURCE_DIR)
++    # A source tree prepared by the caller: nothing to download or unpack.
++    SET(LIBFMT_INCLUDE_DIR "${LIBFMT_SOURCE_DIR}/include")
++    SET(fmt_byproducts)
++    SET(source SOURCE_DIR "${LIBFMT_SOURCE_DIR}")
++  ELSEIF(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "4.9")
+     # it's for RHEL-7, gcc 4.8.5
+     # with newer fmt it complains about missing space in operator""_a()
+     SET(source URL "https://github.com/fmtlib/fmt/releases/download/11.0.2/fmt-11.0.2.zip"
+diff --git a/cmake/pcre.cmake b/cmake/pcre.cmake
+--- a/cmake/pcre.cmake
++++ b/cmake/pcre.cmake
+@@ -63,11 +63,19 @@ MACRO(BUNDLE_PCRE2)
+     SET(CMAKE_MSVC_RUNTIME_LIBRARY_ARG)
+   ENDIF()
+
++  IF(PCRE2_SOURCE_DIR)
++    # A source tree prepared by the caller: nothing to download or unpack.
++    SET(pcre2_source SOURCE_DIR "${PCRE2_SOURCE_DIR}")
++  ELSE()
++    SET(pcre2_source
++      URL "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.47/pcre2-10.47.zip"
++      URL_MD5 7906aec38f872b74f1b925122dde9069)
++  ENDIF()
++
+   ExternalProject_Add(
+     pcre2
+     PREFIX   "${dir}"
+-    URL "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.47/pcre2-10.47.zip"
+-    URL_MD5 7906aec38f872b74f1b925122dde9069
++    ${pcre2_source}
+     INSTALL_COMMAND ""
+     CMAKE_ARGS
+       "-DCMAKE_WARN_DEPRECATED=FALSE"
