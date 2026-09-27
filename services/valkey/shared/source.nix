@@ -1,11 +1,12 @@
 {
-  lib,
+  pkgs,
   sc,
   version,
   versionData,
   versionDirectory,
 }:
 let
+  inherit (pkgs) lib;
   pin = versionData.upstream;
 in
 sc.mkSource {

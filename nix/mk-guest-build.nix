@@ -9,12 +9,18 @@
   version,
   script,
   sources,
-  manifest,
+  libraries ? { },
+  extensions ? { },
+  manifest ? null,
   nativeBuildInputs ? [ ],
+  environment ? { },
 }:
 let
   metadata = import ./collect-metadata.nix { inherit lib; } (
-    [ toolchain ] ++ builtins.attrValues sources
+    [ toolchain ]
+    ++ builtins.attrValues sources
+    ++ builtins.attrValues libraries
+    ++ builtins.attrValues extensions
   );
   variable = kind: key: "SC_${kind}_${lib.toUpper (lib.replaceStrings [ "-" ] [ "_" ] key)}_DIR";
   inputs =
@@ -25,17 +31,21 @@ let
     ++ [ pkgs.python3Minimal ]
     ++ nativeBuildInputs
     ++ lib.concatMap (source: source.requiredPrograms) (builtins.attrValues sources)
+    ++ lib.concatMap (library: library.requiredPrograms or [ ]) (builtins.attrValues libraries)
+    ++ lib.concatMap (extension: extension.requiredPrograms or [ ]) (builtins.attrValues extensions)
   );
 in
 pkgs.runCommand "${name}-${version}"
   (
     toolchain.environment
     // inputs "SOURCE" sources (upstreamSource: upstreamSource.tree)
+    // inputs "LIBRARY" libraries (library: library)
+    // inputs "EXTENSION" extensions (extension: extension.directory)
+    // environment
     // {
       nativeBuildInputs = toolchain.programs ++ [ pkgs.python3Minimal ] ++ nativeBuildInputs;
       SC_TOOLCHAIN = toolchain.support;
       SC_PYTHON = "${pkgs.python3Minimal}/bin/python3";
-      SC_MANIFEST = manifest;
       passAsFile = [ "SERVICECACHE_METADATA" ];
       SERVICECACHE_METADATA = builtins.toJSON (
         toolchain.buildMetadata
@@ -44,13 +54,16 @@ pkgs.runCommand "${name}-${version}"
           metadata = buildMetadata;
           service = { inherit name version; };
           dependencies = lib.mapAttrs (_: dependency: dependency.version) (
-            builtins.removeAttrs sources [ name ]
+            builtins.removeAttrs sources [ name ] // libraries
           );
         }
       );
       passthru = metadata // {
         inherit version sources requiredPrograms;
       };
+    }
+    // lib.optionalAttrs (manifest != null) {
+      SC_MANIFEST = manifest;
     }
   )
   ''

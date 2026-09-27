@@ -16,7 +16,7 @@ Early development prototype. Interfaces, service packages and runtime patches ma
 
 - Linux on x86-64 or AArch64.
 - Rust, normally installed through [rustup](https://rustup.rs/).
-- Bash, Git, GNU Make, CMake, Perl, Bison, Flex, curl, tar, `sha256sum` and `zic` (the tz compiler, from your libc or tzdata package).
+- Bash, Git, GNU Make, CMake, Perl, Bison, curl, tar and `sha256sum`.
 - Python 3.11 or newer as `python3` (`SC_PYTHON` overrides the interpreter).
 - An installed single-user or multi-user [Nix](https://nixos.org/download).
 - Enough time and disk space for source builds. The pinned WASIX toolchain, source checkouts and database build trees can occupy multiple gigabytes.

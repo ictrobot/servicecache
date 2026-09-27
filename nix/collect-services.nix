@@ -4,14 +4,24 @@
 let
   inherit (pkgs) lib;
   sc = import ./default.nix { inherit pkgs buildMetadata; };
+  servicePkgs = import ./service-pkgs.nix { inherit pkgs; };
   directories =
     path:
     if builtins.pathExists path then
       builtins.attrNames (lib.filterAttrs (_: type: type == "directory") (builtins.readDir path))
     else
       [ ];
+  libraryNames = lib.filter (name: builtins.pathExists (../libs + "/${name}/default.nix")) (
+    directories ../libs
+  );
+  extensionNames = lib.filter (name: builtins.pathExists (../extensions + "/${name}/default.nix")) (
+    directories ../extensions
+  );
   scope = lib.makeScope lib.callPackageWith (self: {
-    inherit sc lib;
+    pkgs = servicePkgs;
+    inherit sc;
+    extensions = lib.genAttrs extensionNames (name: self.callPackage (../extensions + "/${name}") { });
+    libraries = lib.genAttrs libraryNames (name: self.callPackage (../libs + "/${name}") { });
   });
   servicePackages = lib.concatMapAttrs (
     name: _:
@@ -35,7 +45,15 @@ let
 in
 {
   services = servicePackages;
-  smoke = {
-    smoke-toolchain = sc.toolchain.smoke;
-  };
+  smoke =
+    lib.concatMapAttrs (
+      name: extension:
+      lib.optionalAttrs (extension ? smoke) { "smoke-extension-${name}" = extension.smoke; }
+    ) scope.extensions
+    // lib.concatMapAttrs (
+      name: package: lib.optionalAttrs (package ? smoke) { "smoke-${name}" = package.smoke; }
+    ) scope.libraries
+    // {
+      smoke-toolchain = sc.toolchain.smoke;
+    };
 }

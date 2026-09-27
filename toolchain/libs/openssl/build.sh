@@ -46,7 +46,7 @@ done
 # Whether the directory already holds a complete WASIX build of this version of
 # OpenSSL: both static libraries, headers that announce the version asked for,
 # the datagram support and exit cleanup this build does without, the target
-# wasix.conf describes, built from the wasix.conf in this directory, and real
+# wasix.conf describes, built from libs/openssl/wasix.conf, and real
 # pthread locking rather than the no-op the configuration falls back to when it
 # decides the platform has no threads.
 openssl_ready() {
@@ -67,7 +67,7 @@ openssl_ready() {
   grep -Eq '^# *define SIXTY_FOUR_BIT$' "$config_header" || return 1
   ! grep -q 'OPENSSL_NO_ASM' "$config_header" || return 1
   ! grep -q 'OPENSSL_NO_EC_NISTP_64_GCC_128' "$config_header" || return 1
-  cmp -s "$lib_dir/wasix.conf" "$install_dir/wasix.conf" || return 1
+  cmp -s "$SC_ROOT/libs/openssl/wasix.conf" "$install_dir/wasix.conf" || return 1
   "$WASIXCC_DIR/bin/wasixnm" --defined-only --print-file-name \
     "$install_dir/lib/libcrypto.a" 2>/dev/null |
     grep -E 'libcrypto-lib-threads_pthread[.]o: .* T CRYPTO_THREAD_lock_new$' \
@@ -111,7 +111,7 @@ mkdir -p "$build_dir"
     LD="$WASIXCC_DIR/bin/wasixld" \
     CFLAGS="--target=wasm32-wasix -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -ftls-model=local-exec -fno-trapping-math -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -DUSE_TIMEGM -DOPENSSL_NO_SECURE_MEMORY -DOPENSSL_NO_DGRAM -DOPENSSL_THREADS -O2" \
     LDFLAGS="-Wl,--allow-undefined" \
-    "$source_dir/Configure" --config="$lib_dir/wasix.conf" wasix-wasm32 \
+    "$source_dir/Configure" --config="$SC_ROOT/libs/openssl/wasix.conf" wasix-wasm32 \
       --prefix="$install_dir" \
       --libdir=lib \
       -static \
@@ -131,5 +131,5 @@ mkdir -p "$build_dir"
 
 make -C "$build_dir" -j"$jobs" build_libs
 make -C "$build_dir" install_dev
-cp "$lib_dir/wasix.conf" "$install_dir/wasix.conf"
+cp "$SC_ROOT/libs/openssl/wasix.conf" "$install_dir/wasix.conf"
 openssl_ready || { sc_fail "OpenSSL verification failed after installation"; exit 1; }

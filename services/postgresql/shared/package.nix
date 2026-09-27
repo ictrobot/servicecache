@@ -2,13 +2,14 @@
   pkgs,
   sc,
   version,
+  libraries,
+  extensions,
 }:
 let
   versionDirectory = ../versions + "/${version}";
   versionData = import (versionDirectory + "/version.nix");
-  valkeySource = import ./source.nix {
+  postgresqlSource = import ./source.nix {
     inherit
-      pkgs
       sc
       version
       versionData
@@ -18,11 +19,19 @@ let
   versionManifest = versionDirectory + "/service.toml";
 in
 sc.mkGuestBuild {
-  name = "valkey";
+  name = "postgresql";
   inherit version;
   script = ./build.sh;
   manifest = if builtins.pathExists versionManifest then versionManifest else ./service.toml;
   sources = {
-    valkey = valkeySource;
+    postgresql = postgresqlSource;
   };
+  nativeBuildInputs = with pkgs; [
+    perl
+    bison
+    flex
+    wasixRunner
+  ];
+  libraries = { inherit (libraries) openssl; };
+  extensions = { inherit (extensions) ictrobot_shm_v1; };
 }

@@ -8,7 +8,7 @@
  * mapping; partial unmaps are not part of version 1.  The public wrappers
  * return zero on success, or -1 and set errno on failure.
  *
- * The ABI is specified in this directory's README.  A module using it
+ * The ABI is specified in the parent directory's README.  A module using it
  * imports the ictrobot_shm_v1 namespace and instantiates only on a runtime
  * that provides it.
  *

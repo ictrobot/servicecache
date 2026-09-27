@@ -12,6 +12,12 @@ sc_build_init() {
   sc_build_environment
 }
 
+sc_library_init() {
+  SC_LIBRARY="$1"
+  SC_VERSION="$2"
+  sc_build_environment
+}
+
 sc_build_environment() {
   PATH="$(sc_store_path)" || return 1
   export PATH

@@ -40,7 +40,7 @@ All of `address`, `length` and `offset` must be multiples of `page`, and
 
 Both return a WASI errno: 0 on success. The C declarations, and thin
 wrappers that convert the errno into the usual -1-and-`errno`
-convention, are in [`ictrobot_shm_v1.h`](ictrobot_shm_v1.h).
+convention, are in [`ictrobot_shm_v1.h`](include/ictrobot_shm_v1.h).
 
 ### fd_map(fd, address, length, offset) → errno
 

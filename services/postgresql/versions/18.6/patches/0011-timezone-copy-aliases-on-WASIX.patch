@@ -1,0 +1,22 @@
+Subject: timezone: copy aliases on WASIX
+Last-Update: 2026-09-27
+
+Wasmer keeps symbolic links in memory instead of writing them into the
+mounted build directory. Use zic's file-copy fallback so timezone aliases
+survive the generator's exit and are included in the assembled service.
+
+diff --git a/src/timezone/zic.c b/src/timezone/zic.c
+--- a/src/timezone/zic.c
++++ b/src/timezone/zic.c
+@@ -18,6 +18,11 @@
+
+ #include "private.h"
+ #include "tzfile.h"
++
++#ifdef __wasi__
++/* Persist timezone aliases through the file-copy fallback. */
++#undef HAVE_SYMLINK
++#endif
+
+ #define	ZIC_VERSION_PRE_2013 '2'
+ #define	ZIC_VERSION	'3'

@@ -55,7 +55,7 @@ help:
 	@echo "smoke-services                  build and smoke-test every service version"
 	@echo "smoke-service-<name>-<version>  build if needed, then smoke-test one service version"
 	@echo "smoke-extensions                run every Wasmer extension's demo ($(EXTENSION_NAMES))"
-	@echo "smoke-extension-<name>          run one extension's demo under the extensions CLI; stock must refuse it"
+	@echo "smoke-extension-<name>          build one extension's demo through Nix and run it under the extensions CLI; stock must refuse it"
 	@echo "setup-wasmer                    prepare the servicecache Wasmer variant the host builds against"
 	@echo "setup-wasmer-dev                put work/wasmer-dev's exported branches at the committed patch sets (clones it if missing)"
 	@echo "wasmer-<variant>                build a Wasmer CLI with Nix and link it into work/wasmer/<variant> ($(WASMER_VARIANTS))"
@@ -162,15 +162,15 @@ services: $(SERVICE_TARGETS)
 
 smoke: smoke-toolchain smoke-services smoke-extensions smoke-openssl
 
-smoke-openssl: bootstrap
-	toolchain/libs/openssl/smoke.sh
+smoke-openssl: wasmer-stock
+	libs/openssl/smoke.sh
 
 smoke-services: $(SMOKE_SERVICE_TARGETS)
 
 smoke-extensions: $(SMOKE_EXTENSION_TARGETS)
 
 define extension_rules
-smoke-extension-$(1): bootstrap wasmer-extensions
+smoke-extension-$(1): wasmer-extensions wasmer-stock
 	extensions/$(1)/smoke.sh
 endef
 
