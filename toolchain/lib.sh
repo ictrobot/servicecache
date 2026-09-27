@@ -5,6 +5,31 @@ sc_fail() {
   return 1
 }
 
+# sc_patch_names patch-directory: print every patch name in bytewise filename
+# order. The sequence number in each name is the patch application order.
+sc_patch_names() {
+  if [[ $# -ne 1 ]]; then
+    sc_fail "usage: sc_patch_names patch-directory"
+    return 1
+  fi
+
+  local patch_dir="$1" patch name
+  local LC_ALL=C
+  local -a patches=("$patch_dir"/*.patch)
+  if [[ ! -f "${patches[0]}" ]]; then
+    sc_fail "no patch files found in $patch_dir"
+    return 1
+  fi
+  for patch in "${patches[@]}"; do
+    name="${patch##*/}"
+    if [[ ! "$name" =~ ^[0-9]{4}-.+\.patch$ ]]; then
+      sc_fail "patch filename must start with a four-digit sequence number: $patch"
+      return 1
+    fi
+    printf '%s\n' "$name"
+  done
+}
+
 sc_init() {
   if [[ $# -ne 2 ]]; then
     sc_fail "usage: sc_init service version"
@@ -174,20 +199,12 @@ sc_checkout() {
 # sc_series_stamps patch-directory...: the .sc-applied lines that applying
 # the series in order leaves behind.
 sc_series_stamps() {
-  local patch_dir patch_name
+  local patch_dir patch_name patches
   for patch_dir in "$@"; do
-    if [[ ! -f "$patch_dir/series" ]]; then
-      sc_fail "patch series not found: $patch_dir/series"
-      return 1
-    fi
+    patches="$(sc_patch_names "$patch_dir")" || return 1
     while IFS= read -r patch_name; do
-      [[ -z "$patch_name" || "$patch_name" == \#* ]] && continue
-      if [[ ! -f "$patch_dir/$patch_name" ]]; then
-        sc_fail "series entry not found: $patch_dir/$patch_name"
-        return 1
-      fi
       echo "$(sha256sum "$patch_dir/$patch_name" | cut -d' ' -f1)  $patch_name"
-    done < "$patch_dir/series"
+    done <<< "$patches"
   done
 }
 
@@ -236,7 +253,6 @@ sc_apply_series() {
 
   local patch_dir="$1"
   local source_dir="$2"
-  local series_file="$patch_dir/series"
   local expected_tag="${SC_UPSTREAM_TAG:?sc_checkout must run before sc_apply_series}"
 
   if ! git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
@@ -253,25 +269,16 @@ sc_apply_series() {
     echo "expected:      ${expected_commit:-tag not found}" >&2
     return 1
   fi
-  if [[ ! -f "$series_file" ]]; then
-    sc_fail "patch series not found: $series_file"
-    return 1
-  fi
-
   # Every applied patch is recorded here with its content hash, so that a
   # rerun recognises it even when a later patch in the series changed the
   # same lines and the patch no longer reverse-applies on its own. The file
   # is untracked, so resetting the checkout (git clean) forgets it too.
   local stamp_file="$source_dir/.sc-applied"
 
-  local patch_name patch_path patch_hash
+  local patch_name patch_path patch_hash patches
+  patches="$(sc_patch_names "$patch_dir")" || return 1
   while IFS= read -r patch_name; do
-    [[ -z "$patch_name" || "$patch_name" == \#* ]] && continue
     patch_path="$patch_dir/$patch_name"
-    if [[ ! -f "$patch_path" ]]; then
-      sc_fail "series entry not found: $patch_path"
-      return 1
-    fi
     patch_hash="$(sha256sum "$patch_path" | cut -d' ' -f1)"
 
     if [[ -f "$stamp_file" ]] && grep -qxF "$patch_hash  $patch_name" "$stamp_file"; then
@@ -291,7 +298,7 @@ sc_apply_series() {
       echo "reset it to the pristine tag and rerun: make clean-wasmer, clean-wasix-libc or clean-service-<name>-<version>" >&2
       return 1
     fi
-  done < "$series_file"
+  done <<< "$patches"
 }
 
 sc_strip() {
@@ -422,18 +429,18 @@ sc_check_guest_imports() {
 
 # The content hash of what the sysroot's libc carries beyond its tag: the
 # patch series for wasix-libc and for the mimalloc built into it
-# (patches/wasix-libc, patches/mimalloc, each in series order) and the
+# (patches/wasix-libc, patches/mimalloc, each in filename order) and the
 # mimalloc tag. It is what toolchain/bootstrap.sh stamps each rebuilt libc.a
 # with, and what BUILD-INFO records.
 sc_sysroot_patch_hash() {
-  local root patch_dir patch
+  local root patch_dir patch patches
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   {
     for patch_dir in "$root/patches/wasix-libc" "$root/patches/mimalloc"; do
+      patches="$(sc_patch_names "$patch_dir")" || return 1
       while IFS= read -r patch; do
-        [[ -z "$patch" || "$patch" == \#* ]] && continue
         cat "$patch_dir/$patch"
-      done < "$patch_dir/series"
+      done <<< "$patches"
     done
     echo "mimalloc ${MIMALLOC_TAG:?}"
   } | sha256sum | cut -d' ' -f1

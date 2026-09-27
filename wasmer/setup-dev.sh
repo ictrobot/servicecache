@@ -35,18 +35,20 @@ fi
 # from..to reproduces the set. The export alone cannot tell a branch left
 # on an older from, since a range only subtracts.
 branch_current() {
-  local from="$1" to="$2" set_dir="$3" export_dir patch same=1
+  local from="$1" to="$2" set_dir="$3" export_dir patch exported committed same=1
   git -C "$checkout" rev-parse --verify --quiet "refs/heads/$to" >/dev/null || return 1
   git -C "$checkout" merge-base --is-ancestor "$from" "$to" 2>/dev/null || return 1
   export_dir="$(mktemp -d "$root/work/wasmer-dev-export.XXXXXX")"
   if sc_wasmer_export_range "$checkout" "$from" "$to" "$export_dir" 2>/dev/null &&
-     cmp -s "$export_dir/series" "$set_dir/series"; then
+     exported="$(sc_patch_names "$export_dir")" &&
+     committed="$(sc_patch_names "$set_dir")" &&
+     [[ "$exported" == "$committed" ]]; then
     while IFS= read -r patch; do
       if ! cmp -s "$export_dir/$patch" "$set_dir/$patch"; then
         same=0
         break
       fi
-    done < "$set_dir/series"
+    done <<< "$committed"
   else
     same=0
   fi
@@ -113,8 +115,8 @@ for ((i = first_stale; i < ${#sets[@]}; i++)); do
   read -r from to set_dir <<< "${sets[$i]}"
   old="$(git -C "$checkout" rev-parse --verify --quiet --short "refs/heads/$to" || true)"
   git -C "$worktree" checkout --quiet --detach "$from"
+  patches="$(sc_patch_names "$root/$set_dir")"
   while IFS= read -r patch; do
-    [[ -z "$patch" || "$patch" == \#* ]] && continue
     {
       echo "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001"
       echo "From: $ident"
@@ -123,7 +125,7 @@ for ((i = first_stale; i < ${#sets[@]}; i++)); do
       echo "could not apply $set_dir/$patch on $from" >&2
       exit 1
     }
-  done < "$root/$set_dir/series"
+  done <<< "$patches"
   git -C "$worktree" branch --force "$to" HEAD
   echo "rebuilt $to from $set_dir${old:+ (was $old, still in its reflog)}"
 done

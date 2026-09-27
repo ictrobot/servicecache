@@ -22,15 +22,15 @@ sc_wasmer_load_variant() {
 # sc_wasmer_sets_hash: content hash of the loaded variant's patch sets (and
 # the pinned tag), for stamping built CLIs so a changed series rebuilds.
 sc_wasmer_sets_hash() {
-  local root set patch
+  local root set patch patches
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   {
     echo "v$WASMER_VERSION"
     for set in $WASMER_PATCH_SETS; do
+      patches="$(sc_patch_names "$root/$set")" || return 1
       while IFS= read -r patch; do
-        [[ -z "$patch" || "$patch" == \#* ]] && continue
         cat "$root/$set/$patch"
-      done < "$root/$set/series"
+      done <<< "$patches"
     done
   } | sha256sum | cut -d' ' -f1
 }
@@ -45,8 +45,8 @@ sc_wasmer_dev_sets() {
 }
 
 # sc_wasmer_export_range <checkout> <from> <to> <directory>: write the
-# commits from..to as the directory's patch set and series. Each file
-# keeps its Subject and body and then the diff, like the service series.
+# commits from..to as the directory's patch series. Each file keeps its
+# Subject and body and then the diff, like the service patches.
 sc_wasmer_export_range() {
   local checkout="$1" from="$2" to="$3" patch_dir="$4" patch
   mkdir -p "$patch_dir"
@@ -61,7 +61,6 @@ sc_wasmer_export_range() {
       -e '0,/^diff --git/s//\n&/' \
       "$patch"
   done
-  (cd "$patch_dir" && ls -- *.patch) > "$patch_dir/series"
 }
 
 # sc_wasmer_napi_submodule <tree>: lib/cli needs the wasmer-napi submodule
