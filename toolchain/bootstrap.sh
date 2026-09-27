@@ -254,7 +254,9 @@ run_smoke() {
     local -a watchdog=()
     if [[ -n "${3:-}" ]]; then
       # A runtime deadlock can also prevent a guest watchdog from exiting.
-      watchdog=(timeout --kill-after=2s "$3")
+      # Wasmer resets the terminal as it starts, which stops a process in a
+      # background process group, so timeout must keep it in the foreground.
+      watchdog=(timeout --foreground --kill-after=2s "$3")
     fi
     output="$("${watchdog[@]}" "$SC_ROOT/work/wasmer/fixes/bin/wasmer" run --net \
       --volume "$SC_ROOT:$SC_ROOT" --cwd "$build_dir" \
