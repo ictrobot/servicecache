@@ -1,4 +1,5 @@
-Subject: [PATCH 2/2] connector-c: add a wolfSSL backend
+Subject: connector-c: add a wolfSSL backend
+Last-Update: 2026-09-27
 
 WITH_SSL=WOLFSSL builds the OpenSSL backend against wolfSSL's OpenSSL
 layer, as MariaDB Server builds against it, from what the parent provides

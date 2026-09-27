@@ -1,4 +1,5 @@
-Subject: [PATCH 2/6] mysys: adapt locking, durability and memory to WASIX
+Subject: mysys: adapt locking, durability and memory to WASIX
+Last-Update: 2026-09-27
 
 WASIX has no POSIX advisory file locks, no fdatasync, no directory sync
 and no large pages, and its mmap gives anonymous private memory only. A

@@ -1,4 +1,5 @@
-Subject: [PATCH] cmake: pass zlib's detected HAVE_UNISTD_H to the compiler
+Subject: cmake: pass zlib's detected HAVE_UNISTD_H to the compiler
+Last-Update: 2026-09-27
 
 The zlib 1.3.2 bundled since MySQL 8.0.46 ships a zconf.h in its source tree,
 which zlib.h finds before the generated one that carries the HAVE_UNISTD_H

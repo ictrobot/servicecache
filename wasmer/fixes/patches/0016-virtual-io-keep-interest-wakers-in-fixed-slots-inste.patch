@@ -1,4 +1,5 @@
 Subject: virtual-io: keep interest wakers in fixed slots instead of a map
+Last-Update: 2026-09-27
 
 Every poll of every socket goes through InterestWakerMap. A poll clears
 the interest it is about to wait on, registers its waker under it and

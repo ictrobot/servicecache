@@ -1,4 +1,5 @@
 Subject: virtual-net: answer a listener's readiness without accepting
+Last-Update: 2026-09-27
 
 A host listener answered whether a connection was waiting by accepting
 one and keeping it in a backlog of its own, and an accept then took it

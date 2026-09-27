@@ -1,3 +1,9 @@
+Subject: util: use UTC on WASIX
+Last-Update: 2026-09-27
+
+WASI clocks use UTC and do not populate gettimeofday's obsolete timezone
+argument. Return the matching zero offset directly.
+
 diff --git a/src/util.c b/src/util.c
 index ba7df61..cf442eb 100644
 --- a/src/util.c

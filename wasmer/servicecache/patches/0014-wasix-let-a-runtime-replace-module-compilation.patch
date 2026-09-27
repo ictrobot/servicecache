@@ -1,4 +1,5 @@
 Subject: wasix: let a runtime replace module compilation
+Last-Update: 2026-09-27
 
 The first compilation of a spawned module happens lazily inside the
 runtime, on a global Rayon pool that is created on first use and never

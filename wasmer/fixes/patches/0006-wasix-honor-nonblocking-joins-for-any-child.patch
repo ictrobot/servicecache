@@ -1,4 +1,5 @@
 Subject: wasix: honor nonblocking joins for any child
+Last-Update: 2026-09-27
 
 waitpid(-1, WNOHANG) could not tell "children exist but none has
 finished" from "there are no children", and did not reliably reap an

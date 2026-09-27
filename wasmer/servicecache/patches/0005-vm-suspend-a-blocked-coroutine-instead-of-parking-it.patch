@@ -1,4 +1,5 @@
 Subject: vm: suspend a blocked coroutine instead of parking its thread
+Last-Update: 2026-09-27
 
 The coroutine that runs a call into Wasm can yield `Blocked(future)`
 when a host wait would park the thread; `on_wasm_stack` becomes a loop

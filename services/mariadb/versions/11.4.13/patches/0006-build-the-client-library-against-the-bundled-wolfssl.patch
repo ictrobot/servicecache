@@ -1,4 +1,5 @@
-Subject: [PATCH 6/6] cmake: build the client library against the bundled wolfSSL
+Subject: cmake: build the client library against the bundled wolfSSL
+Last-Update: 2026-09-27
 
 With CONC_WITH_SSL=WOLFSSL, hand Connector/C the bundled wolfSSL the
 server is built with: its target, include directories and user settings,

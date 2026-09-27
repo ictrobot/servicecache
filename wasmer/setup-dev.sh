@@ -32,14 +32,14 @@ elif ! git -C "$checkout" rev-parse --verify --quiet "$tag^{commit}" >/dev/null;
 fi
 
 # branch_current from to set-directory: to is stacked on from and exporting
-# from..to reproduces the set. The export alone cannot tell a branch left
-# on an older from, since a range only subtracts.
+# from..to reproduces the set, dates carried over from it. The export alone
+# cannot tell a branch left on an older from, since a range only subtracts.
 branch_current() {
   local from="$1" to="$2" set_dir="$3" export_dir patch exported committed same=1
   git -C "$checkout" rev-parse --verify --quiet "refs/heads/$to" >/dev/null || return 1
   git -C "$checkout" merge-base --is-ancestor "$from" "$to" 2>/dev/null || return 1
   export_dir="$(mktemp -d "$root/work/wasmer-dev-export.XXXXXX")"
-  if sc_wasmer_export_range "$checkout" "$from" "$to" "$export_dir" 2>/dev/null &&
+  if sc_wasmer_export_range "$checkout" "$from" "$to" "$export_dir" "$set_dir" 2>/dev/null &&
      exported="$(sc_patch_names "$export_dir")" &&
      committed="$(sc_patch_names "$set_dir")" &&
      [[ "$exported" == "$committed" ]]; then

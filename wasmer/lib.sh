@@ -44,23 +44,72 @@ sc_wasmer_dev_sets() {
   echo "jitdump servicecache wasmer/servicecache/patches"
 }
 
-# sc_wasmer_export_range <checkout> <from> <to> <directory>: write the
-# commits from..to as the directory's patch series. Each file keeps its
-# Subject and body and then the diff, like the service patches.
+# sc_wasmer_comparable <patch>: all content except its modification date.
+sc_wasmer_comparable() {
+  sed '/^Last-Update:/d' "$1"
+}
+
+# sc_wasmer_patch_date <previous> <current> <today>: the date an exported
+# patch carries. It keeps the date of the previous file of the same name
+# when their contents match apart from Last-Update, and is today otherwise.
+sc_wasmer_patch_date() {
+  local previous="$1" current="$2" today="$3" date=""
+  if [[ -f "$previous" ]] &&
+     diff -q <(sc_wasmer_comparable "$previous") <(sc_wasmer_comparable "$current") >/dev/null 2>&1; then
+    date="$(sed -n '/^diff --git/q; s/^Last-Update:[ \t]*//p' "$previous" | head -n 1)"
+  fi
+  echo "${date:-$today}"
+}
+
+# sc_wasmer_insert_date <patch> <date>: put the Last-Update line after the
+# Subject field, continuation lines included.
+sc_wasmer_insert_date() {
+  local patch="$1" date="$2"
+  awk -v date="$date" '
+    !placed && subject && $0 !~ /^[ \t]/ { print "Last-Update: " date; placed = 1 }
+    /^Subject:/ && !subject { subject = 1 }
+    { print }
+    END { if (subject && !placed) print "Last-Update: " date }
+  ' "$patch" > "$patch.dated" || return 1
+  mv "$patch.dated" "$patch"
+}
+
+# sc_wasmer_export_range <checkout> <from> <to> <directory> [previous]:
+# write the commits from..to as the directory's patch series. Each file keeps
+# its Subject and body and then the diff, like the service patches, with a
+# Last-Update line after the Subject. format-patch knows
+# nothing of that line, so it is carried across from the set in previous
+# (default: the directory as it was). Unchanged content keeps its date;
+# descriptions, hunk positions and index hashes all count as changes.
+# Exporting an unchanged branch reproduces the set byte for byte.
 sc_wasmer_export_range() {
-  local checkout="$1" from="$2" to="$3" patch_dir="$4" patch
+  local checkout="$1" from="$2" to="$3" patch_dir="$4" previous="${5:-$4}"
+  local patch today kept status=0
+  today="$(date +%F)"
+  kept="$(mktemp -d)" || return 1
+  if [[ -d "$previous" ]]; then
+    find "$previous" -maxdepth 1 -name '*.patch' -exec cp -- {} "$kept/" \; || {
+      rm -rf "$kept"
+      return 1
+    }
+  fi
   mkdir -p "$patch_dir"
   rm -f "$patch_dir"/*.patch
   git -C "$checkout" format-patch --keep-subject --no-signature --quiet \
-    -o "$patch_dir" "$from..$to"
+    -o "$patch_dir" "$from..$to" || status=1
   for patch in "$patch_dir"/*.patch; do
+    (( status )) && break
     [[ -f "$patch" ]] || continue
     sed -i \
       -e '1,/^Subject:/{/^Subject:/!d}' \
       -e '/^---$/,/^diff --git/{/^diff --git/!d}' \
       -e '0,/^diff --git/s//\n&/' \
-      "$patch"
+      "$patch" &&
+      sc_wasmer_insert_date "$patch" \
+        "$(sc_wasmer_patch_date "$kept/${patch##*/}" "$patch" "$today")" || status=1
   done
+  rm -rf "$kept"
+  return "$status"
 }
 
 # sc_wasmer_napi_submodule <tree>: lib/cli needs the wasmer-napi submodule

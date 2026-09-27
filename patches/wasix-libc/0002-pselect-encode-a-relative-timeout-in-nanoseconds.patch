@@ -1,4 +1,5 @@
 Subject: pselect: encode a relative timeout in nanoseconds
+Last-Update: 2026-09-27
 
 `pselect()` built its clock subscription with `timespec_to_timestamp_clamp()`,
 a helper written for absolute timestamps: for `tv_sec <= 0` it stores the

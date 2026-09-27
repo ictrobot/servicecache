@@ -1,3 +1,10 @@
+Subject: modules: enable static Lua on WASIX
+Last-Update: 2026-09-27
+
+Build Lua without position-independent code and give its module API pointers
+one owning translation unit. Resolve the known static Lua entry points
+directly because the WebAssembly target has no dynamic symbol lookup.
+
 diff --git a/deps/Makefile b/deps/Makefile
 index 94d9385..174580c 100644
 --- a/deps/Makefile

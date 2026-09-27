@@ -1,4 +1,5 @@
 Subject: Add mimalloc as a malloc implementation
+Last-Update: 2026-09-27
 
 dlmalloc takes one lock around every allocation and release, so the threads
 of a program that allocates often spend their time waiting for each other;

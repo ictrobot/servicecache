@@ -1,4 +1,5 @@
-Subject: [PATCH 3/7] platform: add WASIX runtime services
+Subject: platform: add WASIX runtime services
+Last-Update: 2026-09-27
 
 Provide the platform pieces required by a static, threaded WASIX server:
 pthread-backed statement timers, a static dynamic-loader compatibility shim,

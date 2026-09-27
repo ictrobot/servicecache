@@ -1,4 +1,5 @@
 Subject: wasix: wait for a blocking socket operation on its own thread
+Last-Update: 2026-09-27
 
 A socket operation that would block handed its wait to the shared event
 selector: it registered a handler on the socket, the calling thread

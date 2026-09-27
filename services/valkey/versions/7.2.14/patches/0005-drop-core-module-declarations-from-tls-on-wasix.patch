@@ -1,3 +1,9 @@
+Subject: tls: drop core module declarations on WASIX
+Last-Update: 2026-09-27
+
+The statically linked WebAssembly build already owns the module API symbols.
+Do not ask the TLS translation unit to emit a second core-module copy.
+
 diff --git a/src/tls.c b/src/tls.c
 index 9a53848..00b8103 100644
 --- a/src/tls.c

@@ -1,4 +1,5 @@
-Subject: [PATCH] abseil: treat WASIX as a platform with mmap()
+Subject: abseil: treat WASIX as a platform with mmap()
+Last-Update: 2026-09-27
 
 Abseil 20250814.1 only lists Emscripten among WebAssembly targets that have
 mmap(); the 20230802.1 release bundled with MySQL 8.4 accepted any __wasm__

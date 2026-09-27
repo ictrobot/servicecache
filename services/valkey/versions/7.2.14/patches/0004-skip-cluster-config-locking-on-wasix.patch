@@ -1,3 +1,9 @@
+Subject: cluster: skip config locking on WASIX
+Last-Update: 2026-09-27
+
+WASIX does not provide the advisory flock operation used for a cluster
+configuration file. Keep the existing no-lock fallback for this target.
+
 diff --git a/src/cluster.c b/src/cluster.c
 index 6ce3827..7aa96ff 100644
 --- a/src/cluster.c

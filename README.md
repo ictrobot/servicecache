@@ -83,7 +83,7 @@ The manager API is intended to be used by the same local user through its Unix s
 Common checks are exposed as Make targets:
 
 ```sh
-make lint                 # rustfmt, Clippy and the generic-manager check
+make lint                 # formatting and static checks
 make test                 # Rust unit and integration tests
 make smoke-toolchain      # build and run the WASIX toolchain fixtures
 make smoke-services       # smoke-test the built service packages

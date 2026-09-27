@@ -1,4 +1,5 @@
-Subject: [PATCH 5/6] client: build a batch-only mariadb client
+Subject: client: build a batch-only mariadb client
+Last-Update: 2026-09-27
 
 Build the mariadb command-line client for batch use only: no readline or
 libedit, no interactive input, no pager through popen, and SIGINT ends

@@ -1,4 +1,5 @@
 Subject: wasix: support multiple epoll registrations per file
+Last-Update: 2026-09-27
 
 The virtual epoll kept one interest registration per file, so adding the
 same file to a second epoll instance displaced the first waiter, and one

@@ -1,4 +1,5 @@
 Subject: wasix: signal the parent when a virtual process exits
+Last-Update: 2026-09-27
 
 A parent that waits for SIGCHLD could miss its children's exits: an
 exiting virtual process did not consistently signal the process that

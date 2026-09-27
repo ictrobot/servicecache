@@ -1,4 +1,5 @@
 Subject: chdir: serialise relative-path resolution
+Last-Update: 2026-09-27
 
 `make_absolute()` assembled `cwd + "/" + path` in a process-wide static
 buffer and returned a pointer into it, and `__wasilibc_find_relpath_alloc()`

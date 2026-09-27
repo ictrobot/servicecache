@@ -1,4 +1,5 @@
 Subject: wasix: recheck pending signals before a wait sleeps again
+Last-Update: 2026-09-27
 
 AsyncifyPoller checks the signal queue, and only a check that finds it
 empty subscribes the waker. When the check finds signals, they are

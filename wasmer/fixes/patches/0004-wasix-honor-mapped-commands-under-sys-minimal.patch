@@ -1,4 +1,5 @@
 Subject: wasix: honor mapped commands under sys-minimal
+Last-Update: 2026-09-27
 
 The builder's mapped commands were registered only in builds with the
 full sys feature: under sys-minimal, map_commands does not exist and

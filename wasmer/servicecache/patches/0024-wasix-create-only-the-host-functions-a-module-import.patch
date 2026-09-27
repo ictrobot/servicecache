@@ -1,4 +1,5 @@
 Subject: wasix: create only the host functions a module imports
+Last-Update: 2026-09-27
 
 Instantiating a WASIX module built every function of every WASI namespace
 - wasi, wasi_unstable, wasi_snapshot_preview1, wasix_32v1 and wasix_64v1,

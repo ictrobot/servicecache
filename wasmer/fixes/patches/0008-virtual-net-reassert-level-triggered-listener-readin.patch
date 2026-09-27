@@ -1,4 +1,5 @@
 Subject: virtual-net: reassert level-triggered listener readiness
+Last-Update: 2026-09-27
 
 mio delivers edge-triggered readiness, but WASIX exposes epoll with
 level-triggered semantics. When connections arrived together, one

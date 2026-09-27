@@ -1,4 +1,5 @@
 Subject: virtual-net: adopt a listening socket
+Last-Update: 2026-09-27
 
 A host that creates a guest's listening socket itself needs to hand it
 to the guest as a `LocalTcpListener`: `from_std_listener` wraps a socket

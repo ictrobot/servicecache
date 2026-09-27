@@ -1,4 +1,5 @@
-Subject: [PATCH 4/6] innodb: adapt to WASIX filesystems
+Subject: innodb: adapt to WASIX filesystems
+Last-Update: 2026-09-27
 
 InnoDB locks its files with fcntl and syncs them with fdatasync, neither
 of which WASIX provides. A service instance owns its data directory, so

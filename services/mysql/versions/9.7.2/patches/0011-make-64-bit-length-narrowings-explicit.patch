@@ -1,4 +1,5 @@
-Subject: [PATCH] sql: make two 64-bit length narrowings explicit for wasm32
+Subject: sql: make two 64-bit length narrowings explicit for wasm32
+Last-Update: 2026-09-27
 
 MySQL no longer supports 32-bit targets, and 9.x has grown two places where
 a 64-bit length is brace-initialised into a std::size_t, which is an error

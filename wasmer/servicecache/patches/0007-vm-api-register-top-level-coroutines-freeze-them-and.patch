@@ -1,5 +1,6 @@
 Subject: vm, api: register top-level coroutines, freeze them and resurrect
  them
+Last-Update: 2026-09-27
 
 `run_guest_thread` runs a whole guest-thread body on a registered
 top-level coroutine driven by one OS thread that does nothing else; the

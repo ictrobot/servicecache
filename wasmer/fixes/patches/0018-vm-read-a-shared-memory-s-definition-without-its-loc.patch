@@ -1,4 +1,5 @@
 Subject: vm: read a shared memory's definition without its lock
+Last-Update: 2026-09-27
 
 Every host call that reaches into guest memory builds a MemoryView, and
 building one asked the memory for its size and then for its definition.

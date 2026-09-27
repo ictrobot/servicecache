@@ -1,4 +1,5 @@
 Subject: virtual-io: hand a fused wait to a suspend hook
+Last-Update: 2026-09-27
 
 block_on is the choke point of every blocking WASIX syscall. It now wraps
 the wait in a fused future pinned on the caller's stack and offers it to

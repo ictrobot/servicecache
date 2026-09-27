@@ -1,3 +1,10 @@
+Subject: server: refuse fork on WASIX
+Last-Update: 2026-09-27
+
+WASIX's fork copies the child's memory instead of sharing it, so background
+children would diverge silently from the parent. Make the existing fork
+wrapper fail with ENOTSUP so callers take their established error paths.
+
 diff --git a/src/server.h b/src/server.h
 index 735434a..1185f55 100644
 --- a/src/server.h

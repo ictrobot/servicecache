@@ -1,3 +1,11 @@
+Subject: server: refuse fork on WASIX
+Last-Update: 2026-09-27
+
+WASIX's fork copies the child's memory instead of sharing it, so the
+background save and the sentinel's script runner would diverge silently
+from the parent. Route both through valkey_fork, which fails on WASIX so
+the caller takes its existing "could not fork" path.
+
 diff --git a/src/sentinel.c b/src/sentinel.c
 index c77f746..44e3f21 100644
 --- a/src/sentinel.c

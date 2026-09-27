@@ -1,4 +1,5 @@
 Subject: wasix: do less on the syscall entry path when nothing is pending
+Last-Update: 2026-09-27
 
 Every WASIX syscall begins with do_pending_operations, which asks the
 thread and the process whether anything has come up. What is left of

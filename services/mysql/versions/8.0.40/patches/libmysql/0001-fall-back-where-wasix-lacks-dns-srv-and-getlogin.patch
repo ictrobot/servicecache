@@ -1,4 +1,5 @@
-Subject: [PATCH] libmysql: fall back where WASIX lacks DNS SRV and getlogin
+Subject: libmysql: fall back where WASIX lacks DNS SRV and getlogin
+Last-Update: 2026-09-27
 
 DNS SRV lookup and getlogin are unavailable on WASIX, so use explicit
 fallbacks for those optional paths.

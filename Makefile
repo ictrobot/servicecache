@@ -45,7 +45,7 @@ help:
 	@echo "build                           setup-wasmer, then cargo build"
 	@echo "build-release                   setup-wasmer, then cargo build --release"
 	@echo "test                            setup-wasmer, then cargo test"
-	@echo "lint                            setup-wasmer, then cargo fmt --check and cargo clippy"
+	@echo "lint                            setup-wasmer, then cargo fmt --check, cargo clippy, cargo deny and the patch header checks"
 	@echo "lifecycle-tests                 freeze and fork every built service through the host (quick matrix)"
 	@echo "lifecycle-tests-long            the same plus the long cases (thousands of forks)"
 	@echo "lifecycle-tests-release         the quick matrix on a release build, for latency figures"
@@ -91,6 +91,7 @@ lint: setup-wasmer
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo deny -L error --config deny.toml check licenses bans
 	! grep -rniE 'mysql|mariadb|postgres|valkey|beanstalkd' crates/servicecache
+	toolchain/check-patches.sh
 
 check: lint test smoke-toolchain
 

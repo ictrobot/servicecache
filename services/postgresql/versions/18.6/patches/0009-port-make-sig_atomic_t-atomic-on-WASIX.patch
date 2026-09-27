@@ -1,4 +1,5 @@
 Subject: port: make sig_atomic_t atomic on WASIX
+Last-Update: 2026-09-27
 
 PostgreSQL declares its signal and latch flags volatile sig_atomic_t,
 which is enough where one kernel-synchronised address space backs a

@@ -1,5 +1,6 @@
 Subject: api: run host imports on the coroutine stack when suspension is
  enabled
+Last-Update: 2026-09-27
 
 The import trampolines switch every host call to the OS thread's stack
 through `on_host_stack`, which is what stops a syscall from suspending

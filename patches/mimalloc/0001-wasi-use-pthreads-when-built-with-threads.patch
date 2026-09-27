@@ -1,4 +1,5 @@
 Subject: wasi: use pthreads when the program is built with threads
+Last-Update: 2026-09-27
 
 The WASI port is written for a single thread. It takes none of the pthread
 mutexes the other POSIX ports take, so its locks are loops around an atomic

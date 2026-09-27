@@ -1,4 +1,5 @@
 Subject: wasix: let an unset socket timeout mean no deadline
+Last-Update: 2026-09-27
 
 Every socket call that can block read the matching timeout option off
 the socket and, when the guest had not set one, substituted thirty

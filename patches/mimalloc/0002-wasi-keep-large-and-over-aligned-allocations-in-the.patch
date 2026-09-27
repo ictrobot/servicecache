@@ -1,4 +1,5 @@
 Subject: wasi: keep large and over-aligned allocations in the arenas
+Last-Update: 2026-09-27
 
 WASI cannot shrink linear memory, and its primitive free is a no-op. An
 allocation that bypasses the arenas is therefore lost when it is freed. Two

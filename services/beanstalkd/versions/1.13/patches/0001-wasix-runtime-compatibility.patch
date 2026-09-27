@@ -1,3 +1,10 @@
+Subject: wasix: skip SO_LINGER and WAL locking, drain pending accepts
+Last-Update: 2026-09-27
+
+Skip socket linger and advisory record locking, which the WASIX interfaces
+do not provide. Drain every pending accept before applying epoll changes so
+an edge-triggered readiness notification cannot strand queued connections.
+
 diff --git a/net.c b/net.c
 index a9d2056..56e288e 100644
 --- a/net.c

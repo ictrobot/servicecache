@@ -1,3 +1,9 @@
+Subject: debug: stub dladdr on WASIX
+Last-Update: 2026-09-27
+
+WASIX has no dynamic-loader interface. Supply the small dladdr surface the
+debug code expects so stack traces remain buildable without libdl.
+
 diff --git a/src/debug.c b/src/debug.c
 index dcfebc3..be7c1af 100644
 --- a/src/debug.c

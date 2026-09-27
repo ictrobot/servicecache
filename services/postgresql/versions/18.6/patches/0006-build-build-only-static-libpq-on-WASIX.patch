@@ -1,4 +1,5 @@
 Subject: build: build only static libpq on WASIX
+Last-Update: 2026-09-27
 
 WASIX executables are self-contained WebAssembly modules, and this port
 is fully static with no position-independent code. initdb and psql link

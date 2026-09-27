@@ -1,4 +1,5 @@
-Subject: [PATCH 6/7] myisam: disable unsupported cross-process file locks
+Subject: myisam: disable unsupported cross-process file locks
+Last-Update: 2026-09-27
 
 WASIX does not currently provide the advisory record-locking API used by
 MyISAM. Retain MyISAM's in-process table locks and document the single-server

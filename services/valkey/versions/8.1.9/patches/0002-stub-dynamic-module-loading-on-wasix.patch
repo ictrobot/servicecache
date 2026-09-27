@@ -1,3 +1,9 @@
+Subject: modules: stub dynamic loading on WASIX
+Last-Update: 2026-09-27
+
+WebAssembly modules are linked statically and WASIX has no dynamic loader.
+Provide failing stubs so attempts to load a dynamic module report ENOTSUP.
+
 diff --git a/src/module.c b/src/module.c
 index 07fe73d..32c1cfe 100644
 --- a/src/module.c

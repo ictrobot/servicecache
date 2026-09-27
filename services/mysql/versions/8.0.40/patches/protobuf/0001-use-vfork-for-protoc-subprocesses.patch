@@ -1,4 +1,5 @@
-Subject: [PATCH] protobuf: use vfork for protoc subprocesses on WASIX
+Subject: protobuf: use vfork for protoc subprocesses on WASIX
+Last-Update: 2026-09-27
 
 WASIX's exception-enabled libc exposes vfork() but intentionally omits fork(),
 because copying an exception-handling stack is unsupported. protoc's subprocess

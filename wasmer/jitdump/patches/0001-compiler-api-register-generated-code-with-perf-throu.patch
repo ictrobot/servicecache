@@ -1,4 +1,5 @@
 Subject: compiler, api: register generated code with perf through jitdump
+Last-Update: 2026-09-27
 
 Wasmer could name generated code for perf with a perf map, but only in a
 limited way: a compiler setting turned it on, so a headless engine

@@ -1,4 +1,5 @@
 Subject: vm: suspend memory.atomic.wait like a syscall
+Last-Update: 2026-09-27
 
 `ThreadConditions::do_wait` parked the OS thread on a Condvar from
 inside the coroutine, so a guest thread sitting in `memory.atomic.wait`

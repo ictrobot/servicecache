@@ -1,4 +1,5 @@
 Subject: vm: refuse a memory that could move under code that assumes it cannot
+Last-Update: 2026-09-27
 
 A memory moves to a new allocation whenever it grows past what it
 reserved, whatever its style: a dynamic memory reserves only what it

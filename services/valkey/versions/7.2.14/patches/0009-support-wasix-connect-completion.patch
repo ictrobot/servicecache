@@ -1,3 +1,9 @@
+Subject: client: support WASIX connect completion
+Last-Update: 2026-09-27
+
+WASIX reports ENOTSUP when connect is repeated on an already connected
+socket. Read SO_ERROR to distinguish a completed connection instead.
+
 diff --git a/deps/hiredis/net.c b/deps/hiredis/net.c
 index 33fe0b9..74a7446 100644
 --- a/deps/hiredis/net.c

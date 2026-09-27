@@ -1,3 +1,9 @@
+Subject: rdma: provide an unavailable stub on WASIX
+Last-Update: 2026-09-27
+
+RDMA support is unavailable to the WebAssembly target. Avoid its platform
+headers and register a connection type that reports the feature unavailable.
+
 diff --git a/src/rdma.c b/src/rdma.c
 index b7ea1d6..fb586cb 100644
 --- a/src/rdma.c

@@ -1,4 +1,5 @@
-Subject: [PATCH 7/7] client: build batch-only mysql module for WASIX
+Subject: client: build batch-only mysql module for WASIX
+Last-Update: 2026-09-27
 
 Build the standard mysql client without its terminal editing path. Standard
 input and --execute retain the upstream batch parser and direct TCP/TLS client

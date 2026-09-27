@@ -1,4 +1,5 @@
-Subject: [PATCH 3/6] server: adapt lifecycle for WASIX
+Subject: server: adapt lifecycle for WASIX
+Last-Update: 2026-09-27
 
 WASIX runs signal handlers but never wakes sigwait, and has no setuid,
 setgid or chroot. The signal thread waits for the shutdown flag on the

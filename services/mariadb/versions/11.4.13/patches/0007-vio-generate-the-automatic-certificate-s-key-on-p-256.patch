@@ -1,4 +1,5 @@
-Subject: [PATCH] vio: generate the automatic certificate's key on P-256
+Subject: vio: generate the automatic certificate's key on P-256
+Last-Update: 2026-09-27
 
 When no certificate is configured the server generates a self-signed one
 at startup, with a 4096-bit RSA key. Finding two 2048-bit primes is a

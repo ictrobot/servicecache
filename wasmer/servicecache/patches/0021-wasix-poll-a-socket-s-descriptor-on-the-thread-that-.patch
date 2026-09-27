@@ -1,5 +1,6 @@
 Subject: wasix: poll a socket's descriptor on the thread that called
  poll_oneoff
+Last-Update: 2026-09-27
 
 A guest waiting in poll_oneoff on a socket paid the same handoff through
 the selector thread an epoll wait did, and one thing more: the guard

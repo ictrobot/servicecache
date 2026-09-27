@@ -1,4 +1,5 @@
-Subject: [PATCH 4/7] server: adapt lifecycle and networking for WASIX
+Subject: server: adapt lifecycle and networking for WASIX
+Last-Update: 2026-09-27
 
 WASIX lacks the Unix process-control and signal-delivery behavior used by
 mysqld. Keep the server in the foreground, reject chroot/identity switching,
