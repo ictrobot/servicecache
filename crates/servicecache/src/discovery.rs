@@ -141,7 +141,14 @@ impl ServiceIndex {
     }
 
     fn insert(&mut self, manifest_path: &Path) -> Result<()> {
-        let manifest = Manifest::load(manifest_path)?;
+        let directory = manifest_path
+            .parent()
+            .context("manifest path has no parent directory")?
+            .canonicalize()
+            .with_context(|| {
+                format!("failed to resolve package for {}", manifest_path.display())
+            })?;
+        let manifest = Manifest::load(&directory.join("service.toml"))?;
         let key = (
             manifest.service.name.clone(),
             manifest.service.version.clone(),
@@ -184,11 +191,10 @@ fn manifests_in(search_dir: &Path) -> Result<Vec<PathBuf>> {
                 search_dir.display()
             )
         })?;
-        if entry
+        let file_type = entry
             .file_type()
-            .with_context(|| format!("failed to inspect {}", entry.path().display()))?
-            .is_dir()
-        {
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        if file_type.is_dir() || (file_type.is_symlink() && entry.path().is_dir()) {
             let manifest = entry.path().join("service.toml");
             if manifest.is_file() {
                 manifests.push(manifest);
@@ -315,6 +321,84 @@ mod tests {
         assert_eq!(package.files().expect("hash the package").len(), 2);
         assert_eq!(
             package.shadowed[0].files().expect("hash the shadow").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn follows_package_links_and_keeps_the_selected_target() {
+        let packages = TestDirectory::new();
+        let installed = TestDirectory::new();
+        packages.package("first", "one");
+        packages.package("second", "two");
+        let link = installed.0.join("current");
+        std::os::unix::fs::symlink(packages.0.join("first"), &link).expect("link package");
+        std::os::unix::fs::symlink(packages.0.join("missing"), installed.0.join("stale"))
+            .expect("link missing package");
+
+        let index = ServiceIndex::discover(std::slice::from_ref(&installed.0))
+            .expect("discover linked package");
+        let selected = index.select("example", Some("1")).expect("select package");
+        assert_eq!(selected.directory(), packages.0.join("first"));
+        let original_files = index
+            .iter()
+            .next()
+            .expect("package")
+            .files()
+            .expect("hash package");
+
+        fs::remove_file(&link).expect("remove installation link");
+        std::os::unix::fs::symlink(packages.0.join("second"), &link).expect("replace package link");
+        assert_eq!(
+            fs::read_to_string(&selected.guest.module).expect("read original module"),
+            "one"
+        );
+        assert_eq!(
+            index
+                .iter()
+                .next()
+                .expect("package")
+                .files()
+                .expect("hash original package"),
+            original_files
+        );
+        let updated = ServiceIndex::discover(std::slice::from_ref(&installed.0))
+            .expect("discover replacement");
+        assert_eq!(
+            fs::read_to_string(
+                &updated
+                    .select("example", Some("1"))
+                    .expect("select replacement")
+                    .guest
+                    .module
+            )
+            .expect("read replacement module"),
+            "two"
+        );
+    }
+
+    #[test]
+    fn linked_packages_follow_installation_name_order() {
+        let packages = TestDirectory::new();
+        let installed = TestDirectory::new();
+        packages.package("a", "one");
+        packages.package("z", "two");
+        std::os::unix::fs::symlink(packages.0.join("z"), installed.0.join("a"))
+            .expect("link first package");
+        std::os::unix::fs::symlink(packages.0.join("a"), installed.0.join("z"))
+            .expect("link second package");
+
+        let index = ServiceIndex::discover(std::slice::from_ref(&installed.0))
+            .expect("discover linked packages");
+        let package = index.iter().next().expect("selected package");
+        assert_eq!(package.manifest.directory(), packages.0.join("z"));
+        assert_eq!(package.shadowed.len(), 1);
+        assert_eq!(package.shadowed[0].directory, packages.0.join("a"));
+        assert_eq!(
+            package.shadowed[0]
+                .files()
+                .expect("hash shadowed package")
+                .len(),
             2
         );
     }
