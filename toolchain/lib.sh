@@ -429,14 +429,16 @@ sc_check_guest_imports() {
 
 # The content hash of what the sysroot's libc carries beyond its tag: the
 # patch series for wasix-libc and for the mimalloc built into it
-# (patches/wasix-libc, patches/mimalloc, each in filename order) and the
-# mimalloc tag. It is what toolchain/bootstrap.sh stamps each rebuilt libc.a
-# with, and what BUILD-INFO records.
+# (toolchain/sources/wasix-libc/patches and toolchain/sources/mimalloc/patches,
+# each in filename order) and the mimalloc tag. It is what
+# toolchain/bootstrap.sh stamps each rebuilt libc.a with, and what BUILD-INFO
+# records.
 sc_sysroot_patch_hash() {
   local root patch_dir patch patches
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   {
-    for patch_dir in "$root/patches/wasix-libc" "$root/patches/mimalloc"; do
+    for patch_dir in "$root/toolchain/sources/wasix-libc/patches" \
+      "$root/toolchain/sources/mimalloc/patches"; do
       patches="$(sc_patch_names "$patch_dir")" || return 1
       while IFS= read -r patch; do
         cat "$patch_dir/$patch"

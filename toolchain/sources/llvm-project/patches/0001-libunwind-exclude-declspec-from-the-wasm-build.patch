@@ -1,0 +1,27 @@
+Subject: libunwind: exclude __declspec from the wasm build
+Last-Update: 2026-09-27
+
+libunwind marks what it exports with __declspec(dllexport) on every target
+that is not ELF, Mach-O or AIX, and WebAssembly is none of them, so clang
+refuses the attribute and no source of libunwind compiles for it. The
+attribute is left out for WebAssembly, which exports what the link asks for.
+
+This is the WASI SDK's src/llvm-pr-168449.patch, at commit 5a0bf653a1a0
+(tag wasi-sdk-34, 2026-08-24). It is LLVM pull request
+https://github.com/llvm/llvm-project/pull/168449, by yerzham, opened
+2025-11-17.
+
+diff --git a/libunwind/src/config.h b/libunwind/src/config.h
+index f017403fa2234..6014a37e27212 100644
+--- a/libunwind/src/config.h
++++ b/libunwind/src/config.h
+@@ -75,7 +75,8 @@
+   #define _LIBUNWIND_EXPORT
+   #define _LIBUNWIND_HIDDEN
+ #else
+-  #if !defined(__ELF__) && !defined(__MACH__) && !defined(_AIX)
++  #if !defined(__ELF__) && !defined(__MACH__) && !defined(_AIX) &&             \
++      !defined(__wasm__)
+     #define _LIBUNWIND_EXPORT __declspec(dllexport)
+     #define _LIBUNWIND_HIDDEN
+   #else

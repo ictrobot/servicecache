@@ -1,11 +1,11 @@
 // Two threads making relative-path syscalls at once must not corrupt each
-// other's paths (patches/wasix-libc). Thread 1 creates ./d1/file_NNNN.ibt
-// with O_CREAT|O_EXCL while thread 2 probes names under ./d2. Afterwards
-// every file is looked up through a directory descriptor (openat), which
-// bypasses libc's cwd-relative path resolution, and both directories are
-// listed for strays. Exits 0 when every file exists under its own name and
-// nothing else does; with the unpatched libc, some creates land on a
-// spliced name and their files are missing.
+// other's paths (toolchain/sources/wasix-libc/patches). Thread 1 creates
+// ./d1/file_NNNN.ibt with O_CREAT|O_EXCL while thread 2 probes names under
+// ./d2. Afterwards every file is looked up through a directory descriptor
+// (openat), which bypasses libc's cwd-relative path resolution, and both
+// directories are listed for strays. Exits 0 when every file exists under its
+// own name and nothing else does; with the unpatched libc, some creates land
+// on a spliced name and their files are missing.
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>

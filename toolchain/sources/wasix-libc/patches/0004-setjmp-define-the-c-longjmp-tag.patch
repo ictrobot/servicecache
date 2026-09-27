@@ -1,0 +1,48 @@
+Subject: setjmp: define the __c_longjmp tag
+Last-Update: 2026-09-27
+
+`__wasm_longjmp()` throws with the `__c_longjmp` WebAssembly tag. clang 21
+and older define that tag, weakly, in every object that throws or catches
+with it; clang 22 and later leave the definition to the C library, so with
+them a module that links the setjmp/longjmp runtime fails on an undefined
+`__c_longjmp`. The tag, with one pointer-sized parameter, is now defined
+here in inline assembly for clang 22 and later; older compilers are left to
+define it as they did.
+
+This is wasi-libc's fix, from commit 2fc32bc81b9f ("Test with LLVM 22 in CI,
+fix a setjmp/longjmp issue", https://github.com/WebAssembly/wasi-libc/pull/772,
+by alexcrichton, 2026-03-11), applied to wasix-libc's copy of the runtime.
+
+diff --git a/libc-top-half/musl/src/setjmp/setjmplongjmp.c b/libc-top-half/musl/src/setjmp/setjmplongjmp.c
+--- a/libc-top-half/musl/src/setjmp/setjmplongjmp.c
++++ b/libc-top-half/musl/src/setjmp/setjmplongjmp.c
+@@ -1,3 +1,4 @@
++// Modified for ServiceCache: backported fix of https://github.com/WebAssembly/wasi-libc/pull/772
+ #ifndef __wasilibc_unmodified_upstream
+ #include <setjmp.h>
+ 
+@@ -79,6 +80,24 @@ __wasm_longjmp(void *env, int val)
+         __builtin_wasm_throw(1, arg); /* 1 == C_LONGJMP */
+ }
+ 
++// The `__builtin_wasm_throw` invocation above will reference this symbol which
++// refers to a WebAssembly tag. The tag can't be defined in C but we can define
++// it with inline assembly, so do so here.
++//
++// Note that the means of defining this symbol changed historically, so this
++// is only done on LLVM 22+ where it's required.
++#if __clang_major__ >= 22
++__asm__(".globl __c_longjmp\n"
++#if defined(__wasm32__)
++        ".tagtype __c_longjmp i32\n"
++#elif defined(__wasm64__)
++        ".tagtype __c_longjmp i64\n"
++#else
++#error "Unsupported Wasm architecture"
++#endif
++        "__c_longjmp:\n");
++#endif
++
+ #  else
+ 
+ #include <wasi/libc.h>

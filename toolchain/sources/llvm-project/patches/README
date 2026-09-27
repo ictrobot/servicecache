@@ -1,0 +1,23 @@
+WASI SDK patches applied to the LLVM runtime release pinned in ../default.nix.
+
+The three are the WASI SDK's src/llvm-pr-168449.patch,
+src/llvm-pr-186054.patch and src/llvm-undo-part-of-194317.patch, copied from
+https://github.com/WebAssembly/wasi-sdk at tag wasi-sdk-34, commit
+5a0bf653a1a06e1c18867567c5937006d3394a69.
+
+0001-libunwind-exclude-declspec-from-the-wasm-build.patch is LLVM pull
+request https://github.com/llvm/llvm-project/pull/168449, by yerzham.
+
+0002-libcxxabi-define-cxa-thread-atexit-where-needed.patch is LLVM pull
+request https://github.com/llvm/llvm-project/pull/186054, by whitequark and
+ldionne.
+
+0003-libcxx-include-the-ibm-locale-shims-only-on-z-os.patch is the WASI SDK's
+https://github.com/WebAssembly/wasi-sdk/pull/636, by alexcrichton, which
+undoes part of LLVM pull request
+https://github.com/llvm/llvm-project/pull/194317, by philnik777.
+
+The patches remain the copyright of their authors. They, the WASI SDK and
+LLVM are offered under the Apache License 2.0 with the LLVM Exceptions
+(LICENSE-Apache-2.0-WITH-LLVM-exception), and so is this series. Context
+lines are from LLVM and remain the copyright of their authors under its terms.

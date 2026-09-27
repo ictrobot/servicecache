@@ -33,7 +33,7 @@ help:
 	@echo "services                        build every service version into work/services"
 	@echo "service-<name>-<version>        bootstrap if needed, then build one service version"
 	@echo "smoke                           run every smoke test"
-	@echo "smoke-toolchain                 build and run the toolchain smoke test"
+	@echo "smoke-toolchain                 build the toolchain fixtures through Nix, copy them to work/build/toolchain-smoke and run them under Wasmer"
 	@echo "smoke-services                  smoke-test every built service version"
 	@echo "smoke-service-<name>-<version>  build if needed, then smoke-test one service version"
 	@echo "smoke-extensions                run every Wasmer extension's demo ($(EXTENSION_NAMES))"
@@ -68,8 +68,8 @@ help:
 bootstrap:
 	toolchain/bootstrap.sh --all
 
-smoke-toolchain: bootstrap
-	toolchain/bootstrap.sh --all --check
+smoke-toolchain:
+	toolchain/smoke/run.sh
 
 setup-wasmer:
 	wasmer/setup.sh
@@ -175,8 +175,8 @@ work/services/$(1)-$(2)/BUILD-INFO: services/$(1)/build.sh services/$(1)/service
     $$(wildcard services/$(1)/deps.sh) $$(shell find -L services/$(1)/libs -type f 2>/dev/null) \
     services/$(1)/versions/$(2)/version.env \
     $$(shell find -L services/$(1)/versions/$(2)/patches -type f) \
-    toolchain/versions.sh $$(wildcard patches/wasix-libc/*.patch) \
-    $$(wildcard patches/mimalloc/*.patch) | bootstrap
+    toolchain/versions.sh $$(wildcard toolchain/sources/wasix-libc/patches/*.patch) \
+    $$(wildcard toolchain/sources/mimalloc/patches/*.patch) | bootstrap
 	services/$(1)/build.sh $(2)
 
 smoke-service-$(1)-$(2): work/services/$(1)-$(2)/BUILD-INFO

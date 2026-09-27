@@ -1,0 +1,33 @@
+Subject: libc++: include the IBM locale shims only on z/OS
+Last-Update: 2026-09-27
+
+libc++ includes its IBM locale shims, __locale_dir/locale_base_api/ibm.h, on
+every platform without a locale support header of its own, WASI among them,
+where only AIX and z/OS included them before. Their inline strtod_l, strtof_l
+and strtold_l redeclare the C library's functions of those names with an
+attribute clang refuses in a redeclaration, so no source of libc++ compiles.
+The shims are included on z/OS alone again, AIX having a support header of
+its own.
+
+This is the WASI SDK's src/llvm-undo-part-of-194317.patch, at commit
+5a0bf653a1a0 (tag wasi-sdk-34, 2026-08-24). It was added by
+https://github.com/WebAssembly/wasi-sdk/pull/636, by alexcrichton, merged
+2026-07-01, and undoes part of LLVM pull request
+https://github.com/llvm/llvm-project/pull/194317, by philnik777, which ported
+OpenBSD to libc++'s new locale API.
+
+diff --git a/libcxx/include/__locale_dir/locale_base_api.h b/libcxx/include/__locale_dir/locale_base_api.h
+index e1e60e18fd7c..d1fb4cdbcd43 100644
+--- a/libcxx/include/__locale_dir/locale_base_api.h
++++ b/libcxx/include/__locale_dir/locale_base_api.h
+@@ -132,7 +132,9 @@
+ //       (by providing global non-reserved names) and the new API. As we move individual platforms
+ //       towards the new way of defining the locale base API, this should disappear since each platform
+ //       will define those directly.
+-#    include <__locale_dir/locale_base_api/ibm.h>
++#    if defined(__MVS__)
++#      include <__locale_dir/locale_base_api/ibm.h>
++#    endif
+ 
+ #    include <__locale_dir/locale_base_api/bsd_locale_fallbacks.h>
+ 

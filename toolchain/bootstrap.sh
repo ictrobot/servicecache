@@ -2,7 +2,6 @@
 set -euo pipefail
 
 SC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SC_CHECK=0
 SC_ALL=0
 
 source "$SC_ROOT/toolchain/lib.sh"
@@ -13,14 +12,13 @@ fail() {
 }
 
 usage() {
-  echo "usage: $0 [--all] [--check]" >&2
+  echo "usage: $0 [--all]" >&2
   exit 2
 }
 
 for argument in "$@"; do
   case "$argument" in
     --all) SC_ALL=1 ;;
-    --check) SC_CHECK=1 ;;
     *) usage ;;
   esac
 done
@@ -86,16 +84,17 @@ install_sysroot() {
   sysroot_ready || fail "WASIX sysroot verification failed after installation"
 }
 
-# The sysroot's libc carries patches/wasix-libc (see its README): wasix-libc
-# is checked out at the sysroot's tag under work/wasix-libc, the series is
-# applied, and libc is built from it with wasix-libc's own build for every
-# sysroot variant wasixcc can target; that libc.a replaces the downloaded
-# one. Its malloc is mimalloc, built in through the series' MALLOC_IMPL option
-# from a checkout at MIMALLOC_TAG under work/mimalloc that carries
-# patches/mimalloc. A stamp next to each archive holds the hash of both series
-# and the tag, so a fresh download or a change to any of them is rebuilt. The
-# symbols wasix-libc checks a build for are dlmalloc's, so that check is off.
-# The legacy exception-handling variants (sysroot-eh, sysroot-ehpic) cannot be
+# The sysroot's libc carries toolchain/sources/wasix-libc/patches (see its
+# README): wasix-libc is checked out at the sysroot's tag under
+# work/wasix-libc, the series is applied, and libc is built from it with
+# wasix-libc's own build for every sysroot variant wasixcc can target; that
+# libc.a replaces the downloaded one. Its malloc is mimalloc, built in
+# through the series' MALLOC_IMPL option from a checkout at MIMALLOC_TAG
+# under work/mimalloc that carries toolchain/sources/mimalloc/patches. A
+# stamp next to each archive holds the hash of both series and the tag, so a
+# fresh download or a change to any of them is rebuilt. The symbols
+# wasix-libc checks a build for are dlmalloc's, so that check is off. The
+# legacy exception-handling variants (sysroot-eh, sysroot-ehpic) cannot be
 # selected through wasixcc and are left as downloaded. The make arguments are
 # the ones wasix-libc's build32-general.sh uses for each variant.
 SYSROOT_PATCH_VARIANTS=(
@@ -123,14 +122,14 @@ patch_sysroot() {
   local checkout="$SC_ROOT/work/wasix-libc"
   (
     sc_checkout https://github.com/wasix-org/wasix-libc.git "$WASIX_SYSROOT_TAG" "$checkout"
-    sc_reset_if_stale "$checkout" "$SC_ROOT/patches/wasix-libc"
-    sc_apply_series "$SC_ROOT/patches/wasix-libc" "$checkout"
+    sc_reset_if_stale "$checkout" "$SC_ROOT/toolchain/sources/wasix-libc/patches"
+    sc_apply_series "$SC_ROOT/toolchain/sources/wasix-libc/patches" "$checkout"
   ) || fail "could not prepare the wasix-libc checkout"
   local mimalloc="$SC_ROOT/work/mimalloc"
   (
     sc_checkout https://github.com/microsoft/mimalloc.git "$MIMALLOC_TAG" "$mimalloc"
-    sc_reset_if_stale "$mimalloc" "$SC_ROOT/patches/mimalloc"
-    sc_apply_series "$SC_ROOT/patches/mimalloc" "$mimalloc"
+    sc_reset_if_stale "$mimalloc" "$SC_ROOT/toolchain/sources/mimalloc/patches"
+    sc_apply_series "$SC_ROOT/toolchain/sources/mimalloc/patches" "$mimalloc"
   ) || fail "could not prepare the mimalloc checkout"
 
   local hash entry variant flags lib
@@ -190,108 +189,6 @@ install_wasmer() {
     fail "could not build the stock Wasmer CLI (wasmer/build.sh stock)"
 }
 
-run_smoke() {
-  require_command timeout
-  local build_dir="$SC_ROOT/work/build/toolchain-smoke"
-  local module="$build_dir/wasix_cpp.wasm"
-  local output expected
-  mkdir -p "$build_dir"
-
-  "$WASIXCC_DIR/bin/wasix++" -O2 -pthread \
-    "$SC_ROOT/toolchain/smoke/threads-exceptions.cpp" -o "$module"
-  output="$("$WASMER_DIR/bin/wasmer" run "$module")"
-  expected=$'WASIX C++ exception works\nWASIX pthread works'
-  [[ "$output" == "$expected" ]] || fail "WASIX smoke test returned unexpected output"
-  printf '%s\n' "$output"
-
-  # A second module, for the manager's own tests: it reports what it sees
-  # of stdin and of the network, so the embedded runtime can be checked
-  # without any service.
-  "$WASIXCC_DIR/bin/wasixcc" -O2 \
-    "$SC_ROOT/toolchain/smoke/stdio-net.c" -o "$build_dir/stdio-net.wasm"
-  "$WASIXCC_DIR/bin/wasixcc" -O2 \
-    "$SC_ROOT/toolchain/smoke/netprobe.c" -o "$build_dir/netprobe.wasm"
-
-  # The libc patches (patches/wasix-libc, patches/mimalloc), once per patched
-  # sysroot variant that runs as a plain module; each fixture fails on the
-  # unpatched libc. Two threads making relative-path syscalls at once must not
-  # corrupt each other's paths, select() and pselect() must wait for a timeout
-  # under one second rather than return at once, and threads that end must
-  # give their memory back to malloc.
-  local flags
-  for flags in "" "-fno-exceptions"; do
-    # shellcheck disable=SC2086
-    "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread $flags \
-      "$SC_ROOT/toolchain/smoke/relpath-race.c" -o "$build_dir/relpath-race.wasm"
-    "$WASMER_DIR/bin/wasmer" run "$build_dir/relpath-race.wasm" > /dev/null ||
-      fail "relative-path race smoke test failed (wasixcc ${flags:-default flags})"
-    # shellcheck disable=SC2086
-    "$WASIXCC_DIR/bin/wasixcc" -O2 $flags \
-      "$SC_ROOT/toolchain/smoke/select-sleeps.c" -o "$build_dir/select-sleeps.wasm"
-    output="$("$WASMER_DIR/bin/wasmer" run "$build_dir/select-sleeps.wasm")" ||
-      fail "select timeout smoke test failed (wasixcc ${flags:-default flags})"
-    [[ "$output" == "WASIX select and pselect wait for their timeouts" ]] ||
-      fail "select timeout smoke test returned unexpected output: $output"
-    # shellcheck disable=SC2086
-    "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread $flags \
-      "$SC_ROOT/toolchain/smoke/malloc-threads.c" -o "$build_dir/malloc-threads.wasm"
-    output="$("$WASMER_DIR/bin/wasmer" run "$build_dir/malloc-threads.wasm")" ||
-      fail "malloc threads smoke test failed (wasixcc ${flags:-default flags})"
-    [[ "$output" == "WASIX malloc works across threads" ]] ||
-      fail "malloc threads smoke test returned unexpected output: $output"
-  done
-  echo "WASIX relative-path race test passed"
-  echo "WASIX select and pselect wait for their timeouts"
-  echo "WASIX malloc works across threads"
-
-  # Guest fixtures for the fixes patch set run under the fixes variant:
-  # stock does not carry the behaviour they test. PATH covers their
-  # spawn-by-name of themselves.
-  "$SC_ROOT/wasmer/build.sh" fixes >/dev/null ||
-    fail "could not build the fixes Wasmer CLI (wasmer/build.sh fixes)"
-  run_fixes_expecting() {
-    local module="$1" expected="$2" output
-    local -a watchdog=()
-    if [[ -n "${3:-}" ]]; then
-      # A runtime deadlock can also prevent a guest watchdog from exiting.
-      # Wasmer resets the terminal as it starts, which stops a process in a
-      # background process group, so timeout must keep it in the foreground.
-      watchdog=(timeout --foreground --kill-after=2s "$3")
-    fi
-    output="$("${watchdog[@]}" "$SC_ROOT/work/wasmer/fixes/bin/wasmer" run --net \
-      --volume "$SC_ROOT:$SC_ROOT" --cwd "$build_dir" \
-      --env "PATH=$build_dir" "$build_dir/$module")" ||
-      fail "$module failed under the fixes variant"
-    [[ "$output" == "$expected" ]] ||
-      fail "$module: expected \"$expected\", got \"$output\""
-    printf '%s\n' "$output"
-  }
-  "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread \
-    "$SC_ROOT/toolchain/smoke/signal-epoll.c" -o "$build_dir/signal-epoll.wasm"
-  run_fixes_expecting signal-epoll.wasm \
-    "WASIX signal wakes every epoll registration"
-  "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread \
-    "$SC_ROOT/toolchain/smoke/epoll-interest-switch.c" \
-    -o "$build_dir/epoll-interest-switch.wasm"
-  run_fixes_expecting epoll-interest-switch.wasm \
-    "WASIX epoll interest switch keeps level readiness"
-  "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread \
-    "$SC_ROOT/toolchain/smoke/epoll-close-during-dispatch.c" \
-    -o "$build_dir/epoll-close-during-dispatch.wasm"
-  run_fixes_expecting epoll-close-during-dispatch.wasm \
-    "WASIX epoll sets close during dispatch without wedging the selector" 20s
-  "$WASIXCC_DIR/bin/wasixcc" -O2 -pthread \
-    "$SC_ROOT/toolchain/smoke/signal-during-handler.c" \
-    -o "$build_dir/signal-during-handler.wasm"
-  run_fixes_expecting signal-during-handler.wasm \
-    "WASIX signal during a handler still wakes the wait"
-  "$WASIXCC_DIR/bin/wasixcc" -O2 \
-    "$SC_ROOT/toolchain/smoke/lseek-under-signal.c" \
-    -o "$build_dir/lseek-under-signal.wasm"
-  run_fixes_expecting lseek-under-signal.wasm \
-    "WASIX seeks and syncs survive a signal flood"
-}
-
 install_current_set() {
   install_wrapper
   install_sysroot
@@ -299,9 +196,6 @@ install_current_set() {
   install_binaryen
   patch_sysroot
   install_wasmer
-  if [[ "$SC_CHECK" -eq 1 ]]; then
-    run_smoke
-  fi
 }
 
 load_default_set() {
@@ -340,7 +234,7 @@ set_key() {
 }
 
 # Sets are identified by their five pins; a set already handled is skipped so
-# services that share the default pins do not repeat its checks and smoke test.
+# services that share the default pins do not repeat its checks.
 declare -A handled_sets=()
 
 (

@@ -1,22 +1,23 @@
 /* Verify that the libc's malloc works across threads.  The sysroot's libc is
- * built with mimalloc (patches/wasix-libc, patches/mimalloc), whose WASI port
- * is single-threaded without its patch and never learns that a thread ended,
- * so every thread's heap is lost with it.  Here threads allocate blocks of
- * many sizes and leave each one in a shared table, freeing whatever block it
- * replaces, so most blocks are freed by a thread that did not allocate them;
- * the threads then end and new ones take their place.  A block is filled with
- * a byte derived from its address and size, and checked before it is freed.
- * The light rounds come first, while the program's memory is still small and
- * has no room to hide a leak in: once a few of them have filled the table,
- * thousands more short-lived threads must fit in what ended threads gave
- * back.  Memory may grow by one of mimalloc's arenas, which over that many
- * threads is a few KiB each, where the unpatched port loses a thread's whole
- * heap and is stopped within a few rounds.  The heavy rounds then add large
- * blocks and long-lived contention.  What the allocation functions leave in
- * errno, the aligned allocation functions, and a block that libc allocates
- * for the program to free, are checked first; last, a very large block and
- * one with the largest alignment mimalloc serves must each reuse the memory
- * they free, and a larger alignment must be refused. */
+ * built with mimalloc (toolchain/sources/wasix-libc/patches,
+ * toolchain/sources/mimalloc/patches), whose WASI port is single-threaded
+ * without its patch and never learns that a thread ended, so every thread's
+ * heap is lost with it.  Here threads allocate blocks of many sizes and leave
+ * each one in a shared table, freeing whatever block it replaces, so most
+ * blocks are freed by a thread that did not allocate them; the threads then
+ * end and new ones take their place.  A block is filled with a byte derived
+ * from its address and size, and checked before it is freed. The light rounds
+ * come first, while the program's memory is still small and has no room to
+ * hide a leak in: once a few of them have filled the table, thousands more
+ * short-lived threads must fit in what ended threads gave back.  Memory may
+ * grow by one of mimalloc's arenas, which over that many threads is a few KiB
+ * each, where the unpatched port loses a thread's whole heap and is stopped
+ * within a few rounds.  The heavy rounds then add large blocks and long-lived
+ * contention.  What the allocation functions leave in errno, the aligned
+ * allocation functions, and a block that libc allocates for the program to
+ * free, are checked first; last, a very large block and one with the largest
+ * alignment mimalloc serves must each reuse the memory they free, and a larger
+ * alignment must be refused. */
 
 #include <errno.h>
 #include <pthread.h>

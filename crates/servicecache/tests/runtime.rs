@@ -1,5 +1,5 @@
 //! The embedded runtime runs a module with isolated stdio and no network.
-//! The fixtures are the toolchain's smoke modules (`bootstrap.sh --check`);
+//! The fixtures are the toolchain's smoke modules (`make smoke-toolchain`);
 //! the tests are skipped when they are not built.
 
 use std::path::{Path, PathBuf};

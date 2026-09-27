@@ -1,10 +1,10 @@
 /* Listens on the port named by its argument, accepts one connection and
  * tells the client the addresses the guest sees: its own listening port
  * (getsockname) and the client's port (getpeername). Given a second port,
- * it also reports what of the network it can reach. Built by bootstrap.sh
- * --check; the manager's tests run it under the host to check that a guest
- * reads ports back correctly and makes outbound connections only to its
- * own endpoint. */
+ * it also reports what of the network it can reach. Built by
+ * toolchain/smoke/build.sh; the manager's tests run it under the host to
+ * check that a guest reads ports back correctly and makes outbound
+ * connections only to its own endpoint. */
 
 #include <arpa/inet.h>
 #include <errno.h>

@@ -24,9 +24,13 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          sc = import ./nix { inherit pkgs; };
           wasmer = import ./wasmer/build.nix { inherit pkgs; };
         in
-        lib.mapAttrs' (name: package: lib.nameValuePair "wasmer-${name}" package) wasmer.packages
+        {
+          smoke-toolchain = sc.toolchain.smoke;
+        }
+        // lib.mapAttrs' (name: package: lib.nameValuePair "wasmer-${name}" package) wasmer.packages
         // lib.mapAttrs' (name: package: lib.nameValuePair "wasmer-${name}-tests" package) wasmer.tests
       );
 

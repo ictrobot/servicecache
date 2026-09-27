@@ -58,9 +58,9 @@ common_args=(
 # The bootstrap failed about one time in twenty until the sysroot's libc was
 # fixed: two guest threads resolving relative paths at once corrupted each
 # other's paths (wasix-libc chdir.c; the fix is
-# patches/wasix-libc/0001-chdir-lock-relative-path-resolution.patch, built into
-# the sysroot by toolchain/bootstrap.sh). A guest built against an unpatched
-# sysroot still has it, so a failed bootstrap is retried once, loudly.
+# toolchain/sources/wasix-libc/patches/0001-chdir-lock-relative-path-resolution.patch,
+# built into the sysroot by toolchain/bootstrap.sh). A guest built against an
+# unpatched sysroot still has it, so a failed bootstrap is retried once, loudly.
 bootstrapped=false
 for attempt in 1 2; do
   if "$SC_TOOLCHAIN/run-wasix.sh" "$server_module" \

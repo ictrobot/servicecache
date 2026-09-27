@@ -1,7 +1,7 @@
 /* Reports what a WASIX guest sees of its standard input and of the network:
  * how many bytes stdin holds, whether it is a terminal, and what connecting
- * to a loopback port returns. Built by bootstrap.sh --check; the manager's
- * tests run it to check the embedded runtime without any service. */
+ * to a loopback port returns. Built by toolchain/smoke/build.sh; the
+ * manager's tests run it to check the embedded runtime without any service. */
 
 #include <arpa/inet.h>
 #include <errno.h>

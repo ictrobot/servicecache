@@ -86,7 +86,7 @@ Common checks (`make lint` needs `uv`, `cargo-deny`, and Nix):
 ```sh
 make lint                 # formatting and static checks
 make test                 # Rust unit and integration tests
-make smoke-toolchain      # build and run the WASIX toolchain fixtures
+make smoke-toolchain      # build and run the WASIX fixtures
 make smoke-services       # smoke-test the built service packages
 make lifecycle-tests      # freeze and fork every built service
 ```
