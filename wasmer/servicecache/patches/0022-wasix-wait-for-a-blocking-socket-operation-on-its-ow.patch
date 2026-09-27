@@ -408,7 +408,7 @@ index 944beb5..4510f9a 100644
  /// Performs mutable work on a socket under an asynchronous runtime with
  /// built in signal processing
  pub(crate) fn __sock_asyncify_mut<T, F, Fut>(
-@@ -1686,3 +2021,368 @@ pub(crate) fn conv_spawn_err_to_errno(err: &SpawnError) -> Errno {
+@@ -1686,3 +2021,369 @@ pub(crate) fn conv_spawn_err_to_errno(err: &SpawnError) -> Errno {
  pub(crate) fn conv_spawn_err_to_exit_code(err: &SpawnError) -> ExitCode {
      conv_spawn_err_to_errno(err).into()
  }
@@ -567,6 +567,7 @@ index 944beb5..4510f9a 100644
 +            std::thread::sleep(Duration::from_millis(50));
 +            let mut drain = vec![0u8; filled];
 +            peer.read_exact(&mut drain).unwrap();
++            peer.read_exact(&mut [0u8; 1]).unwrap();
 +            drain.len()
 +        });
 +
