@@ -10,7 +10,6 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 source "$root/toolchain/lib.sh"
-source "$root/toolchain/versions.sh"
 source "$root/wasmer/lib.sh"
 
 checkout="${1:-$root/work/wasmer-dev}"

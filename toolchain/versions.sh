@@ -11,7 +11,6 @@
 : "${WASIX_SYSROOT_TAG:=v2026-07-30.1}"
 : "${WASIX_LLVM_TAG:=21.1.206}"
 : "${BINARYEN_TAG:=version_132}"
-: "${WASMER_VERSION:=7.3.0}"
 # The sysroot's libc is built with this mimalloc as its malloc.
 : "${MIMALLOC_TAG:=v3.5.3}"
 

@@ -513,7 +513,7 @@ sc_write_build_info() {
     echo "Upstream tag: $upstream_tag"
     echo "ServiceCache commit: $servicecache_commit"
     sc_toolchain_identity
-    echo "Wasmer: $WASMER_VERSION"
+    echo "Wasmer: $(cat "$SC_ROOT/wasmer/version")"
     echo "Guest extensions: ${SC_GUEST_EXTENSIONS:-none}"
   } > "$out_dir/BUILD-INFO"
 }

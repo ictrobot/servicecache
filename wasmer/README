@@ -1,13 +1,11 @@
-Wasmer 7.3.0, built from the pinned tag in named variants. A variant is an
-ordered list of patch sets applied to the tag, declared in
-<variant>/variant.env; its checkout lives at work/src/wasmer/<variant>, its
-cargo output at work/build/wasmer/<variant>, and its CLI is installed at
-work/wasmer/<variant>/bin/wasmer, mirroring how services are laid out.
+Wasmer 7.3.0 is built from the pinned tag in named variants. Each variant's
+patches.list gives its ordered patch sets. wasmer/build.nix builds the CLIs
+through Nix; make wasmer-<variant> links one at work/wasmer/<variant>.
 Every variant builds only the Cranelift compiler backend; ServiceCache does
 not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
 
 - stock: no patches. A guest with no extension declaration must run under
-  it unchanged, and it is the unpatched baseline for test.sh.
+  it unchanged, and it is the unpatched baseline for the other variants.
 
 - fixes: fixes to upstream Wasmer that are not specific to ServiceCache.
 
@@ -25,25 +23,26 @@ not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
   forked child. It is off unless selected; the CLI takes --profiler jitdump.
 
 - servicecache: the runtime the host embeds ([patch.crates-io] in Cargo.toml
-  points at its checkout). It applies the fixes, extensions and jitdump sets
-  and then its own, which makes a guest coroutine suspend on a blocking host
-  wait instead of parking its OS thread, lets guest threads be resurrected on
-  fresh threads in a forked child, rebuilds the selector after a fork,
-  replaces a clone's listening socket, snapshots shared memory across the
-  native fork so clones diverge, keeps host I/O from going through a runtime
-  handle captured at construction, and waits on a guest futex or on a
+  points at its separate host checkout). It applies the fixes, extensions and
+  jitdump sets and then its own, which makes a guest coroutine suspend on a
+  blocking host wait instead of parking its OS thread, lets guest threads be
+  resurrected on fresh threads in a forked child, rebuilds the selector after
+  a fork, replaces a clone's listening socket, snapshots shared memory across
+  the native fork so clones diverge, keeps host I/O from going through a
+  runtime handle captured at construction, and waits on a guest futex or on a
   socket's host descriptor in the kernel. Suspension is off unless the host
   enables it; the I/O changes apply always.
 
-build.sh <variant> builds and installs a variant's CLI, stamped with the
-hash of its patch sets so that a changed series rebuilds it; setup.sh
-<variant> only prepares its checkout, resetting it to the tag first when
-the patches applied to it are not the current sets; test.sh <variant>
-runs the unit tests of the crates that go into the built CLIs, and of any
-other crate the patch sets modify, so patches carry their tests and the
-tests actually run; upstream's integration suites and the backends we do
-not build are left to upstream's CI. The matching make targets are
-wasmer-<variant>, test-wasmer-<variant> and clean-wasmer-<variant>.
+The flake exposes wasmer-<variant> and wasmer-<variant>-tests packages. The
+matching make targets link the CLI or run its unit tests. Smoke tests and
+toolchain/bootstrap.sh build the CLIs they run. Upstream's integration suites
+and the backends we do not build are left to upstream's CI. Two upstream tests
+that download from the public registry are skipped in Nix's network-isolated
+sandbox.
+
+make setup-wasmer prepares work/src/wasmer/servicecache for host Cargo,
+without Nix. make build and make test use this checkout. It is separate from
+the immutable Nix source used for the servicecache CLI.
 
 The patch sets are developed as stacked branches of a checkout under
 work/wasmer-dev — a set's branch contains the branches below it — and

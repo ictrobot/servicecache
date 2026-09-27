@@ -16,7 +16,7 @@ SERVICE_NAMES := $(sort $(foreach file,$(SERVICE_VERSION_FILES),$(word 2,$(subst
 SERVICE_NAME_TARGETS := $(foreach verb,service smoke-service clean-service purge-service lifecycle-service,$(addprefix $(verb)-,$(SERVICE_NAMES)))
 
 # Wasmer variants: build, test and clean targets per wasmer/<variant>/.
-WASMER_VARIANTS := $(patsubst wasmer/%/variant.env,%,$(wildcard wasmer/*/variant.env))
+WASMER_VARIANTS := $(patsubst wasmer/%/patches.list,%,$(wildcard wasmer/*/patches.list))
 WASMER_TARGETS := $(addprefix wasmer-,$(WASMER_VARIANTS))
 TEST_WASMER_TARGETS := $(addprefix test-wasmer-,$(WASMER_VARIANTS))
 CLEAN_WASMER_TARGETS := $(addprefix clean-wasmer-,$(WASMER_VARIANTS))
@@ -40,12 +40,12 @@ help:
 	@echo "smoke-extension-<name>          run one extension's demo under the extensions CLI; stock must refuse it"
 	@echo "setup-wasmer                    prepare the servicecache Wasmer variant the host builds against"
 	@echo "setup-wasmer-dev                put work/wasmer-dev's exported branches at the committed patch sets (clones it if missing)"
-	@echo "wasmer-<variant>                build a Wasmer variant's CLI into work/wasmer/<variant> ($(WASMER_VARIANTS))"
-	@echo "test-wasmer-<variant>           run the unit tests of the CLI's crates in that variant's checkout"
+	@echo "wasmer-<variant>                build a Wasmer CLI with Nix and link it into work/wasmer/<variant> ($(WASMER_VARIANTS))"
+	@echo "test-wasmer-<variant>           run the Wasmer variant's unit tests through Nix"
 	@echo "build                           setup-wasmer, then cargo build"
 	@echo "build-release                   setup-wasmer, then cargo build --release"
 	@echo "test                            setup-wasmer, then cargo test"
-	@echo "lint                            setup-wasmer, then ruff (through uv), cargo fmt --check, cargo clippy, cargo deny and the patch header checks"
+	@echo "lint                            setup-wasmer, then ruff (through uv), cargo fmt --check, cargo clippy, cargo deny, the patch header checks and the flake's checks"
 	@echo "lifecycle-tests                 freeze and fork every built service through the host (quick matrix)"
 	@echo "lifecycle-tests-long            the same plus the long cases (thousands of forks)"
 	@echo "lifecycle-tests-release         the quick matrix on a release build, for latency figures"
@@ -58,7 +58,7 @@ help:
 	@echo "check                           lint, test and smoke-toolchain"
 	@echo "clean                           remove build outputs: every service, cargo, the toolchain smoke"
 	@echo "clean-services                  remove every service's build and output; keep source checkouts"
-	@echo "clean-wasmer                    reset every Wasmer variant (also clean-wasmer-<variant>)"
+	@echo "clean-wasmer                    remove Wasmer CLI output links (also clean-wasmer-<variant>)"
 	@echo "clean-wasix-libc                reset work/wasix-libc and work/mimalloc to their pristine tags so bootstrap re-applies the series"
 	@echo "clean-service-<name>-<version>  the same for one service version"
 	@echo "purge-service-<name>-<version>  also remove its source checkout"
@@ -72,7 +72,7 @@ smoke-toolchain: bootstrap
 	toolchain/bootstrap.sh --all --check
 
 setup-wasmer:
-	wasmer/setup.sh servicecache
+	wasmer/setup.sh
 
 setup-wasmer-dev:
 	wasmer/setup-dev.sh
@@ -92,6 +92,7 @@ lint: setup-wasmer lint-python
 	cargo deny -L error --config deny.toml check licenses bans
 	! grep -rniE 'mysql|mariadb|postgres|valkey|beanstalkd' crates/servicecache
 	toolchain/check-patches.sh
+	toolchain/nix.sh check
 
 # The developer tools, from the locked dev group in pyproject.toml. Nothing
 # a build runs needs them, or anything beyond an interpreter.
@@ -161,10 +162,7 @@ test-wasmer-$(1):
 	wasmer/test.sh $(1)
 
 clean-wasmer-$(1):
-	if [ -d work/src/wasmer/$(1) ]; then \
-	  git -C work/src/wasmer/$(1) reset --quiet --hard && git -C work/src/wasmer/$(1) clean --quiet -fdx; \
-	fi
-	rm -rf work/build/wasmer/$(1) work/wasmer/$(1)
+	rm -rf work/wasmer/$(1)
 endef
 
 $(foreach variant,$(WASMER_VARIANTS),$(eval $(call wasmer_variant_rules,$(variant))))

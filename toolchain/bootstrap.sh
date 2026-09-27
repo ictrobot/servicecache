@@ -313,7 +313,7 @@ load_service_set() {
   local version_file="$1"
   local service_versions="${version_file%/versions/*}/versions.sh"
 
-  unset WASIXCC_VERSION WASIX_SYSROOT_TAG WASIX_LLVM_TAG BINARYEN_TAG WASMER_VERSION
+  unset WASIXCC_VERSION WASIX_SYSROOT_TAG WASIX_LLVM_TAG BINARYEN_TAG
   unset MIMALLOC_TAG
   unset WASIXCC_SHA256_X86_64 WASIXCC_SHA256_AARCH64
   source "$version_file"
@@ -335,11 +335,11 @@ done
 mkdir -p "$SC_ROOT/work/downloads/toolchain"
 
 set_key() {
-  printf '%s|%s|%s|%s|%s|%s' "$WASIXCC_VERSION" "$WASIX_SYSROOT_TAG" \
-    "$WASIX_LLVM_TAG" "$BINARYEN_TAG" "$WASMER_VERSION" "$MIMALLOC_TAG"
+  printf '%s|%s|%s|%s|%s' "$WASIXCC_VERSION" "$WASIX_SYSROOT_TAG" \
+    "$WASIX_LLVM_TAG" "$BINARYEN_TAG" "$MIMALLOC_TAG"
 }
 
-# Sets are identified by their six pins; a set already handled is skipped so
+# Sets are identified by their five pins; a set already handled is skipped so
 # services that share the default pins do not repeat its checks and smoke test.
 declare -A handled_sets=()
 
