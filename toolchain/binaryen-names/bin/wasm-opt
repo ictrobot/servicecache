@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-# binaryen's wasm-opt, with -g: sc_host_init points wasixcc's
-# WASIXCC_BINARYEN_LOCATION here, so every wasm-opt run wasixcc makes keeps
-# the module's name section.
-exec "${SC_WASM_OPT:?sc_host_init must set SC_WASM_OPT}" -g "$@"

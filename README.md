@@ -15,13 +15,13 @@ Early development prototype. Interfaces, service packages and runtime patches ma
 ## Requirements
 
 - Linux on x86-64 or AArch64.
-- Rust, normally installed through [rustup](https://rustup.rs/).
-- Bash, Git, GNU Make, curl, tar and `sha256sum`.
+- A host C/C++ compiler and Rust, normally installed through [rustup](https://rustup.rs/).
+- Bash, Git, GNU Make and `sha256sum`.
 - Python 3.11 or newer as `python3` (`SC_PYTHON` overrides the interpreter).
 - An installed single-user or multi-user [Nix](https://nixos.org/download).
-- Enough time and disk space for source builds. The pinned WASIX toolchain, source checkouts and database build trees can occupy multiple gigabytes.
+- Enough time and disk space for source builds. The guest toolchain, sources and database builds can occupy multiple gigabytes.
 
-Project-generated toolchain, source and service state is kept below `work/`. Services built through Nix live in its store, linked from `work/services`. Rust build output goes below `target/`.
+Nix outputs live in its store, linked from `work/services`. Smoke fixtures and Wasmer's host checkouts and builds are kept below `work/`. Rust build output goes below `target/`.
 
 ## Quick start
 

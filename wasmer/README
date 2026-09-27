@@ -34,11 +34,10 @@ not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
   enables it; the I/O changes apply always.
 
 The flake exposes wasmer-<variant> and wasmer-<variant>-tests packages. The
-matching make targets link the CLI or run its unit tests. Smoke tests and
-toolchain/bootstrap.sh build the CLIs they run. Upstream's integration suites
-and the backends we do not build are left to upstream's CI. Two upstream tests
-that download from the public registry are skipped in Nix's network-isolated
-sandbox.
+matching make targets link the CLI or run its unit tests. Smoke tests build
+the CLI they need; guest builds do not. Upstream's integration suites and the
+backends we do not build are left to upstream's CI. Two upstream tests that
+download from the public registry are skipped in Nix's network-isolated sandbox.
 
 make setup-wasmer prepares work/src/wasmer/servicecache for host Cargo,
 without Nix. make build and make test use this checkout. It is separate from

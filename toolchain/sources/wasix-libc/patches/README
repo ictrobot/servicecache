@@ -1,7 +1,5 @@
 Patches to wasix-libc, pinned in ../default.nix and built by toolchain/libc.sh
 with mimalloc as its allocator (enabled by patch 0003).
-toolchain/bootstrap.sh also applies them to the libc it builds into the
-downloaded WASIX sysroot.
 
 Except where otherwise noted, Copyright (c) 2026 Ethan Jones.
 
