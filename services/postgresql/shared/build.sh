@@ -8,10 +8,17 @@ sc_build_init postgresql "${1:?usage: $0 version}"
 # record are files' places in PostgreSQL rather than paths of this build.
 build="$SC_BUILD_DIR/postgresql"
 sc_copy_source "$SC_SOURCE_POSTGRESQL_DIR" "$build"
+sc_copy_source "$SC_SOURCE_PGVECTOR_DIR" "$build/pgvector"
 
 # Each loadable module package.nix lists is linked into postgres.wasm and
 # reached through a generated table (src/include/port/wasix_static_modules.h).
 mapfile -t static_modules <<< "${SC_POSTGRESQL_LOADABLE_MODULES:?}"
+
+# Entry points a module looks up by name itself rather than through fmgr.
+declare -A static_module_entry_points=()
+while read -r module_name entry_points; do
+  [[ -z "$module_name" ]] || static_module_entry_points["$module_name"]="$entry_points"
+done <<< "${SC_POSTGRESQL_MODULE_ENTRY_POINTS-}"
 
 # A module's table entries (kind, name looked up, defining symbol), read
 # from its archive: the magic block, _PG_init, and each version-1 function
@@ -32,6 +39,10 @@ static_module_entries() {
     defines "$function" || { sc_fail "module $module_name declares $symbol without $function"; return 1; }
     echo "finfo $symbol $symbol"
     echo "function $function $function"
+  done
+  for symbol in ${static_module_entry_points[$module_name]-}; do
+    defines "$symbol" || { sc_fail "module $module_name does not define $symbol"; return 1; }
+    echo "entry $symbol $symbol"
   done
 }
 

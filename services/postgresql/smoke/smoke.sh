@@ -471,6 +471,46 @@ check "SELECT b > '2000-01-01 00:00:00+00' AND b <= now() FROM smoke_moddatetime
 # contrib/spi's other trigger modules are neither linked in nor installed.
 check "SELECT count(*) FROM pg_available_extensions WHERE name IN ('autoinc', 'insert_username', 'refint')" "0"
 
+# vector
+check "CREATE EXTENSION vector"
+check "SELECT '[1,2,3]'::vector <-> '[4,5,6]'::vector" "5.196152422706632"
+check "SELECT '[1,2,3]'::vector <#> '[4,5,6]'::vector" "-32"
+check "SELECT '[1,2,3]'::vector <=> '[4,5,6]'::vector" "0.025368153802923787"
+check "SELECT '[1,2,3]'::vector <+> '[4,5,6]'::vector" "9"
+check "SELECT vector_dims('[1,2,3]'::vector)" "3"
+check "SELECT '[1,2,3]'::halfvec <-> '[4,5,6]'::halfvec" "5.196152422706632"
+check "SELECT '{1:1,3:2}/5'::sparsevec <-> '{1:2}/5'::sparsevec" "2.23606797749979"
+check "SELECT '[1,2]'::vector + '[3,4]'::vector" "[4,6]"
+check "SELECT avg(v) FROM (VALUES ('[1,2]'::vector), ('[3,4]'::vector)) t(v)" "[2,3]"
+check "LOAD 'vector'; SELECT current_setting('hnsw.ef_search'), current_setting('ivfflat.probes')" "40	1"
+# Both index methods answer approximately, so only the exact match, at
+# distance 0, is checked.
+check "CREATE TABLE smoke_vector_hnsw (id int PRIMARY KEY, v vector(3))"
+check "INSERT INTO smoke_vector_hnsw SELECT id, ARRAY[id % 97, id % 89, id % 83]::float[]::vector(3) FROM generate_series(1, 5000) id"
+check "CREATE INDEX smoke_vector_hnsw_index ON smoke_vector_hnsw USING hnsw (v vector_l2_ops)"
+check "ANALYZE smoke_vector_hnsw"
+check "SELECT v FROM smoke_vector_hnsw WHERE id = 1234" "[70,77,72]"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_vector_hnsw ORDER BY v <-> '[70,77,72]' LIMIT 3" \
+  "Limit
+  ->  Index Scan using smoke_vector_hnsw_index on smoke_vector_hnsw
+        Order By: (v <-> '[70,77,72]'::vector)"
+check "SET enable_seqscan = off; SELECT id, v <-> '[70,77,72]' FROM smoke_vector_hnsw ORDER BY v <-> '[70,77,72]' LIMIT 1" "1234	0"
+check "CREATE TABLE smoke_vector_ivfflat (id int PRIMARY KEY, v vector(3))"
+check "INSERT INTO smoke_vector_ivfflat SELECT id, ARRAY[id % 97, id % 89, id % 83]::float[]::vector(3) FROM generate_series(1, 5000) id"
+check "CREATE INDEX smoke_vector_ivfflat_index ON smoke_vector_ivfflat USING ivfflat (v vector_l2_ops) WITH (lists = 10)"
+check "ANALYZE smoke_vector_ivfflat"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_vector_ivfflat ORDER BY v <-> '[70,77,72]' LIMIT 3" \
+  "Limit
+  ->  Index Scan using smoke_vector_ivfflat_index on smoke_vector_ivfflat
+        Order By: (v <-> '[70,77,72]'::vector)"
+check "SET enable_seqscan = off; SELECT id, v <-> '[70,77,72]' FROM smoke_vector_ivfflat ORDER BY v <-> '[70,77,72]' LIMIT 1" "1234	0"
+# A parallel build's workers start through the module's own entry points.
+# The table is too small for the planner to grant workers, so it is told.
+check "CREATE TABLE smoke_vector_parallel (id int PRIMARY KEY, v vector(3)) WITH (parallel_workers = 2)"
+check "INSERT INTO smoke_vector_parallel SELECT id, ARRAY[id % 97, id % 89, id % 83]::float[]::vector(3) FROM generate_series(1, 5000) id"
+check "SET max_parallel_maintenance_workers = 2; SET maintenance_work_mem = '64MB'; CREATE INDEX smoke_vector_parallel_index ON smoke_vector_parallel USING hnsw (v vector_l2_ops)"
+check "SET enable_seqscan = off; SELECT id, v <-> '[70,77,72]' FROM smoke_vector_parallel ORDER BY v <-> '[70,77,72]' LIMIT 1" "1234	0"
+
 kill "$server_pid" 2>/dev/null || true
 wait "$server_pid" 2>/dev/null || true
 server_pid=""

@@ -53,6 +53,25 @@ let
         "DATA=moddatetime--1.0.sql"
       ];
     }
+    # pgvector's makefile is written for PGXS, so it is pointed at this build
+    # tree instead of an installed server; an empty OPTFLAGS leaves out the
+    # -march=native it would add.
+    {
+      name = "vector";
+      directory = "pgvector";
+      makeFlags = [
+        "PG_CONFIG=true"
+        "PGXS=../src/makefiles/pgxs.mk"
+        "includedir_server=../src/include"
+        "includedir_internal=../src/include"
+        "OPTFLAGS="
+      ];
+      # Parallel index builds start their workers by these names.
+      entryPoints = [
+        "HnswParallelBuildMain"
+        "IvfflatParallelBuildMain"
+      ];
+    }
   ];
   postgresqlSource = import ./source.nix {
     inherit
@@ -64,6 +83,7 @@ let
       loadableModules
       ;
   };
+  pgvectorSource = import ../deps/pgvector { inherit sc; };
   versionManifest = versionDirectory + "/service.toml";
 in
 sc.mkGuestBuild {
@@ -73,6 +93,7 @@ sc.mkGuestBuild {
   manifest = if builtins.pathExists versionManifest then versionManifest else ./service.toml;
   sources = {
     postgresql = postgresqlSource;
+    pgvector = pgvectorSource;
   };
   nativeBuildInputs = with pkgs; [
     perl
@@ -85,4 +106,7 @@ sc.mkGuestBuild {
   environment.SC_POSTGRESQL_LOADABLE_MODULES = pkgs.lib.concatMapStringsSep "\n" (
     module: "${module.name} ${module.directory} ${toString (module.makeFlags or [ ])}"
   ) loadableModules;
+  environment.SC_POSTGRESQL_MODULE_ENTRY_POINTS = pkgs.lib.concatMapStringsSep "\n" (
+    module: "${module.name} ${toString module.entryPoints}"
+  ) (builtins.filter (module: module ? entryPoints) loadableModules);
 }

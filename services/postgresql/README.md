@@ -26,3 +26,4 @@
 - `tsm_system_time`
 - `unaccent`
 - `uuid-ossp`
+- `vector`, from [pgvector](https://github.com/pgvector/pgvector)
