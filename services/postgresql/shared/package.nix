@@ -33,6 +33,7 @@ let
     (contrib "isn")
     (contrib "lo")
     (contrib "ltree")
+    (contrib "pg_stat_statements")
     (contrib "pg_trgm")
     (contrib "pgcrypto")
     (contrib "seg")

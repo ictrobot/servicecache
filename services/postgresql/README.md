@@ -15,6 +15,7 @@
 - `lo`
 - `ltree`
 - `moddatetime`
+- `pg_stat_statements`
 - `pg_trgm`
 - `pgcrypto`
 - `plpgsql`

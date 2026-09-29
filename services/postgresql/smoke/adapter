@@ -83,6 +83,7 @@ def expect_parallel_capacity_limited(session, sql, expected, requested, what):
 
 
 def recipe():
+    print("CREATE EXTENSION pg_stat_statements;")
     print("CREATE TABLE adapter_probe (id integer PRIMARY KEY, value text NOT NULL);")
     print("INSERT INTO adapter_probe VALUES (1, 'recipe-value');")
     print("CREATE TABLE parallel_probe AS SELECT id FROM generate_series(1, 20000) id;")
@@ -98,6 +99,15 @@ def check_initialized(host, port):
         session.rows("SELECT id::text, value FROM adapter_probe WHERE id < 1000 ORDER BY id"),
         [["1", "recipe-value"]],
         "initializer row",
+    )
+    # A clone starts with the template's statistics, recipe included.
+    expect(
+        session.rows(
+            "SELECT calls::text FROM pg_stat_statements "
+            "WHERE query LIKE 'CREATE TABLE adapter_probe %'"
+        ),
+        [["1"]],
+        "the recipe's statement in the clone's statistics",
     )
     session.rows(
         "SET max_parallel_workers_per_gather = 4; "
@@ -180,6 +190,15 @@ def check_diverged(host, port, tag):
     session = Session(host, port)
     rows = session.rows("SELECT id::text, value FROM adapter_probe WHERE id >= 1000")
     expect(rows, [[str(1000 + int(tag)), f"clone-{int(tag)}"]], "clone row")
+    # The recipe's insert and this clone's own; siblings' inserts are theirs.
+    expect(
+        session.rows(
+            "SELECT calls::text FROM pg_stat_statements "
+            "WHERE query = 'INSERT INTO adapter_probe VALUES ($1, $2)'"
+        ),
+        [["2"]],
+        "the inserts in the clone's statistics",
+    )
     session.close()
 
 

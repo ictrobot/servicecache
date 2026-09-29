@@ -24,6 +24,8 @@ probe=("$SC_SERVICE_DIR/smoke/postgresql-probe.py" --host 127.0.0.1 --port "$por
 tls_probe=("${probe[@]}" --tls)
 # The same probe, printing the notifications a statement raised after its rows.
 notify_probe=("${probe[@]}" --notifications)
+# The same probe, connected to the database pg_stat_statements' checks create.
+other_database_probe=("${probe[@]}" --database smoke_pg_stat_statements)
 
 mkdir -p "$SC_WORK"
 data_dir="$(mktemp -d "$SC_WORK/postgresql-smoke.XXXXXX")"
@@ -48,6 +50,7 @@ trap cleanup EXIT
   -c dynamic_shared_memory_type=posix -c io_method=sync \
   -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
   -c shared_buffers=16MB -c max_connections=50 -c ssl=on \
+  -c shared_preload_libraries=pg_stat_statements \
   > "$data_dir/server.log" 2>&1 &
 server_pid=$!
 
@@ -82,6 +85,9 @@ tls_check() {
 }
 notify_check() {
   check_with notify_probe "$@"
+}
+other_database_check() {
+  check_with other_database_probe "$@"
 }
 
 check "CREATE TABLE smoke (id int PRIMARY KEY, value text)"
@@ -510,6 +516,59 @@ check "CREATE TABLE smoke_vector_parallel (id int PRIMARY KEY, v vector(3)) WITH
 check "INSERT INTO smoke_vector_parallel SELECT id, ARRAY[id % 97, id % 89, id % 83]::float[]::vector(3) FROM generate_series(1, 5000) id"
 check "SET max_parallel_maintenance_workers = 2; SET maintenance_work_mem = '64MB'; CREATE INDEX smoke_vector_parallel_index ON smoke_vector_parallel USING hnsw (v vector_l2_ops)"
 check "SET enable_seqscan = off; SELECT id, v <-> '[70,77,72]' FROM smoke_vector_parallel ORDER BY v <-> '[70,77,72]' LIMIT 1" "1234	0"
+
+# pg_stat_statements
+# Preloaded at server start: its statistics live in shared memory, so each
+# check below is run by one backend and read back by another.
+check "SHOW shared_preload_libraries" "pg_stat_statements"
+check "CREATE EXTENSION pg_stat_statements"
+check "CREATE ROLE smoke_pg_stat_statements"
+check "CREATE DATABASE smoke_pg_stat_statements"
+check "CREATE TABLE smoke_pg_stat_statements_a (id int)"
+check "CREATE TABLE smoke_pg_stat_statements_b (id int)"
+check "CREATE FUNCTION smoke_pg_stat_statements_f() RETURNS bigint LANGUAGE plpgsql AS 'BEGIN RETURN (SELECT count(*) FROM smoke_pg_stat_statements_a); END'"
+check "SELECT pg_stat_statements_reset() IS NOT NULL" "t"
+# One normalised statement is one entry per database and role.
+check "SELECT 42 + 1" "43"
+check "SELECT 42 + 2" "44"
+check "SELECT 42 + 3" "45"
+check "SET ROLE smoke_pg_stat_statements; SELECT 42 + 4" "46"
+other_database_check "SELECT 42 + 5" "47"
+check "SELECT d.datname, r.rolname, s.calls FROM pg_stat_statements s JOIN pg_database d ON d.oid = s.dbid JOIN pg_roles r ON r.oid = s.userid WHERE s.query = 'SELECT \$1 + \$2' ORDER BY 1, 2" \
+  "postgres	postgres	3
+postgres	smoke_pg_stat_statements	1
+smoke_pg_stat_statements	postgres	1"
+# Four concurrent sessions update one entry 25 times each without losing any.
+concurrent_statements=()
+for i in $(seq 25); do
+  concurrent_statements+=("SELECT 100 * $i")
+done
+concurrent_sessions=()
+for _ in 1 2 3 4; do
+  "${probe[@]}" "${concurrent_statements[@]}" > /dev/null &
+  concurrent_sessions+=("$!")
+done
+for session in "${concurrent_sessions[@]}"; do
+  wait "$session" || { echo "a concurrent session failed" >&2; exit 1; }
+done
+check "SELECT calls FROM pg_stat_statements WHERE query = 'SELECT \$1 * \$2'" "100"
+# A parallel query is counted once, by its leader.
+check "$parallel_settings; SELECT count(*) FROM parallel_smoke WHERE id % 3 = 0" "6666"
+check "SELECT calls, rows, parallel_workers_to_launch, parallel_workers_launched FROM pg_stat_statements WHERE query = 'SELECT count(*) FROM parallel_smoke WHERE id % \$1 = \$2'" "1	1	4	4"
+check "SET pg_stat_statements.track = 'all'; SELECT smoke_pg_stat_statements_f()" "0"
+check "SELECT calls FROM pg_stat_statements WHERE NOT toplevel AND query LIKE '%FROM smoke_pg_stat_statements_a%'" "1"
+check "SET pg_stat_statements.track_planning = on; SELECT 6 * 7 + 1" "43"
+check "SELECT plans, calls FROM pg_stat_statements WHERE query = 'SELECT \$1 * \$2 + \$3'" "1	1"
+check "SELECT pg_stat_statements_reset(0, 0, (SELECT queryid FROM pg_stat_statements WHERE query = 'SELECT \$1 * \$2')) IS NOT NULL" "t"
+check "SELECT count(*) FROM pg_stat_statements WHERE query = 'SELECT \$1 * \$2'" "0"
+check "SELECT dealloc FROM pg_stat_statements_info" "0"
+# The server's own statistics are shared memory too; pg_stat_force_next_flush
+# makes a backend hand its counts over before it answers.
+other_database_check "SELECT pg_stat_force_next_flush()"
+check "SELECT xact_commit > 0 FROM pg_stat_database WHERE datname = 'smoke_pg_stat_statements'" "t"
+check "SELECT count(*) FROM smoke_pg_stat_statements_b; SELECT count(*) FROM smoke_pg_stat_statements_b; SELECT pg_stat_force_next_flush()" "0
+0"
+check "SELECT seq_scan FROM pg_stat_user_tables WHERE relname = 'smoke_pg_stat_statements_b'" "2"
 
 kill "$server_pid" 2>/dev/null || true
 wait "$server_pid" 2>/dev/null || true
