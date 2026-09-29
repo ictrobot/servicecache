@@ -10,29 +10,42 @@ points. A linked-in module has no file, so the scan of loaded modules
 by name is its whole identity check. Installing a module installs its
 archive where its shared object would have gone.
 
-diff --git a/src/Makefile.shlib b/src/Makefile.shlib
-index 3825af5..391c303 100644
---- a/src/Makefile.shlib
-+++ b/src/Makefile.shlib
-@@ -224,6 +224,17 @@ ifeq ($(SHLIB_EXPORTS),)
-   override CXXFLAGS += $(CXXFLAGS_SL_MODULE)
- endif
+diff --git a/src/Makefile.global.in b/src/Makefile.global.in
+index 8b1b357..fa48d64 100644
+--- a/src/Makefile.global.in
++++ b/src/Makefile.global.in
+@@ -570,6 +570,11 @@ WIN32_STACK_RLIMIT=4194304
+ 
+ DLSUFFIX = @DLSUFFIX@
  
 +# On WASIX a loadable module is linked into the server, under entry point
 +# names of its own (src/include/port/wasix_static_modules.h).
++wasix_module_prefix = wasix_module_$(1)_
++wasix_module_cppflags = -D_PG_init=$(call wasix_module_prefix,$(1))_PG_init -DPg_magic_func=$(call wasix_module_prefix,$(1))Pg_magic_func
++
+ # Pull in platform-specific magic
+ include $(top_builddir)/src/Makefile.port
+ 
+diff --git a/src/Makefile.shlib b/src/Makefile.shlib
+index 3825af5..371d03a 100644
+--- a/src/Makefile.shlib
++++ b/src/Makefile.shlib
+@@ -224,6 +224,14 @@ ifeq ($(SHLIB_EXPORTS),)
+   override CXXFLAGS += $(CXXFLAGS_SL_MODULE)
+ endif
+ 
++# On WASIX a loadable module is linked into the server (Makefile.global).
 +ifeq ($(host_os),wasix)
 +ifndef soname
 +wasix_linked_module = yes
-+wasix_module_prefix = wasix_module_$(NAME)_
-+override CPPFLAGS += -D_PG_init=$(wasix_module_prefix)_PG_init
-+override CPPFLAGS += -DPg_magic_func=$(wasix_module_prefix)Pg_magic_func
++override CPPFLAGS += $(call wasix_module_cppflags,$(NAME))
 +endif
 +endif
 +
  
  ##
  ## BUILD
-@@ -362,7 +373,13 @@ endif # PORTNAME == cygwin || PORTNAME == win32
+@@ -362,7 +370,13 @@ endif # PORTNAME == cygwin || PORTNAME == win32
  ##
  
  .PHONY: install-lib install-lib-static install-lib-shared installdirs-lib
@@ -204,7 +217,7 @@ index b1fb610..2faf3f0 100644
  	if (!have_slash)
 diff --git a/src/include/port/wasix_static_modules.h b/src/include/port/wasix_static_modules.h
 new file mode 100644
-index 0000000..4efb700
+index 0000000..87116cb
 --- /dev/null
 +++ b/src/include/port/wasix_static_modules.h
 @@ -0,0 +1,41 @@
@@ -228,7 +241,7 @@ index 0000000..4efb700
 + * server. The build generates this table from the archives it links: the
 + * name each module is loaded by and the entry points dlsym() would find
 + * in it. The two names the fmgr interface fixes are compiled under a
-+ * per-module prefix (src/Makefile.shlib) and listed here under their
++ * per-module prefix (src/Makefile.global.in) and listed here under their
 + * usual names.
 + */
 +typedef void (*WasixModuleFunction) (void);
@@ -249,6 +262,75 @@ index 0000000..4efb700
 +extern const WasixStaticModule wasix_static_modules[];
 +
 +#endif							/* WASIX_STATIC_MODULES_H */
+diff --git a/src/makefiles/pgxs.mk b/src/makefiles/pgxs.mk
+index 039cee3..4d1eddf 100644
+--- a/src/makefiles/pgxs.mk
++++ b/src/makefiles/pgxs.mk
+@@ -216,7 +216,23 @@ endef
+ # end of HEADERS_* stuff
+ 
+ 
+-all: $(PROGRAM) $(DATA_built) $(HEADER_allbuilt) $(SCRIPTS_built) $(addsuffix $(DLSUFFIX), $(MODULES)) $(addsuffix .control, $(EXTENSION))
++# On WASIX a MODULES entry is built as a static archive for the server to
++# link in (Makefile.global).
++ifeq ($(host_os),wasix)
++module_products = $(addsuffix .a, $(addprefix lib, $(MODULES)))
++
++$(foreach module,$(MODULES),$(eval $(module).o: override CPPFLAGS += $(call wasix_module_cppflags,$(module))))
++
++# The "touch" is for the reason the same rule in Makefile.shlib gives.
++lib%.a: %.o
++	rm -f $@
++	$(AR) $(AROPT) $@ $<
++	touch $@
++else
++module_products = $(addsuffix $(DLSUFFIX), $(MODULES))
++endif
++
++all: $(PROGRAM) $(DATA_built) $(HEADER_allbuilt) $(SCRIPTS_built) $(module_products) $(addsuffix .control, $(EXTENSION))
+ 
+ ifeq ($(with_llvm), yes)
+ all: $(addsuffix .bc, $(MODULES)) $(patsubst %.o,%.bc, $(OBJS))
+@@ -228,7 +244,12 @@ NAME = $(MODULE_big)
+ 
+ include $(top_srcdir)/src/Makefile.shlib
+ 
++# On WASIX the server links the static archive instead (Makefile.global).
++ifeq ($(host_os),wasix)
++all: all-static-lib
++else
+ all: all-lib
++endif
+ endif # MODULE_big
+ 
+ 
+@@ -245,7 +266,7 @@ ifneq (,$(DATA_TSEARCH))
+ 	$(INSTALL_DATA) $(addprefix $(srcdir)/, $(DATA_TSEARCH)) '$(DESTDIR)$(datadir)/tsearch_data/'
+ endif # DATA_TSEARCH
+ ifdef MODULES
+-	$(INSTALL_SHLIB) $(addsuffix $(DLSUFFIX), $(MODULES)) '$(DESTDIR)$(pkglibdir)/'
++	$(INSTALL_SHLIB) $(module_products) '$(DESTDIR)$(pkglibdir)/'
+ ifeq ($(with_llvm), yes)
+ 	$(foreach mod, $(MODULES), $(call install_llvm_module,$(mod),$(mod).bc))
+ endif # with_llvm
+@@ -314,7 +335,7 @@ ifneq (,$(DATA_TSEARCH))
+ 	rm -f $(addprefix '$(DESTDIR)$(datadir)/tsearch_data'/, $(notdir $(DATA_TSEARCH)))
+ endif
+ ifdef MODULES
+-	rm -f $(addprefix '$(DESTDIR)$(pkglibdir)'/, $(addsuffix $(DLSUFFIX), $(MODULES)))
++	rm -f $(addprefix '$(DESTDIR)$(pkglibdir)'/, $(module_products))
+ ifeq ($(with_llvm), yes)
+ 	$(foreach mod, $(MODULES), $(call uninstall_llvm_module,$(mod)))
+ endif # with_llvm
+@@ -355,7 +376,7 @@ endif # NO_INSTALL
+ 
+ clean:
+ ifdef MODULES
+-	rm -f $(addsuffix $(DLSUFFIX), $(MODULES)) $(addsuffix .o, $(MODULES)) $(if $(PGFILEDESC),$(WIN32RES)) \
++	rm -f $(module_products) $(addsuffix .o, $(MODULES)) $(if $(PGFILEDESC),$(WIN32RES)) \
+ 	    $(addsuffix .bc, $(MODULES))
+ endif
+ ifdef DATA_built
 diff --git a/src/pl/plpgsql/src/Makefile b/src/pl/plpgsql/src/Makefile
 index 63cb96f..3cc9224 100644
 --- a/src/pl/plpgsql/src/Makefile

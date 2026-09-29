@@ -29,7 +29,9 @@ class Session:
         probe.wait_ready(self.sock)
 
     def rows(self, sql):
-        return probe.query(self.sock, sql)
+        # Nothing here listens, so a statement's rows are all of its answer.
+        rows, _ = probe.query(self.sock, sql)
+        return rows
 
     def close(self):
         try:

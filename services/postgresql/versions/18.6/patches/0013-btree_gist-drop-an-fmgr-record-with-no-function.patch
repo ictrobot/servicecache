@@ -1,0 +1,20 @@
+Subject: btree_gist: drop an fmgr record with no function
+Last-Update: 2026-09-29
+
+btree_gist declares a version-1 info record for gbt_timetz_sortsupport,
+which no source file defines and nothing looks up. A linked-in module's
+table of entry points is generated from its archive and needs the
+function beside every record, so drop the record.
+
+diff --git a/contrib/btree_gist/btree_time.c b/contrib/btree_gist/btree_time.c
+index 1dba950..d8607f2 100644
+--- a/contrib/btree_gist/btree_time.c
++++ b/contrib/btree_gist/btree_time.c
+@@ -28,7 +28,6 @@ PG_FUNCTION_INFO_V1(gbt_timetz_consistent);
+ PG_FUNCTION_INFO_V1(gbt_time_penalty);
+ PG_FUNCTION_INFO_V1(gbt_time_same);
+ PG_FUNCTION_INFO_V1(gbt_time_sortsupport);
+-PG_FUNCTION_INFO_V1(gbt_timetz_sortsupport);
+ 
+ 
+ #ifdef USE_FLOAT8_BYVAL

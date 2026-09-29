@@ -9,6 +9,7 @@
 let
   inherit (pkgs) lib;
   pin = versionData.upstream;
+  directories = map (module: module.directory) loadableModules;
 in
 sc.mkSource {
   inherit version;
@@ -23,12 +24,13 @@ sc.mkSource {
         reason = "Unused as upstream tests are not built.";
       }
       {
-        paths = [ "contrib" ];
-        reason = "Unused as contrib modules are not built.";
+        paths = [ "contrib/" ];
+        keep = [ "contrib/contrib-global.mk" ] ++ builtins.filter (lib.hasPrefix "contrib/") directories;
+        reason = "Unused as only the listed modules are built. Keep the makefile fragment they include.";
       }
       {
         paths = [ "src/pl/" ];
-        keep = builtins.filter (lib.hasPrefix "src/pl/") (map (module: module.directory) loadableModules);
+        keep = builtins.filter (lib.hasPrefix "src/pl/") directories;
         reason = "Unused as only the listed modules are built.";
       }
       {

@@ -38,6 +38,13 @@ def error_text(payload: bytes) -> str:
     return ": ".join(fields) or "unknown PostgreSQL error"
 
 
+def notification_text(payload: bytes) -> str:
+    """The channel and payload of a NotificationResponse."""
+    channel, _, rest = payload[4:].partition(b"\0")
+    body = rest.split(b"\0")[0]
+    return f"NOTIFY {channel.decode()} {body.decode()}"
+
+
 def wait_ready(sock: socket.socket) -> None:
     while True:
         kind, payload = read_message(sock)
@@ -47,9 +54,11 @@ def wait_ready(sock: socket.socket) -> None:
             return
 
 
-def query(sock: socket.socket, sql: str) -> list[list[str | None]]:
+def query(sock: socket.socket, sql: str) -> tuple[list[list[str | None]], list[str]]:
+    """The rows a statement returns, and the notifications that arrived with them."""
     sock.sendall(packet(b"Q", sql.encode() + b"\0"))
     rows = []
+    notifications = []
     while True:
         kind, payload = read_message(sock)
         if kind == b"E":
@@ -67,8 +76,10 @@ def query(sock: socket.socket, sql: str) -> list[list[str | None]]:
                     row.append(payload[offset : offset + length].decode())
                     offset += length
             rows.append(row)
+        if kind == b"A":
+            notifications.append(notification_text(payload))
         if kind == b"Z":
-            return rows
+            return rows, notifications
 
 
 def start_tls(sock: socket.socket) -> ssl.SSLSocket:
@@ -89,6 +100,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=5432)
     parser.add_argument("--database", default="postgres")
     parser.add_argument("--tls", action="store_true")
+    parser.add_argument("--notifications", action="store_true")
     parser.add_argument("sql", nargs="+")
     args = parser.parse_args()
 
@@ -102,8 +114,12 @@ def main() -> int:
         sock.sendall(struct.pack("!II", len(startup) + 8, 196608) + startup)
         wait_ready(sock)
         for statement in args.sql:
-            for row in query(sock, statement):
+            rows, notifications = query(sock, statement)
+            for row in rows:
                 print("\t".join("" if value is None else value for value in row))
+            if args.notifications:
+                for notification in notifications:
+                    print(notification)
         sock.sendall(packet(b"X", b""))
     return 0
 

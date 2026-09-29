@@ -49,7 +49,7 @@ write_static_module_table() {
   echo '#include "port/wasix_static_modules.h"'
 
   for module in "${static_modules[@]}"; do
-    read -r module_name module_dir <<< "$module"
+    read -r module_name module_dir _ <<< "$module"
     entries="$(static_module_entries "$module_name" "$build/$module_dir/lib$module_name.a")" || return 1
 
     echo
@@ -74,7 +74,7 @@ write_static_module_table() {
   echo
   echo "const WasixStaticModule wasix_static_modules[] = {"
   for module in "${static_modules[@]}"; do
-    read -r module_name module_dir <<< "$module"
+    read -r module_name module_dir _ <<< "$module"
     echo "	{\"$module_name\", ${module_name}_symbols},"
   done
   echo "	{NULL, NULL}"
@@ -143,8 +143,9 @@ sc_guest make -C "$build/src/common" -j"$JOBS" all
 module_stage="$SC_BUILD_DIR/modules"
 module_archives=()
 for module in "${static_modules[@]}"; do
-  read -r module_name module_dir <<< "$module"
-  sc_guest make -C "$build/$module_dir" -j"$JOBS" install \
+  read -r module_name module_dir make_flags <<< "$module"
+  read -ra make_flags <<< "$make_flags"
+  sc_guest make -C "$build/$module_dir" -j"$JOBS" "${make_flags[@]}" install \
     DESTDIR="$module_stage" datadir=/share/postgresql
   module_archives+=("$build/$module_dir/lib$module_name.a")
 done

@@ -8,10 +8,49 @@
 let
   versionDirectory = ../versions + "/${version}";
   versionData = import (versionDirectory + "/version.nix");
+  contrib = name: {
+    inherit name;
+    directory = "contrib/${name}";
+  };
   loadableModules = [
     {
       name = "plpgsql";
       directory = "src/pl/plpgsql/src";
+    }
+    (contrib "bloom")
+    (contrib "btree_gin")
+    (contrib "btree_gist")
+    (contrib "citext")
+    (contrib "cube")
+    (contrib "dict_int")
+    (contrib "earthdistance")
+    (contrib "hstore")
+    # intarray's library is _int.
+    {
+      name = "_int";
+      directory = "contrib/intarray";
+    }
+    (contrib "isn")
+    (contrib "lo")
+    (contrib "ltree")
+    (contrib "pg_trgm")
+    (contrib "pgcrypto")
+    (contrib "seg")
+    (contrib "sslinfo")
+    (contrib "tablefunc")
+    (contrib "tcn")
+    (contrib "tsm_system_rows")
+    (contrib "tsm_system_time")
+    (contrib "unaccent")
+    # contrib/spi builds four trigger modules; only moddatetime is linked in.
+    {
+      name = "moddatetime";
+      directory = "contrib/spi";
+      makeFlags = [
+        "MODULES=moddatetime"
+        "EXTENSION=moddatetime"
+        "DATA=moddatetime--1.0.sql"
+      ];
     }
   ];
   postgresqlSource = import ./source.nix {
@@ -43,6 +82,6 @@ sc.mkGuestBuild {
   libraries = { inherit (libraries) openssl; };
   extensions = { inherit (extensions) ictrobot_shm_v1; };
   environment.SC_POSTGRESQL_LOADABLE_MODULES = pkgs.lib.concatMapStringsSep "\n" (
-    module: "${module.name} ${module.directory}"
+    module: "${module.name} ${module.directory} ${toString (module.makeFlags or [ ])}"
   ) loadableModules;
 }

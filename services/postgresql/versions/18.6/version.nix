@@ -1,7 +1,7 @@
 {
   upstream = {
     rev = "724edf9bde9d356724ad384a2e196edc3c9f80f7";
-    hash = "sha256-/Acs/E6U6i9gcNWxF+lCOiDEVc8th+MBBbZO+wakNa8=";
+    hash = "sha256-Urss+GzSyqcANIH5xCiz1QKUwnNkN2ITV+zgRuxjOOY=";
   };
-  tarHash = "sha256-6ogknmQIpHnbnc7t7V5ulkuxaML1hgFx73FoZu6GpWs=";
+  tarHash = "sha256-kGdKKvyXPohLsHYQjeW7yVOPLvSb1sjQ87bNWXW2fYQ=";
 }

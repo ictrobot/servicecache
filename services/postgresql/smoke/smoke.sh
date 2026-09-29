@@ -22,6 +22,8 @@ probe=("$SC_SERVICE_DIR/smoke/postgresql-probe.py" --host 127.0.0.1 --port "$por
 # The same probe over TLS, which it asks for before the startup packet,
 # accepting the server's own certificate.
 tls_probe=("${probe[@]}" --tls)
+# The same probe, printing the notifications a statement raised after its rows.
+notify_probe=("${probe[@]}" --notifications)
 
 mkdir -p "$SC_WORK"
 data_dir="$(mktemp -d "$SC_WORK/postgresql-smoke.XXXXXX")"
@@ -64,8 +66,8 @@ if [[ "$ready" != true ]]; then
 fi
 
 # check sql [expected]: one probe call, a session of its own, and its whole
-# output, which is empty when no expected output is given. tls_check does the
-# same over a TLS connection.
+# output, which is empty when no expected output is given. tls_check and
+# notify_check do the same over a TLS connection and with notifications.
 check_with() {
   local -n probe_command="$1"
   local actual expected="${3-}"
@@ -77,6 +79,9 @@ check() {
 }
 tls_check() {
   check_with tls_probe "$@"
+}
+notify_check() {
+  check_with notify_probe "$@"
 }
 
 check "CREATE TABLE smoke (id int PRIMARY KEY, value text)"
@@ -138,6 +143,317 @@ check "SELECT extname || ' ' || lanname FROM pg_extension, pg_language WHERE ext
 check "CREATE FUNCTION smoke_total(n int) RETURNS int LANGUAGE plpgsql AS 'DECLARE total int := 0; BEGIN FOR i IN 1..n LOOP total := total + i; END LOOP; RETURN total; END'"
 check "SELECT smoke_total(100)::text" "5050"
 check "DO 'BEGIN PERFORM smoke_total(1); END'"
+
+# citext
+check "CREATE EXTENSION citext"
+check "CREATE TABLE smoke_citext (name citext PRIMARY KEY)"
+check "INSERT INTO smoke_citext VALUES ('Abc'), ('XYZ')"
+check "INSERT INTO smoke_citext VALUES ('ABC') ON CONFLICT DO NOTHING"
+check "SELECT name FROM smoke_citext WHERE name = 'abc'" "Abc"
+check "SELECT count(*) FROM smoke_citext" "2"
+
+# pg_trgm
+check "CREATE EXTENSION pg_trgm"
+check "SELECT array_length(show_trgm('word'), 1)" "5"
+check "SELECT similarity('word', 'wordy') > 0.5" "t"
+check "SELECT 'word'::text % 'wordy'::text" "t"
+check "CREATE TABLE smoke_pg_trgm AS SELECT 'word' || id::text AS value FROM generate_series(1, 2000) id"
+check "CREATE INDEX smoke_pg_trgm_index ON smoke_pg_trgm USING gin (value gin_trgm_ops)"
+check "ANALYZE smoke_pg_trgm"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT value FROM smoke_pg_trgm WHERE value LIKE '%rd1234%'" \
+  "Bitmap Heap Scan on smoke_pg_trgm
+  Recheck Cond: (value ~~ '%rd1234%'::text)
+  ->  Bitmap Index Scan on smoke_pg_trgm_index
+        Index Cond: (value ~~ '%rd1234%'::text)"
+check "SET enable_seqscan = off; SELECT value FROM smoke_pg_trgm WHERE value LIKE '%rd1234%'" "word1234"
+
+# hstore
+check "CREATE EXTENSION hstore"
+check "SELECT 'a=>1, b=>2'::hstore -> 'b'" "2"
+check "SELECT 'a=>1, b=>2'::hstore ? 'a'" "t"
+check "SELECT 'a=>1'::hstore || 'b=>2'::hstore" '"a"=>"1", "b"=>"2"'
+check "CREATE TABLE smoke_hstore AS SELECT ('key=>' || id::text)::hstore AS pairs FROM generate_series(1, 2000) id"
+check "CREATE INDEX smoke_hstore_index ON smoke_hstore USING gin (pairs)"
+check "ANALYZE smoke_hstore"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT pairs FROM smoke_hstore WHERE pairs @> 'key=>1234'" \
+  "Bitmap Heap Scan on smoke_hstore
+  Recheck Cond: (pairs @> '\"key\"=>\"1234\"'::hstore)
+  ->  Bitmap Index Scan on smoke_hstore_index
+        Index Cond: (pairs @> '\"key\"=>\"1234\"'::hstore)"
+check "SET enable_seqscan = off; SELECT pairs -> 'key' FROM smoke_hstore WHERE pairs @> 'key=>1234'" "1234"
+
+# btree_gist
+check "CREATE EXTENSION btree_gist"
+check "CREATE TABLE smoke_btree_gist_exclude (a int, b int4range, EXCLUDE USING gist (a WITH =, b WITH &&))"
+check "INSERT INTO smoke_btree_gist_exclude VALUES (1, '[1,3)')"
+check "INSERT INTO smoke_btree_gist_exclude VALUES (1, '[3,5)')"
+check "INSERT INTO smoke_btree_gist_exclude VALUES (2, '[2,4)')"
+check "SELECT count(*) FROM smoke_btree_gist_exclude" "3"
+check "SELECT count(*) FROM smoke_btree_gist_exclude WHERE a = 1 AND b && '[2,4)'::int4range" "2"
+check "CREATE TABLE smoke_btree_gist AS SELECT id FROM generate_series(1, 2000) id"
+check "CREATE INDEX smoke_btree_gist_index ON smoke_btree_gist USING gist (id)"
+check "ANALYZE smoke_btree_gist"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_btree_gist WHERE id = 1234" \
+  "Index Only Scan using smoke_btree_gist_index on smoke_btree_gist
+  Index Cond: (id = 1234)"
+check "SET enable_seqscan = off; SELECT id FROM smoke_btree_gist WHERE id = 1234" "1234"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_btree_gist WHERE id BETWEEN 1234 AND 1236" \
+  "Bitmap Heap Scan on smoke_btree_gist
+  Recheck Cond: ((id >= 1234) AND (id <= 1236))
+  ->  Bitmap Index Scan on smoke_btree_gist_index
+        Index Cond: ((id >= 1234) AND (id <= 1236))"
+check "SET enable_seqscan = off; SELECT id FROM smoke_btree_gist WHERE id BETWEEN 1234 AND 1236 ORDER BY id" \
+  "1234
+1235
+1236"
+
+# btree_gin
+check "CREATE EXTENSION btree_gin"
+check "CREATE TABLE smoke_btree_gin AS SELECT id, 'row' || id::text AS name FROM generate_series(1, 2000) id"
+check "CREATE INDEX smoke_btree_gin_index ON smoke_btree_gin USING gin (id, name)"
+check "ANALYZE smoke_btree_gin"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_btree_gin WHERE id = 1234" \
+  "Bitmap Heap Scan on smoke_btree_gin
+  Recheck Cond: (id = 1234)
+  ->  Bitmap Index Scan on smoke_btree_gin_index
+        Index Cond: (id = 1234)"
+check "SET enable_seqscan = off; SELECT name FROM smoke_btree_gin WHERE id = 1234" "row1234"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_btree_gin WHERE id BETWEEN 1234 AND 1236" \
+  "Bitmap Heap Scan on smoke_btree_gin
+  Recheck Cond: ((id >= 1234) AND (id <= 1236))
+  ->  Bitmap Index Scan on smoke_btree_gin_index
+        Index Cond: ((id >= 1234) AND (id <= 1236))"
+check "SET enable_seqscan = off; SELECT id FROM smoke_btree_gin WHERE id BETWEEN 1234 AND 1236 ORDER BY id" \
+  "1234
+1235
+1236"
+
+# unaccent
+# ts_lexize through the dictionary reads its rules from share/tsearch_data.
+check "CREATE EXTENSION unaccent"
+check "SELECT unaccent('Àbc Déf')" "Abc Def"
+check "SELECT ts_lexize('unaccent', 'Àbc')" "{Abc}"
+check "CREATE TEXT SEARCH CONFIGURATION smoke_unaccent (COPY = simple)"
+check "ALTER TEXT SEARCH CONFIGURATION smoke_unaccent ALTER MAPPING FOR asciiword, word WITH unaccent, simple"
+check "SELECT to_tsvector('smoke_unaccent', 'Àbc Déf')" "'abc':1 'def':2"
+
+# ltree
+check "CREATE EXTENSION ltree"
+check "SELECT 'a.b.c'::ltree <@ 'a.b'" "t"
+check "SELECT nlevel('a.b.c')" "3"
+check "SELECT subpath('a.b.c', 1)" "b.c"
+check "SELECT 'a.b.c'::ltree ~ '*.b.*'" "t"
+check "CREATE TABLE smoke_ltree (path ltree)"
+check "INSERT INTO smoke_ltree VALUES ('a'), ('a.b'), ('a.b.c'), ('a.b.c.d'), ('a.e'), ('a.e.f'), ('a.g.b.c')"
+check "CREATE INDEX smoke_ltree_index ON smoke_ltree USING gist (path)"
+check "ANALYZE smoke_ltree"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT path FROM smoke_ltree WHERE path <@ 'a.b'" \
+  "Index Scan using smoke_ltree_index on smoke_ltree
+  Index Cond: (path <@ 'a.b'::ltree)"
+check "SET enable_seqscan = off; SELECT path FROM smoke_ltree WHERE path <@ 'a.b' ORDER BY path" \
+  "a.b
+a.b.c
+a.b.c.d"
+
+# tablefunc
+check "CREATE EXTENSION tablefunc"
+check "CREATE TABLE smoke_tablefunc (a text, b text, c int)"
+check "INSERT INTO smoke_tablefunc VALUES ('first', 'a', 1), ('first', 'b', 2), ('second', 'a', 3), ('second', 'b', 4)"
+check "SELECT * FROM crosstab('SELECT a, b, c FROM smoke_tablefunc ORDER BY 1, 2') AS t(a text, x int, y int)" \
+  "first	1	2
+second	3	4"
+check "CREATE TABLE smoke_tablefunc_tree (id int, parent int)"
+check "INSERT INTO smoke_tablefunc_tree VALUES (1, NULL), (2, 1), (3, 1), (4, 2)"
+check "SELECT id, level, branch FROM connectby('smoke_tablefunc_tree', 'id', 'parent', '1', 0, '~') AS t(id int, parent int, level int, branch text)" \
+  "1	0	1
+2	1	1~2
+4	2	1~2~4
+3	1	1~3"
+check "SELECT count(*) FROM normal_rand(10, 0, 1)" "10"
+
+# pgcrypto
+# This build has no zlib, so PGP compression is off.
+check "CREATE EXTENSION pgcrypto"
+check "SELECT encode(digest('abc', 'sha256'), 'hex')" \
+  "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+check "SELECT encode(digest('abc', 'md5'), 'hex')" "900150983cd24fb0d6963f7d28e17f72"
+check "SELECT encode(hmac('data', 'key', 'sha256'), 'hex')" \
+  "5031fe3d989c6d1537a013fa6e739da23463fdaec3b70137d828e36ace221bd0"
+check "SELECT crypt('password', '\$2a\$06\$rasEqmk5PLDMOfvBOhCsUO')" \
+  "\$2a\$06\$rasEqmk5PLDMOfvBOhCsUOop1JWlcIbhZmM3t22Gxn6UQyABuNr2O"
+check "WITH h AS (SELECT crypt('password', gen_salt('bf', 6)) AS h) SELECT crypt('password', h) = h FROM h" "t"
+check "SELECT pgp_sym_decrypt(pgp_sym_encrypt('secret', 'pw', 'compress-algo=0'), 'pw')" "secret"
+check "SELECT length(gen_random_bytes(16))" "16"
+
+# sslinfo
+# The probe presents no client certificate.
+check "CREATE EXTENSION sslinfo"
+tls_check "SELECT ssl_is_used()" "t"
+tls_check "SELECT ssl_version()" "TLSv1.3"
+tls_check "SELECT ssl_cipher()" "TLS_AES_256_GCM_SHA384"
+tls_check "SELECT ssl_client_cert_present()" "f"
+check "SELECT ssl_is_used()" "f"
+
+# intarray
+# Its @>, <@ and && over int[] take precedence over the server's anyarray
+# operators; the two agree on these arrays.
+check "CREATE EXTENSION intarray"
+check "SELECT '{1,2,3}'::int[] @> '{2}'" "t"
+check "SELECT sort('{3,1,2}'::int[])" "{1,2,3}"
+check "SELECT uniq(sort('{1,1,2}'::int[]))" "{1,2}"
+check "SELECT '{1,2,3}'::int[] - 2" "{1,3}"
+check "SELECT '{1,2,3}'::int[] @@ '1&3'::query_int" "t"
+check "SELECT idx('{1,2,3}'::int[], 2)" "2"
+check "CREATE TABLE smoke_intarray AS SELECT id, ARRAY[id, id % 7, id % 11] AS tags FROM generate_series(1, 2000) id"
+check "CREATE INDEX smoke_intarray_index ON smoke_intarray USING gin (tags gin__int_ops)"
+check "ANALYZE smoke_intarray"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_intarray WHERE tags @> '{1234}'" \
+  "Bitmap Heap Scan on smoke_intarray
+  Recheck Cond: (tags @> '{1234}'::integer[])
+  ->  Bitmap Index Scan on smoke_intarray_index
+        Index Cond: (tags @> '{1234}'::integer[])"
+check "SET enable_seqscan = off; SELECT id FROM smoke_intarray WHERE tags @> '{1234}'" "1234"
+
+# cube
+check "CREATE EXTENSION cube"
+check "SELECT cube_dim('(1,2,3)'::cube)" "3"
+check "SELECT cube_distance('(0,0)'::cube, '(3,4)'::cube)" "5"
+check "SELECT '(1,2),(3,4)'::cube @> '(2,3)'::cube" "t"
+check "SELECT cube_union('(0,0)'::cube, '(1,1)'::cube)" "(0, 0),(1, 1)"
+check "CREATE TABLE smoke_cube AS SELECT id, cube(ARRAY[id % 50, id / 50]::float8[]) AS c FROM generate_series(1, 2000) id"
+check "CREATE INDEX smoke_cube_index ON smoke_cube USING gist (c)"
+check "ANALYZE smoke_cube"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_cube WHERE c <@ '(10,10),(12,12)'::cube" \
+  "Bitmap Heap Scan on smoke_cube
+  Recheck Cond: (c <@ '(10, 10),(12, 12)'::cube)
+  ->  Bitmap Index Scan on smoke_cube_index
+        Index Cond: (c <@ '(10, 10),(12, 12)'::cube)"
+check "SET enable_seqscan = off; SELECT id FROM smoke_cube WHERE c <@ '(10,10),(12,12)'::cube" \
+  "510
+511
+512
+560
+561
+562
+610
+611
+612"
+
+# earthdistance
+# Distances are float8, so they are rounded before being compared.
+check "CREATE EXTENSION earthdistance"
+check "SELECT round(earth_distance(ll_to_earth(0, 0), ll_to_earth(0, 1)))" "111320"
+check "SELECT round(('(0,0)'::point <@> '(1,0)'::point)::numeric, 3)" "69.093"
+check "SELECT earth_box(ll_to_earth(0, 0), 1000) @> ll_to_earth(0.001, 0.001)" "t"
+
+# bloom
+check "CREATE EXTENSION bloom"
+check "SELECT amname FROM pg_am WHERE amname = 'bloom'" "bloom"
+check "CREATE TABLE smoke_bloom AS SELECT id, id % 61 AS a, id % 59 AS b FROM generate_series(1, 10000) id"
+check "CREATE INDEX smoke_bloom_index ON smoke_bloom USING bloom (a, b)"
+check "ANALYZE smoke_bloom"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_bloom WHERE a = 5 AND b = 7" \
+  "Bitmap Heap Scan on smoke_bloom
+  Recheck Cond: ((a = 5) AND (b = 7))
+  ->  Bitmap Index Scan on smoke_bloom_index
+        Index Cond: ((a = 5) AND (b = 7))"
+check "SET enable_seqscan = off; SELECT id FROM smoke_bloom WHERE a = 5 AND b = 7 ORDER BY id" \
+  "66
+3665
+7264"
+
+# tsm_system_rows
+# Which rows a sample holds varies; how many does not.
+check "CREATE EXTENSION tsm_system_rows"
+check "CREATE TABLE smoke_tsm_system_rows AS SELECT id FROM generate_series(1, 10000) id"
+check "ANALYZE smoke_tsm_system_rows"
+check "SELECT count(*) FROM smoke_tsm_system_rows TABLESAMPLE SYSTEM_ROWS(100)" "100"
+check "SELECT count(*) FROM smoke_tsm_system_rows TABLESAMPLE SYSTEM_ROWS(0)" "0"
+check "SELECT count(*) FROM smoke_tsm_system_rows TABLESAMPLE SYSTEM_ROWS(20000)" "10000"
+check "EXPLAIN (COSTS OFF) SELECT id FROM smoke_tsm_system_rows TABLESAMPLE SYSTEM_ROWS(100)" \
+  "Sample Scan on smoke_tsm_system_rows
+  Sampling: system_rows ('100'::bigint)"
+
+# tsm_system_time
+# How much a time budget reads depends on the machine, so only no time
+# and ample time are checked.
+check "CREATE EXTENSION tsm_system_time"
+check "CREATE TABLE smoke_tsm_system_time AS SELECT id FROM generate_series(1, 10000) id"
+check "ANALYZE smoke_tsm_system_time"
+check "SELECT count(*) FROM smoke_tsm_system_time TABLESAMPLE SYSTEM_TIME(0)" "0"
+check "SELECT count(*) FROM smoke_tsm_system_time TABLESAMPLE SYSTEM_TIME(100000)" "10000"
+check "EXPLAIN (COSTS OFF) SELECT id FROM smoke_tsm_system_time TABLESAMPLE SYSTEM_TIME(100)" \
+  "Sample Scan on smoke_tsm_system_time
+  Sampling: system_time ('100'::double precision)"
+
+# lo
+# lo_manage unlinks a row's large object when the row is deleted.
+check "CREATE EXTENSION lo"
+check "CREATE TABLE smoke_lo (id int, a lo)"
+check "CREATE TRIGGER smoke_lo_trigger BEFORE UPDATE OR DELETE ON smoke_lo FOR EACH ROW EXECUTE FUNCTION lo_manage(a)"
+check "INSERT INTO smoke_lo VALUES (1, lo_from_bytea(0, 'hello'::bytea))"
+check "SELECT convert_from(lo_get(a), 'UTF8') FROM smoke_lo" "hello"
+check "SELECT count(*) FROM pg_largeobject_metadata" "1"
+check "DELETE FROM smoke_lo"
+check "SELECT count(*) FROM pg_largeobject_metadata" "0"
+
+# isn
+check "CREATE EXTENSION isn"
+check "SELECT '978-0-00-123403-1'::isbn13" "978-0-00-123403-1"
+check "SELECT isbn('0-00-123403-X')" "0-00-123403-X"
+check "SELECT '978-0-00-123403-1'::isbn13::isbn" "0-00-123403-X"
+check "SELECT '0-00-123403-X'::isbn = '978-0-00-123403-1'::isbn13" "t"
+check "SELECT is_valid('978-0-00-123403-1'::isbn13)" "t"
+check "SELECT '2001234567893'::ean13" "200-123456789-3"
+
+# seg
+check "CREATE EXTENSION seg"
+check "SELECT '1.5 .. 2.5'::seg" "1.5 .. 2.5"
+check "SELECT '10(+-)1'::seg" "9.0 .. 1.1e1"
+check "SELECT '1 .. 3'::seg @> '2'::seg" "t"
+check "SELECT '1 .. 3'::seg && '2 .. 5'::seg" "t"
+check "SELECT seg_union('1 .. 2', '3 .. 4')" "1 .. 4"
+check "CREATE TABLE smoke_seg AS SELECT id, (id || ' .. ' || (id + 1))::seg AS s FROM generate_series(1, 2000) id"
+check "CREATE INDEX smoke_seg_index ON smoke_seg USING gist (s)"
+check "ANALYZE smoke_seg"
+check "SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id FROM smoke_seg WHERE s <@ '1000 .. 1003'::seg" \
+  "Bitmap Heap Scan on smoke_seg
+  Recheck Cond: (s <@ '1.000e3 .. 1.003e3'::seg)
+  ->  Bitmap Index Scan on smoke_seg_index
+        Index Cond: (s <@ '1.000e3 .. 1.003e3'::seg)"
+check "SET enable_seqscan = off; SELECT id FROM smoke_seg WHERE s <@ '1000 .. 1003'::seg ORDER BY id" \
+  "1000
+1001
+1002"
+
+# dict_int
+check "CREATE EXTENSION dict_int"
+check "SELECT ts_lexize('intdict', '12345678')" "{123456}"
+check "SELECT ts_lexize('intdict', '123')" "{123}"
+check "ALTER TEXT SEARCH DICTIONARY intdict (MAXLEN = 4, REJECTLONG = true)"
+check "SELECT ts_lexize('intdict', '12345678')" "{}"
+check "SELECT ts_lexize('intdict', '1234')" "{1234}"
+
+# tcn
+# A notification reaches only a listening session, when its transaction
+# commits, so LISTEN goes in the same call as the change.
+check "CREATE EXTENSION tcn"
+check "CREATE TABLE smoke_tcn (id int PRIMARY KEY, value text)"
+check "CREATE TRIGGER smoke_tcn_trigger AFTER INSERT OR UPDATE OR DELETE ON smoke_tcn FOR EACH ROW EXECUTE FUNCTION triggered_change_notification()"
+notify_check "LISTEN tcn; INSERT INTO smoke_tcn VALUES (1, 'a')" "NOTIFY tcn \"smoke_tcn\",I,\"id\"='1'"
+notify_check "LISTEN tcn; UPDATE smoke_tcn SET value = 'b' WHERE id = 1" "NOTIFY tcn \"smoke_tcn\",U,\"id\"='1'"
+notify_check "LISTEN tcn; DELETE FROM smoke_tcn WHERE id = 1" "NOTIFY tcn \"smoke_tcn\",D,\"id\"='1'"
+
+# moddatetime
+check "CREATE EXTENSION moddatetime"
+check "CREATE TABLE smoke_moddatetime (id int PRIMARY KEY, a text, b timestamptz NOT NULL)"
+check "CREATE TRIGGER smoke_moddatetime_trigger BEFORE UPDATE ON smoke_moddatetime FOR EACH ROW EXECUTE FUNCTION moddatetime(b)"
+check "INSERT INTO smoke_moddatetime VALUES (1, 'first', '2000-01-01 00:00:00+00')"
+check "SELECT b = '2000-01-01 00:00:00+00' FROM smoke_moddatetime" "t"
+check "UPDATE smoke_moddatetime SET a = 'second' WHERE id = 1"
+check "SELECT b > '2000-01-01 00:00:00+00' AND b <= now() FROM smoke_moddatetime" "t"
+# contrib/spi's other trigger modules are neither linked in nor installed.
+check "SELECT count(*) FROM pg_available_extensions WHERE name IN ('autoinc', 'insert_username', 'refint')" "0"
 
 kill "$server_pid" 2>/dev/null || true
 wait "$server_pid" 2>/dev/null || true
