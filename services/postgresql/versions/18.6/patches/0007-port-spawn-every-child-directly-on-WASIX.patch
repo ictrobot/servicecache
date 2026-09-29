@@ -1,5 +1,5 @@
 Subject: port: spawn every child directly on WASIX
-Last-Update: 2026-09-27
+Last-Update: 2026-09-29
 
 WASIX has no fork, so refuse it with ENOSYS rather than reference an
 unavailable symbol, and launch every postmaster child by posix_spawn
@@ -398,7 +398,7 @@ index f1a6db1..c1abb9c 100644
  
  	printf(_("The default text search configuration will be set to \"%s\".\n"),
  		   default_text_search_config);
-@@ -3133,13 +3338,17 @@ initialize_data_directory(void)
+@@ -3133,13 +3338,15 @@ initialize_data_directory(void)
  
  	setup_collation(cmdfd);
  
@@ -410,9 +410,7 @@ index f1a6db1..c1abb9c 100644
  
  	setup_schema(cmdfd);
  
-+#ifndef __wasi__
  	load_plpgsql(cmdfd);
-+#endif
  
  	vacuum_db(cmdfd);
  

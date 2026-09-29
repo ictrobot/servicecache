@@ -31,6 +31,7 @@
 
   lib = {
     inherit (pkgs.lib)
+      concatMapStringsSep
       hasPrefix
       optional
       optionalAttrs

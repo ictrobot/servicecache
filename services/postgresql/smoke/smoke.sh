@@ -63,14 +63,14 @@ if [[ "$ready" != true ]]; then
   exit 1
 fi
 
-# check description expected sql: one probe call, a session of its own, and
-# its whole output. Statements that return no rows expect "". tls_check does
-# the same over a TLS connection.
+# check sql [expected]: one probe call, a session of its own, and its whole
+# output, which is empty when no expected output is given. tls_check does the
+# same over a TLS connection.
 check_with() {
   local -n probe_command="$1"
-  local actual
-  actual="$("${probe_command[@]}" "$4")" || { echo "$2: the query failed" >&2; exit 1; }
-  [[ "$actual" == "$3" ]] || { echo "$2: expected '$3', got '$actual'" >&2; exit 1; }
+  local actual expected="${3-}"
+  actual="$("${probe_command[@]}" "$2")" || { echo "$2: the query failed" >&2; exit 1; }
+  [[ "$actual" == "$expected" ]] || { echo "$2: expected '$expected', got '$actual'" >&2; exit 1; }
 }
 check() {
   check_with probe "$@"
@@ -79,20 +79,19 @@ tls_check() {
   check_with tls_probe "$@"
 }
 
-check "create a table" "" "CREATE TABLE smoke (id int PRIMARY KEY, value text)"
-check "insert a row" "" "INSERT INTO smoke VALUES (1, 'standalone')"
-check "read the row back" "standalone" "SELECT value FROM smoke WHERE id = 1"
-check "the connection's backend" "client backend" \
-  "SELECT backend_type FROM pg_stat_activity WHERE pid = pg_backend_pid()"
+check "CREATE TABLE smoke (id int PRIMARY KEY, value text)"
+check "INSERT INTO smoke VALUES (1, 'standalone')"
+check "SELECT value FROM smoke WHERE id = 1" "standalone"
+check "SELECT backend_type FROM pg_stat_activity WHERE pid = pg_backend_pid()" "client backend"
 
 # The server is built against OpenSSL, its TLS library, and SHA-256 and the
 # random bytes of a version 4 UUID come from libcrypto.
-check "TLS library" "OpenSSL" "SELECT setting FROM pg_settings WHERE name = 'ssl_library'"
-check "TLS" "on" "SELECT setting FROM pg_settings WHERE name = 'ssl'"
-check "SHA-256 of 'abc'" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" \
-  "SELECT encode(sha256('abc'), 'hex')"
-check "UUID version" "4" "SELECT uuid_extract_version(gen_random_uuid())::text"
-check "two UUIDs differ" "true" "SELECT (gen_random_uuid() <> gen_random_uuid())::text"
+check "SELECT setting FROM pg_settings WHERE name = 'ssl_library'" "OpenSSL"
+check "SELECT setting FROM pg_settings WHERE name = 'ssl'" "on"
+check "SELECT encode(sha256('abc'), 'hex')" \
+  "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+check "SELECT uuid_extract_version(gen_random_uuid())::text" "4"
+check "SELECT (gen_random_uuid() <> gen_random_uuid())::text" "true"
 
 # The cluster initdb made has no certificate, so the server generates one at
 # its first start, under the names ssl_cert_file and ssl_key_file give in the
@@ -110,9 +109,9 @@ check_generated server.key "-----BEGIN PRIVATE KEY-----"
 # A connection that asks for TLS gets it, over the generated certificate, and
 # pg_stat_ssl reports the session. Plain connections, which every other check
 # uses, are still served, unencrypted.
-tls_check "TLS session encrypted" "true" "SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
-tls_check "TLS session version" "TLSv1.3" "SELECT version FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
-check "plain session unencrypted" "false" "SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+tls_check "SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()" "true"
+tls_check "SELECT version FROM pg_stat_ssl WHERE pid = pg_backend_pid()" "TLSv1.3"
+check "SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()" "false"
 
 # A forced parallel aggregate exercises what the extension exists for:
 # postmaster children cooperating through shared memory. The full worker
@@ -120,12 +119,10 @@ check "plain session unencrypted" "false" "SELECT ssl::text FROM pg_stat_ssl WHE
 # launched workers is enough here. The session settings go in the same
 # probe call as each query they apply to.
 parallel_settings="SET max_parallel_workers_per_gather = 4; SET min_parallel_table_scan_size = 0; SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET parallel_leader_participation = off"
-check "create the parallel table" "" \
-  "CREATE TABLE parallel_smoke AS SELECT id FROM generate_series(1, 20000) id"
-check "analyze the parallel table" "" "ANALYZE parallel_smoke"
-check "set its parallel workers" "" "ALTER TABLE parallel_smoke SET (parallel_workers = 4)"
-check "the parallel aggregate's sum" "200010000" \
-  "$parallel_settings; SELECT sum(id)::text FROM parallel_smoke"
+check "CREATE TABLE parallel_smoke AS SELECT id FROM generate_series(1, 20000) id"
+check "ANALYZE parallel_smoke"
+check "ALTER TABLE parallel_smoke SET (parallel_workers = 4)"
+check "$parallel_settings; SELECT sum(id)::text FROM parallel_smoke" "200010000"
 # The plan's text varies, so only its worker count is checked, as a whole
 # line of that plan.
 plan="$("${probe[@]}" "$parallel_settings; EXPLAIN (ANALYZE) SELECT sum(id) FROM parallel_smoke")" ||
@@ -135,6 +132,12 @@ grep -qxE ' *Workers Launched: 4' <<<"$plan" || {
   printf '%s\n' "$plan" >&2
   exit 1
 }
+
+# PL/pgSQL's module is linked into the server rather than loaded.
+check "SELECT extname || ' ' || lanname FROM pg_extension, pg_language WHERE extname = 'plpgsql' AND lanname = 'plpgsql'" "plpgsql plpgsql"
+check "CREATE FUNCTION smoke_total(n int) RETURNS int LANGUAGE plpgsql AS 'DECLARE total int := 0; BEGIN FOR i IN 1..n LOOP total := total + i; END LOOP; RETURN total; END'"
+check "SELECT smoke_total(100)::text" "5050"
+check "DO 'BEGIN PERFORM smoke_total(1); END'"
 
 kill "$server_pid" 2>/dev/null || true
 wait "$server_pid" 2>/dev/null || true

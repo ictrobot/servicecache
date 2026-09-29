@@ -1,10 +1,13 @@
 {
+  pkgs,
   sc,
   version,
   versionData,
   versionDirectory,
+  loadableModules,
 }:
 let
+  inherit (pkgs) lib;
   pin = versionData.upstream;
 in
 sc.mkSource {
@@ -20,11 +23,13 @@ sc.mkSource {
         reason = "Unused as upstream tests are not built.";
       }
       {
-        paths = [
-          "contrib"
-          "src/pl"
-        ];
-        reason = "Unused as loadable modules are not built.";
+        paths = [ "contrib" ];
+        reason = "Unused as contrib modules are not built.";
+      }
+      {
+        paths = [ "src/pl/" ];
+        keep = builtins.filter (lib.hasPrefix "src/pl/") (map (module: module.directory) loadableModules);
+        reason = "Unused as only the listed modules are built.";
       }
       {
         paths = map (name: "src/${name}/po") [
