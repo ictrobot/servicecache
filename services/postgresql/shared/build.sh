@@ -19,7 +19,7 @@ mapfile -t static_modules <<< "${SC_POSTGRESQL_LOADABLE_MODULES:?}"
 # (Makefile.shlib).
 static_module_entries() {
   local module_name="$1" archive="$2"
-  local prefix="wasix_module_${module_name}_" symbols symbol function
+  local prefix="wasix_module_${module_name//-/_}_" symbols symbol function
   symbols="$(guest-nm --defined-only --format=posix "$archive" | awk '$2 == "T" { print $1 }' | sort)"
   defines() { grep -qx "$1" <<< "$symbols"; }
 
@@ -63,7 +63,7 @@ write_static_module_table() {
     done <<< "$entries"
 
     echo
-    echo "static const WasixStaticModuleSymbol ${module_name}_symbols[] = {"
+    echo "static const WasixStaticModuleSymbol ${module_name//-/_}_symbols[] = {"
     while read -r kind name symbol; do
       echo "	{\"$name\", (WasixModuleFunction) $symbol},"
     done <<< "$entries"
@@ -75,7 +75,7 @@ write_static_module_table() {
   echo "const WasixStaticModule wasix_static_modules[] = {"
   for module in "${static_modules[@]}"; do
     read -r module_name module_dir _ <<< "$module"
-    echo "	{\"$module_name\", ${module_name}_symbols},"
+    echo "	{\"$module_name\", ${module_name//-/_}_symbols},"
   done
   echo "	{NULL, NULL}"
   echo "};"
@@ -88,7 +88,8 @@ atomic_sigatomic_header="$SC_SOURCE_POSTGRESQL_DIR/src/include/port/wasix_atomic
 # OpenSSL is the one library the server is configured against: it gives the
 # backend and libpq their TLS code, and SCRAM and the SHA and HMAC functions
 # libcrypto's implementations rather than the copies src/common carries for
-# builds without one.
+# builds without one. uuid-ossp uses the series' built-in UUID backend,
+# which needs no library.
 #
 # No --prefix: nothing is installed, and the server records the configured
 # directories. The default is the same wherever this runs, which a directory
@@ -101,6 +102,7 @@ configure_args=(
   --with-ssl=openssl
   --with-includes="$SC_LIBRARY_OPENSSL_DIR/include"
   --with-libraries="$SC_LIBRARY_OPENSSL_DIR/lib"
+  --with-uuid=builtin
   --without-icu
   --without-libxml
   --without-libxslt

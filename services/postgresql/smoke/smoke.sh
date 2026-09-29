@@ -294,6 +294,22 @@ tls_check "SELECT ssl_cipher()" "TLS_AES_256_GCM_SHA384"
 tls_check "SELECT ssl_client_cert_present()" "f"
 check "SELECT ssl_is_used()" "f"
 
+# uuid-ossp
+# A backend's version 1 state is visible only within one statement, so the
+# checks over it generate their UUIDs in one.
+check 'CREATE EXTENSION "uuid-ossp"'
+check "SELECT uuid_generate_v3(uuid_ns_dns(), 'www.example.com')" "5df41881-3aed-3515-88a7-2f4a814cf09e"
+check "SELECT uuid_generate_v5(uuid_ns_dns(), 'www.example.com')" "2ed6657d-e927-568b-95e1-2665a8aea6a2"
+check "SELECT uuid_ns_url()" "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+check "SELECT uuid_nil()" "00000000-0000-0000-0000-000000000000"
+check "SELECT substr(uuid_generate_v4()::text, 15, 1)" "4"
+check "SELECT substr(uuid_generate_v4()::text, 20, 1) ~ '[89ab]'" "t"
+check "SELECT substr(uuid_generate_v1()::text, 15, 1)" "1"
+check "SELECT substr(uuid_generate_v1()::text, 25) = substr(uuid_generate_v1()::text, 25)" "t"
+check "WITH s AS (SELECT i, (('x' || substr(u, 15, 4) || substr(u, 10, 4) || substr(u, 1, 8))::bit(64) & x'0FFFFFFFFFFFFFFF')::bigint AS ts FROM (SELECT i, uuid_generate_v1()::text AS u FROM generate_series(1, 10) AS i) g) SELECT count(DISTINCT ts) = 10 AND max(ts) FILTER (WHERE i = 10) = max(ts) FROM s" "t"
+check "SELECT (('x' || substr(uuid_generate_v1mc()::text, 25, 2))::bit(8) & B'00000001') = B'00000001'" "t"
+check "SELECT uuid_generate_v1() <> uuid_generate_v1()" "t"
+
 # intarray
 # Its @>, <@ and && over int[] take precedence over the server's anyarray
 # operators; the two agree on these arrays.

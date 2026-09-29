@@ -42,6 +42,7 @@ let
     (contrib "tsm_system_rows")
     (contrib "tsm_system_time")
     (contrib "unaccent")
+    (contrib "uuid-ossp")
     # contrib/spi builds four trigger modules; only moddatetime is linked in.
     {
       name = "moddatetime";

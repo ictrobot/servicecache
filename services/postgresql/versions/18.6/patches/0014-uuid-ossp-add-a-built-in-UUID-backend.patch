@@ -1,0 +1,339 @@
+Subject: uuid-ossp: add a built-in UUID backend
+Last-Update: 2026-09-29
+
+contrib/uuid-ossp is built against one of three UUID libraries. Add a
+fourth choice, --with-uuid=builtin, that needs none: versions 3 and 5
+were already hashed with pg_cryptohash and only need formatting, version
+4 is pg_strong_random bytes, and version 1 follows RFC 4122 with a
+random node and clock sequence kept for the life of the process, as
+libuuid does without a MAC address or state file.
+
+diff --git a/configure b/configure
+index 1dffa36..b3489d9 100755
+--- a/configure
++++ b/configure
+@@ -1594,7 +1594,8 @@ Optional Packages:
+   --with-libedit-preferred
+                           prefer BSD Libedit over GNU Readline
+   --with-liburing         build with io_uring support, for asynchronous I/O
+-  --with-uuid=LIB         build contrib/uuid-ossp using LIB (bsd,e2fs,ossp)
++  --with-uuid=LIB         build contrib/uuid-ossp using LIB
++                          (bsd,builtin,e2fs,ossp)
+   --with-ossp-uuid        obsolete spelling of --with-uuid=ossp
+   --with-libcurl          build with libcurl support
+   --with-libnuma          build with libnuma support
+@@ -8852,7 +8853,7 @@ fi
+ # There are at least three UUID libraries in common use: the FreeBSD/NetBSD
+ # library, the e2fsprogs libuuid (now part of util-linux-ng), and the OSSP
+ # UUID library.  More than one of these might be present on a given platform,
+-# so we make the user say which one she wants.
++# so we make the user say which one she wants.  builtin needs no library.
+ #
+ 
+ 
+@@ -8911,6 +8912,10 @@ if test "$with_uuid" != no ; then
+ 
+ $as_echo "#define HAVE_UUID_BSD 1" >>confdefs.h
+ 
++  elif test "$with_uuid" = builtin ; then
++
++$as_echo "#define HAVE_UUID_BUILTIN 1" >>confdefs.h
++
+   elif test "$with_uuid" = e2fs ; then
+ 
+ $as_echo "#define HAVE_UUID_E2FS 1" >>confdefs.h
+@@ -8920,7 +8925,7 @@ $as_echo "#define HAVE_UUID_E2FS 1" >>confdefs.h
+ $as_echo "#define HAVE_UUID_OSSP 1" >>confdefs.h
+ 
+   else
+-    as_fn_error $? "--with-uuid must specify one of bsd, e2fs, or ossp" "$LINENO" 5
++    as_fn_error $? "--with-uuid must specify one of bsd, builtin, e2fs, or ossp" "$LINENO" 5
+   fi
+ fi
+ 
+@@ -13673,6 +13678,9 @@ else
+   as_fn_error $? "BSD UUID functions are not present" "$LINENO" 5
+ fi
+ 
++elif test "$with_uuid" = builtin ; then
++  # The built-in support needs no library
++  UUID_LIBS=""
+ elif test "$with_uuid" = e2fs ; then
+   # On macOS, the UUID functions are in libc
+   ac_fn_c_check_func "$LINENO" "uuid_generate" "ac_cv_func_uuid_generate"
+diff --git a/configure.ac b/configure.ac
+index 8df4c84..7bcae3b 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -994,9 +994,9 @@ fi
+ # There are at least three UUID libraries in common use: the FreeBSD/NetBSD
+ # library, the e2fsprogs libuuid (now part of util-linux-ng), and the OSSP
+ # UUID library.  More than one of these might be present on a given platform,
+-# so we make the user say which one she wants.
++# so we make the user say which one she wants.  builtin needs no library.
+ #
+-PGAC_ARG_REQ(with, uuid, [LIB], [build contrib/uuid-ossp using LIB (bsd,e2fs,ossp)])
++PGAC_ARG_REQ(with, uuid, [LIB], [build contrib/uuid-ossp using LIB (bsd,builtin,e2fs,ossp)])
+ if test x"$with_uuid" = x"" ; then
+   with_uuid=no
+ fi
+@@ -1008,12 +1008,14 @@ fi
+ if test "$with_uuid" != no ; then
+   if test "$with_uuid" = bsd ; then
+     AC_DEFINE([HAVE_UUID_BSD], 1, [Define to 1 if you have BSD UUID support.])
++  elif test "$with_uuid" = builtin ; then
++    AC_DEFINE([HAVE_UUID_BUILTIN], 1, [Define to 1 if you want built-in UUID support.])
+   elif test "$with_uuid" = e2fs ; then
+     AC_DEFINE([HAVE_UUID_E2FS], 1, [Define to 1 if you have E2FS UUID support.])
+   elif test "$with_uuid" = ossp ; then
+     AC_DEFINE([HAVE_UUID_OSSP], 1, [Define to 1 if you have OSSP UUID support.])
+   else
+-    AC_MSG_ERROR([--with-uuid must specify one of bsd, e2fs, or ossp])
++    AC_MSG_ERROR([--with-uuid must specify one of bsd, builtin, e2fs, or ossp])
+   fi
+ fi
+ AC_SUBST(with_uuid)
+@@ -1485,6 +1487,9 @@ if test "$with_uuid" = bsd ; then
+   AC_CHECK_FUNC(uuid_to_string,
+     [UUID_LIBS=""],
+     [AC_MSG_ERROR([BSD UUID functions are not present])])
++elif test "$with_uuid" = builtin ; then
++  # The built-in support needs no library
++  UUID_LIBS=""
+ elif test "$with_uuid" = e2fs ; then
+   # On macOS, the UUID functions are in libc
+   AC_CHECK_FUNC(uuid_generate,
+diff --git a/contrib/uuid-ossp/uuid-ossp.c b/contrib/uuid-ossp/uuid-ossp.c
+index 58e312a..30146a2 100644
+--- a/contrib/uuid-ossp/uuid-ossp.c
++++ b/contrib/uuid-ossp/uuid-ossp.c
+@@ -1,6 +1,7 @@
+ /*-------------------------------------------------------------------------
+  *
+- * UUID generation functions using the BSD, E2FS or OSSP UUID library
++ * UUID generation functions using the BSD, E2FS or OSSP UUID library,
++ * or no library at all
+  *
+  * Copyright (c) 2007-2025, PostgreSQL Global Development Group
+  *
+@@ -13,6 +14,10 @@
+ 
+ #include "postgres.h"
+ 
++#ifdef HAVE_UUID_BUILTIN
++#include <sys/time.h>
++#endif
++
+ #include "common/cryptohash.h"
+ #include "common/sha1.h"
+ #include "fmgr.h"
+@@ -30,7 +35,9 @@
+  */
+ #define uuid_hash bsd_uuid_hash
+ 
+-#if defined(HAVE_UUID_H)
++#if defined(HAVE_UUID_BUILTIN)
++/* the built-in generator uses no library, and so no header of one */
++#elif defined(HAVE_UUID_H)
+ #include <uuid.h>
+ #elif defined(HAVE_OSSP_UUID_H)
+ #include <ossp/uuid.h>
+@@ -61,7 +68,7 @@
+  * A DCE 1.1 compatible source representation of UUIDs, derived from
+  * the BSD implementation.  BSD already has this; OSSP doesn't need it.
+  */
+-#ifdef HAVE_UUID_E2FS
++#if defined(HAVE_UUID_E2FS) || defined(HAVE_UUID_BUILTIN)
+ typedef struct
+ {
+ 	uint32_t	time_low;
+@@ -248,6 +255,106 @@ uuid_generate_v35_internal(int mode, pg_uuid_t *ns, text *name)
+ 
+ #else							/* !HAVE_UUID_OSSP */
+ 
++#ifdef HAVE_UUID_BUILTIN
++
++/* The Unix epoch in 100-nanosecond intervals since 1582-10-15. */
++#define UUID_V1_EPOCH_OFFSET	UINT64CONST(0x01B21DD213814000)
++
++/* Format sixteen bytes as the 36-character 8-4-4-4-12 string. */
++static void
++uuid_to_hex_string(const unsigned char *uu, char *str)
++{
++	static const char hexdigits[] = "0123456789abcdef";
++	int			i;
++
++	for (i = 0; i < UUID_LEN; i++)
++	{
++		if (i == 4 || i == 6 || i == 8 || i == 10)
++			*str++ = '-';
++		*str++ = hexdigits[uu[i] >> 4];
++		*str++ = hexdigits[uu[i] & 0x0F];
++	}
++	*str = '\0';
++}
++
++static void
++uuid_random_bytes(unsigned char *buf, size_t len)
++{
++	if (!pg_strong_random(buf, len))
++		ereport(ERROR,
++				(errcode(ERRCODE_INTERNAL_ERROR),
++				 errmsg("could not generate random values")));
++}
++
++/*
++ * A version 1 UUID as RFC 4122 section 4.2.2 lays it out.  With no MAC
++ * address or state file, the node (multicast bit set, per section 4.5) and
++ * clock sequence are random and kept for the life of the process, as
++ * libuuid does; a call in the same tick as the last takes the next one.
++ */
++static void
++uuid_make_v1(unsigned char *uu)
++{
++	static bool initialized = false;
++	static unsigned char node[6];
++	static uint16 clock_seq;
++	static uint64 last_ts = 0;
++	struct timeval tv;
++	uint64		ts;
++
++	if (!initialized)
++	{
++		unsigned char rnd[8];
++
++		uuid_random_bytes(rnd, sizeof(rnd));
++		clock_seq = (((uint16) rnd[0] << 8) | rnd[1]) & 0x3FFF;
++		memcpy(node, rnd + 2, sizeof(node));
++		node[0] |= 0x01;
++		initialized = true;
++	}
++
++	gettimeofday(&tv, NULL);
++	ts = (uint64) tv.tv_sec * UINT64CONST(10000000) +
++		(uint64) tv.tv_usec * 10 + UUID_V1_EPOCH_OFFSET;
++
++	if (ts <= last_ts)
++	{
++		/* a clock that went backwards asks for a new clock sequence */
++		if (ts < last_ts)
++			clock_seq = (clock_seq + 1) & 0x3FFF;
++		ts = last_ts + 1;
++	}
++	last_ts = ts;
++
++	/* time_low, then time_mid, then time_hi_and_version with version 1 */
++	uu[0] = (unsigned char) (ts >> 24);
++	uu[1] = (unsigned char) (ts >> 16);
++	uu[2] = (unsigned char) (ts >> 8);
++	uu[3] = (unsigned char) ts;
++	uu[4] = (unsigned char) (ts >> 40);
++	uu[5] = (unsigned char) (ts >> 32);
++	uu[6] = (unsigned char) (((ts >> 56) & 0x0F) | 0x10);
++	uu[7] = (unsigned char) (ts >> 48);
++
++	/* the clock sequence, behind the variant bits */
++	uu[8] = (unsigned char) ((clock_seq >> 8) | 0x80);
++	uu[9] = (unsigned char) clock_seq;
++
++	memcpy(uu + 10, node, sizeof(node));
++}
++
++/* A version 4 UUID: random bytes with the version and variant set. */
++static void
++uuid_make_v4(unsigned char *uu)
++{
++	uuid_random_bytes(uu, UUID_LEN);
++
++	uu[6] = (uu[6] & 0x0F) | 0x40;
++	uu[8] = (uu[8] & 0x3F) | 0x80;
++}
++
++#endif							/* HAVE_UUID_BUILTIN */
++
+ static Datum
+ uuid_generate_internal(int v, unsigned char *ns, const char *ptr, int len)
+ {
+@@ -261,7 +368,20 @@ uuid_generate_internal(int v, unsigned char *ns, const char *ptr, int len)
+ 
+ 		case 1:					/* time/node-based uuids */
+ 			{
+-#ifdef HAVE_UUID_E2FS
++#if defined(HAVE_UUID_BUILTIN)
++				unsigned char uu[UUID_LEN];
++
++				uuid_make_v1(uu);
++				uuid_to_hex_string(uu, strbuf);
++
++				/*
++				 * PTR, if set, replaces the trailing characters of the uuid;
++				 * this is to support v1mc, where a random multicast MAC is
++				 * used instead of the physical one
++				 */
++				if (ptr && len <= 36)
++					strcpy(strbuf + (36 - len), ptr);
++#elif defined(HAVE_UUID_E2FS)
+ 				uuid_t		uu;
+ 
+ 				uuid_generate_time(uu);
+@@ -371,7 +491,11 @@ uuid_generate_internal(int v, unsigned char *ns, const char *ptr, int len)
+ 				UUID_TO_NETWORK(uu);
+ 				UUID_V3_OR_V5(uu, v);
+ 
+-#ifdef HAVE_UUID_E2FS
++#if defined(HAVE_UUID_BUILTIN)
++				/* as for E2FS, the bytes are formatted in local order */
++				UUID_TO_LOCAL(uu);
++				uuid_to_hex_string((unsigned char *) &uu, strbuf);
++#elif defined(HAVE_UUID_E2FS)
+ 				/* uuid_unparse expects local order */
+ 				UUID_TO_LOCAL(uu);
+ 				uuid_unparse((unsigned char *) &uu, strbuf);
+@@ -395,7 +519,12 @@ uuid_generate_internal(int v, unsigned char *ns, const char *ptr, int len)
+ 		case 4:					/* random uuid */
+ 		default:
+ 			{
+-#ifdef HAVE_UUID_E2FS
++#if defined(HAVE_UUID_BUILTIN)
++				unsigned char uu[UUID_LEN];
++
++				uuid_make_v4(uu);
++				uuid_to_hex_string(uu, strbuf);
++#elif defined(HAVE_UUID_E2FS)
+ 				uuid_t		uu;
+ 
+ 				uuid_generate_random(uu);
+@@ -492,6 +621,19 @@ uuid_generate_v1mc(PG_FUNCTION_ARGS)
+ {
+ #ifdef HAVE_UUID_OSSP
+ 	char	   *buf = NULL;
++#elif defined(HAVE_UUID_BUILTIN)
++	char		buf[14];
++	unsigned char node[6];
++
++	uuid_random_bytes(node, sizeof(node));
++
++	/* set IEEE802 multicast and local-admin bits */
++	node[0] |= 0x03;
++
++	snprintf(buf, sizeof(buf), "-%02x%02x%02x%02x%02x%02x",
++			 (unsigned) node[0], (unsigned) node[1],
++			 (unsigned) node[2], (unsigned) node[3],
++			 (unsigned) node[4], (unsigned) node[5]);
+ #elif defined(HAVE_UUID_E2FS)
+ 	char		strbuf[40];
+ 	char	   *buf;
+diff --git a/src/include/pg_config.h.in b/src/include/pg_config.h.in
+index 1483336..e2fb562 100644
+--- a/src/include/pg_config.h.in
++++ b/src/include/pg_config.h.in
+@@ -487,6 +487,9 @@
+ /* Define to 1 if you have BSD UUID support. */
+ #undef HAVE_UUID_BSD
+ 
++/* Define to 1 if you want built-in UUID support. */
++#undef HAVE_UUID_BUILTIN
++
+ /* Define to 1 if you have E2FS UUID support. */
+ #undef HAVE_UUID_E2FS
+ 

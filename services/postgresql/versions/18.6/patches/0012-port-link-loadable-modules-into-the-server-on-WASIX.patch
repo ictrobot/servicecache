@@ -11,7 +11,7 @@ by name is its whole identity check. Installing a module installs its
 archive where its shared object would have gone.
 
 diff --git a/src/Makefile.global.in b/src/Makefile.global.in
-index 8b1b357..fa48d64 100644
+index 8b1b357..3828c7d 100644
 --- a/src/Makefile.global.in
 +++ b/src/Makefile.global.in
 @@ -570,6 +570,11 @@ WIN32_STACK_RLIMIT=4194304
@@ -20,7 +20,7 @@ index 8b1b357..fa48d64 100644
  
 +# On WASIX a loadable module is linked into the server, under entry point
 +# names of its own (src/include/port/wasix_static_modules.h).
-+wasix_module_prefix = wasix_module_$(1)_
++wasix_module_prefix = wasix_module_$(subst -,_,$(1))_
 +wasix_module_cppflags = -D_PG_init=$(call wasix_module_prefix,$(1))_PG_init -DPg_magic_func=$(call wasix_module_prefix,$(1))Pg_magic_func
 +
  # Pull in platform-specific magic
