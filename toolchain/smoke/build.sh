@@ -33,3 +33,4 @@ guest-cc -O2 -pthread "$sources/signal-during-handler.c" -o "$out/signal-during-
 guest-cc -O2 "$sources/lseek-under-signal.c" -o "$out/lseek-under-signal.wasm"
 guest-cc -O2 "$sources/socket-filetypes.c" -o "$out/socket-filetypes.wasm"
 guest-cc -O2 "$sources/poll-zero-timeout.c" -o "$out/poll-zero-timeout.wasm"
+guest-cc -O2 "$sources/root-create.c" -o "$out/root-create.wasm"

@@ -94,3 +94,4 @@ expect_fixes signal-during-handler.wasm "WASIX signal during a handler still wak
 expect_fixes lseek-under-signal.wasm "WASIX seeks and syncs survive a signal flood"
 expect_fixes socket-filetypes.wasm "WASIX sockets report their type in every state"
 expect_fixes poll-zero-timeout.wasm "WASIX answers a poll with a zero timeout at once" 20s
+expect_fixes root-create.wasm "WASIX creates and removes entries at the root through its pre-open"

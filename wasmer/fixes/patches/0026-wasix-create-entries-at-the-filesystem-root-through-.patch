@@ -1,0 +1,54 @@
+Subject: wasix: create entries at the filesystem root through the virtual root
+Last-Update: 2026-09-30
+
+The virtual root descriptor holds only pre-opened directories, so
+creating a file or directory through it was refused with EACCES or
+EPERM, though a lookup through it of anything under the directory
+mounted as `/` succeeds by falling through to that directory. A program
+that resolves absolute paths through the first pre-open named `/`, as
+Go's wasip1 runtime does, reaches the virtual root for every path and
+could read the filesystem but not create in it: `mkdir /data` failed
+with permission denied. The parent of a new entry now falls through to
+the mounted `/` the same way a lookup does, so creation, renaming,
+linking and removal at the root work through either descriptor, and the
+path resolution test expects that parent.
+
+diff --git a/lib/wasix/src/fs/mod.rs b/lib/wasix/src/fs/mod.rs
+index 3207e78..1d42df2 100644
+--- a/lib/wasix/src/fs/mod.rs
++++ b/lib/wasix/src/fs/mod.rs
+@@ -1800,11 +1800,20 @@ impl WasiFs {
+         follow_symlinks: bool,
+     ) -> Result<(InodeGuard, String), Errno> {
+         let (parent_dir, new_entity_name) = PosixPath::from_path(path).parent_path_and_name()?;
+-        if parent_dir.as_str().is_empty() {
+-            return self.get_fd_inode(base).map(|v| (v, new_entity_name));
+-        }
+-        self.get_inode_at_path(inodes, base, parent_dir.as_str(), follow_symlinks)
+-            .map(|v| (v, new_entity_name))
++        let parent = if parent_dir.as_str().is_empty() {
++            self.get_fd_inode(base)?
++        } else {
++            self.get_inode_at_path(inodes, base, parent_dir.as_str(), follow_symlinks)?
++        };
++        // The virtual root holds only pre-opened directories, so an entry at
++        // the root of the filesystem is created in the directory mounted as
++        // `/` when there is one, where a lookup through the virtual root
++        // already finds it.
++        let mounted_root = match parent.read().deref() {
++            Kind::Root { entries } => entries.get("/").cloned(),
++            _ => None,
++        };
++        Ok((mounted_root.unwrap_or(parent), new_entity_name))
+     }
+ 
+     pub fn get_fd(&self, fd: WasiFd) -> Result<Fd, Errno> {
+@@ -3271,7 +3280,7 @@ mod tests {
+         assert_eq!(single_component_name, "new-file");
+         assert!(matches!(
+             single_component_parent.read().deref(),
+-            Kind::Root { .. }
++            Kind::Dir { path, .. } if path == Path::new("/")
+         ));
+ 
+         let root_parent = wasi_fs
