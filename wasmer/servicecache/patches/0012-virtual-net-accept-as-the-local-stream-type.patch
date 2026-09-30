@@ -1,5 +1,5 @@
 Subject: virtual-net: accept as the local stream type
-Last-Update: 2026-09-27
+Last-Update: 2026-09-13
 
 A host that wraps the connections its guest accepts needs the concrete
 stream and its descriptor: `try_accept_local` returns a `LocalTcpStream`,

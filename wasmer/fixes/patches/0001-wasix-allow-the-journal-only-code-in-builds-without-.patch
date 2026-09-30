@@ -1,5 +1,5 @@
 Subject: wasix: allow the journal-only code in builds without the feature
-Last-Update: 2026-09-27
+Last-Update: 2026-08-31
 
 Without the journal feature rustc warns about the journal fields of
 CommonWasiOptions, the journal imports in runners/wasi.rs, and a mut in

@@ -1,5 +1,5 @@
 Subject: virtual-io, wasix: give each thread one waker for all its waits
-Last-Update: 2026-09-27
+Last-Update: 2026-09-13
 
 A wait that cannot be served at once registers its waker with whatever it
 is waiting on, and both lists that hold those wakers -- an interest's slot

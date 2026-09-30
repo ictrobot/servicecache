@@ -1,5 +1,5 @@
 Subject: vm: keep a registry of linear memories
-Last-Update: 2026-09-27
+Last-Update: 2026-09-09
 
 An embedder that owns the process, not the stores, has no way to find a
 guest's linear memory: the `Memory` handle needs its store, which lives

@@ -1,5 +1,5 @@
 Subject: virtual-io: keep handlers and sources; halt and rebuild the selector
-Last-Update: 2026-09-27
+Last-Update: 2026-09-13
 
 The selector's handler map lived on its poll thread's stack, and the
 descriptors it had registered were known only to the kernel's epoll

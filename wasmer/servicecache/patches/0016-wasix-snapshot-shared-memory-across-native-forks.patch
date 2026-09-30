@@ -1,5 +1,5 @@
 Subject: wasix: snapshot shared memory across native forks
-Last-Update: 2026-09-27
+Last-Update: 2026-09-09
 
 A host freezes a guest by stopping every thread and forking natively,
 and every clone must diverge from its template. Shared overlays break

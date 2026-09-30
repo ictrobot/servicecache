@@ -1,5 +1,5 @@
 Subject: virtual-net: read a host datagram socket without a backlog
-Last-Update: 2026-09-27
+Last-Update: 2026-09-13
 
 A host datagram socket answered whether a datagram was waiting by
 receiving one into a backlog of its own, and a receive then copied out

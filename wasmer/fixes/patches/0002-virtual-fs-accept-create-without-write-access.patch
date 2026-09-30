@@ -1,5 +1,5 @@
 Subject: virtual-fs: accept create without write access
-Last-Update: 2026-09-27
+Last-Update: 2026-08-31
 
 Linux accepts O_CREAT without write access (a program may probe a
 directory's writability by creating a file that way), but host_fs

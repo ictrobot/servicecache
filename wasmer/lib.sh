@@ -28,18 +28,13 @@ sc_wasmer_dev_sets() {
   echo "jitdump servicecache wasmer/servicecache/patches"
 }
 
-# sc_wasmer_comparable <patch>: all content except its modification date.
-sc_wasmer_comparable() {
-  sed '/^Last-Update:/d' "$1"
-}
-
 # sc_wasmer_patch_date <previous> <current> <today>: the date an exported
 # patch carries. It keeps the date of the previous file of the same name
-# when their contents match apart from Last-Update, and is today otherwise.
+# while their sc_patch_content matches, and is today otherwise.
 sc_wasmer_patch_date() {
   local previous="$1" current="$2" today="$3" date=""
   if [[ -f "$previous" ]] &&
-     diff -q <(sc_wasmer_comparable "$previous") <(sc_wasmer_comparable "$current") >/dev/null 2>&1; then
+     diff -q <(sc_patch_content "$previous") <(sc_patch_content "$current") >/dev/null 2>&1; then
     date="$(sed -n '/^diff --git/q; s/^Last-Update:[ \t]*//p' "$previous" | head -n 1)"
   fi
   echo "${date:-$today}"
@@ -63,8 +58,8 @@ sc_wasmer_insert_date() {
 # its Subject and body and then the diff, like the service patches, with a
 # Last-Update line after the Subject. format-patch knows
 # nothing of that line, so it is carried across from the set in previous
-# (default: the directory as it was). Unchanged content keeps its date;
-# descriptions, hunk positions and index hashes all count as changes.
+# (default: the directory as it was), and kept while the patch's
+# description and changed lines are the same (sc_patch_content).
 # Exporting an unchanged branch reproduces the set byte for byte.
 sc_wasmer_export_range() {
   local checkout="$1" from="$2" to="$3" patch_dir="$4" previous="${5:-$4}"

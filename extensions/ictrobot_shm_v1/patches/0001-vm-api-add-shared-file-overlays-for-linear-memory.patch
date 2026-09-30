@@ -1,5 +1,5 @@
 Subject: vm, api: add shared file overlays for linear memory
-Last-Update: 2026-09-27
+Last-Update: 2026-09-01
 
 A linear memory is one private anonymous mapping, so no part of it can
 be shared with another instance: MAP_SHARED inside a guest is a

@@ -1,5 +1,5 @@
 Subject: wasix: refresh a socket future's waker on every poll
-Last-Update: 2026-09-27
+Last-Update: 2026-09-11
 
 The five socket futures - accept, send, send_to, recv and recv_from -
 registered an interest handler only on the poll that first found the

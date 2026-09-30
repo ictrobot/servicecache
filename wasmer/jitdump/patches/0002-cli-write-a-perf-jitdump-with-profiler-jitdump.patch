@@ -1,5 +1,5 @@
 Subject: cli: write a perf jitdump with --profiler jitdump
-Last-Update: 2026-09-27
+Last-Update: 2026-09-14
 
 The CLI's --profiler option chose a perf map, or a GDB or LLDB command
 file, all through the compiler configuration. A jitdump is chosen on the

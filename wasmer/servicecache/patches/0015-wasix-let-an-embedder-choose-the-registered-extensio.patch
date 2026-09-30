@@ -1,5 +1,5 @@
 Subject: wasix: let an embedder choose the registered extensions
-Last-Update: 2026-09-27
+Last-Update: 2026-09-07
 
 Extension namespaces were registered unconditionally: any guest under a
 runtime built with an extension could import it, whatever the embedder

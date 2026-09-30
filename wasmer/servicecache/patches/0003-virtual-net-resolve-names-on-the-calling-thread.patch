@@ -1,5 +1,5 @@
 Subject: virtual-net: resolve names on the calling thread
-Last-Update: 2026-09-27
+Last-Update: 2026-08-31
 
 `LocalNetworking::resolve` spawned the lookup on the runtime handle
 captured at construction, which a forked child does not have. It now

@@ -1,5 +1,5 @@
 Subject: wasix: do not interrupt a syscall that cannot block
-Last-Update: 2026-09-27
+Last-Update: 2026-09-11
 
 __asyncify polls the work once and, when it is still pending and the
 thread has signals queued, runs their handlers and returns Intr,

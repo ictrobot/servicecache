@@ -1,6 +1,6 @@
 Subject: compiler-cranelift, compiler: keep the unwind information of
  trampolines
-Last-Update: 2026-09-27
+Last-Update: 2026-09-14
 
 Cranelift describes the frames of the function call trampolines, through
 which the host calls into a module, and of the dynamic trampolines,

@@ -1,5 +1,5 @@
 Subject: virtual-net: read a host stream without a read-ahead buffer
-Last-Update: 2026-09-27
+Last-Update: 2026-09-13
 
 A host TCP stream kept a buffer of its own. Asking whether it was
 readable reserved ten kilobytes and read the kernel socket into that

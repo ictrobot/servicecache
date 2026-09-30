@@ -1,5 +1,5 @@
 Subject: wasix: keep clock offsets in atomics instead of a locked map
-Last-Update: 2026-09-27
+Last-Update: 2026-09-11
 
 The offsets a guest can put on its clocks were held in a
 Mutex<HashMap<Snapshot0Clockid, i64>> on the WASI state. That is the

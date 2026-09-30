@@ -1,5 +1,5 @@
 Subject: wasix: spawn an unchanged WebAssembly file without reading it again
-Last-Update: 2026-09-27
+Last-Update: 2026-09-15
 
 Spawning a plain WebAssembly file read all of it from the filesystem and
 hashed it, to find its compiled module in the runtime's cache, however

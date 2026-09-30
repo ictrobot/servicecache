@@ -1,5 +1,5 @@
 Subject: wasix: serve a level-triggered socket from the waiting thread
-Last-Update: 2026-09-27
+Last-Update: 2026-09-13
 
 A guest blocked in epoll_wait on a socket is woken twice over: the
 kernel wakes the shared selector's poll thread, which dispatches into

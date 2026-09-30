@@ -1,5 +1,5 @@
 Subject: wasix: wait on an interruptible host futex
-Last-Update: 2026-09-27
+Last-Update: 2026-09-13
 
 A guest futex wait went through the async path: a logical waiter in the
 futex table, a Tokio timer for the timeout, and the coroutine suspended

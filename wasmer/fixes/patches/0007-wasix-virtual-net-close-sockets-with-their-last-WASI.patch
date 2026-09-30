@@ -1,5 +1,5 @@
 Subject: wasix, virtual-net: close sockets with their last WASI handle
-Last-Update: 2026-09-27
+Last-Update: 2026-08-31
 
 The descriptor table closed pipes when their last handle went away but
 left sockets open: a guest that closed its descriptor could leave the

@@ -1,5 +1,5 @@
 Subject: wasix: expose the body of task_wasm
-Last-Update: 2026-09-27
+Last-Update: 2026-08-31
 
 `TokioTaskManager::task_wasm` runs a guest thread on its pool: it
 instantiates the module for the new thread, answers the spawning

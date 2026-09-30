@@ -1,5 +1,5 @@
 Subject: wasix: suspend finite clock-only polls directly
-Last-Update: 2026-09-27
+Last-Update: 2026-09-13
 
 A poll_oneoff with one finite clock subscription and nothing else is a
 sleep, and the commonest wait in a guest whose threads pace themselves

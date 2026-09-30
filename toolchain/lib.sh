@@ -30,6 +30,15 @@ sc_patch_names() {
   done
 }
 
+# sc_patch_content [patch]: the part of a patch its Last-Update date is for,
+# from the file or standard input: the Subject and description without the
+# Last-Update line, then only the diff's removed and added lines. Index
+# hashes, hunk positions and context lines change when the tree under the
+# patch does, while the change itself stays the same.
+sc_patch_content() {
+  awk '/^diff --git / { diff = 1 } diff ? /^[-+]/ : !/^Last-Update:/' "$@"
+}
+
 # Use the configured interpreter, or python3, for all host Python commands.
 sc_python() {
   SC_PYTHON="${SC_PYTHON:-python3}"
