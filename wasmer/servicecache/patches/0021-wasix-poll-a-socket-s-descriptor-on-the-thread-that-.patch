@@ -78,7 +78,7 @@ index 0edfd56..3b05aab 100644
          let handler: MockHandlerSlot = Arc::new(StdMutex::new(None));
          let socket = InodeSocket::new(InodeSocketKind::TcpStream {
 diff --git a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
-index f239f1a..ae4db1e 100644
+index 29e660b..b037d08 100644
 --- a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
 +++ b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
 @@ -272,6 +272,449 @@ impl Future for PollBatch {
@@ -531,7 +531,7 @@ index f239f1a..ae4db1e 100644
  pub(crate) fn poll_fd_guard(
      state: &Arc<WasiState>,
      peb: PollEventSet,
-@@ -414,6 +857,101 @@ where
+@@ -415,6 +858,101 @@ where
          };
      }
  
@@ -633,7 +633,7 @@ index f239f1a..ae4db1e 100644
      let mut events_seen: u32 = 0;
  
      let batch = {
-@@ -464,33 +1002,6 @@ where
+@@ -465,33 +1003,6 @@ where
      };
  
      // Function to process a timeout
@@ -667,7 +667,7 @@ index f239f1a..ae4db1e 100644
  
      #[cfg(feature = "sys")]
      if env.capabilities.threading.enable_blocking_sleep && subs_len == 1 {
-@@ -501,7 +1012,7 @@ where
+@@ -502,7 +1013,7 @@ where
          // real-time demands with greater precision.
          if let Some(timeout) = timeout {
              std::thread::sleep(timeout);
@@ -676,7 +676,7 @@ index f239f1a..ae4db1e 100644
              return Ok(Errno::Success);
          }
      }
-@@ -524,43 +1035,6 @@ where
+@@ -525,43 +1036,6 @@ where
          }
      };
  
@@ -720,7 +720,7 @@ index f239f1a..ae4db1e 100644
      // We use asyncify with a deep sleep to wait on new IO events
      let res = __asyncify_with_deep_sleep::<M, Result<Vec<EventResult>, Errno>, _>(
          ctx,
-@@ -572,3 +1046,245 @@ where
+@@ -573,3 +1047,245 @@ where
      }
      Ok(Errno::Success)
  }

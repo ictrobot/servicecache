@@ -1,0 +1,35 @@
+Subject: wasix: answer a poll with a zero clock timeout at once
+Last-Update: 2026-09-30
+
+poll_oneoff took a clock subscription whose timeout was zero as a wait
+with no deadline. WASI defines it as the opposite, a check of what is
+ready now, and wasix-libc sends one nanosecond instead of zero to get
+that behaviour. A program using the WASI meaning, such as the Go
+runtime's scheduler, which polls its sockets with a zero timeout between
+runnable goroutines, blocked until an unrelated descriptor became ready.
+Zero and one nanosecond now both mean an immediate check: the call
+reports what is ready, or the clock subscription when nothing is, as a
+timed-out wait does.
+
+diff --git a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
+index 73a96d6..40b31d7 100644
+--- a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
++++ b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
+@@ -290,11 +290,12 @@ where
+                         continue;
+                     }
+ 
+-                    // If the timeout duration is zero then this is an immediate check rather than
+-                    // a sleep itself
+-                    if clock_info.timeout == 0 {
+-                        time_to_sleep = Duration::MAX;
+-                    } else if clock_info.timeout == 1 {
++                    // A timeout of zero, as WASI defines it, or of one
++                    // nanosecond, which wasix-libc sends for a zero poll
++                    // timeout, is an immediate check rather than a sleep:
++                    // the call reports what is ready now, or the clock
++                    // subscription when nothing is.
++                    if clock_info.timeout <= 1 {
+                         time_to_sleep = Duration::ZERO;
+                         clock_subs.push((clock_info, s.userdata));
+                     } else {

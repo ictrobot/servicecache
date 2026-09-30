@@ -24,7 +24,7 @@ a clock with descriptors, immediate polls and infinite waits are
 unchanged.
 
 diff --git a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
-index 73a96d6..f239f1a 100644
+index 40b31d7..29e660b 100644
 --- a/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
 +++ b/lib/wasix/src/syscalls/wasi/poll_oneoff.rs
 @@ -92,6 +92,87 @@ pub fn poll_oneoff<M: MemorySize + 'static>(

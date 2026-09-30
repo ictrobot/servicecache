@@ -93,3 +93,4 @@ expect_fixes epoll-close-during-dispatch.wasm \
 expect_fixes signal-during-handler.wasm "WASIX signal during a handler still wakes the wait"
 expect_fixes lseek-under-signal.wasm "WASIX seeks and syncs survive a signal flood"
 expect_fixes socket-filetypes.wasm "WASIX sockets report their type in every state"
+expect_fixes poll-zero-timeout.wasm "WASIX answers a poll with a zero timeout at once" 20s
