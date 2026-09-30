@@ -1,0 +1,29 @@
+Subject: wasix: succeed at fd_sync on a directory
+Last-Update: 2026-09-30
+
+fd_sync on a directory descriptor answered EISDIR. fsync(2) accepts a
+directory, and a program that needs a rename or a new entry to be
+durable syncs the directory holding it afterwards, and may treat the
+failure as fatal. On a file, fd_sync only drains the writes the handle
+holds and never fsyncs on the host; a directory holds no pending
+writes, so the call now succeeds as it does on a file with nothing
+pending.
+
+diff --git a/lib/wasix/src/syscalls/wasi/fd_sync.rs b/lib/wasix/src/syscalls/wasi/fd_sync.rs
+index f1c4ad7..866cba1 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_sync.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_sync.rs
+@@ -53,7 +53,12 @@ pub fn fd_sync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<Errno
+                     return Ok(Errno::Inval);
+                 }
+             }
+-            Kind::Root { .. } | Kind::Dir { .. } => return Ok(Errno::Isdir),
++            // fsync(2) accepts a directory, which a program syncs to make
++            // a rename or a new entry durable. On a file this call only
++            // drains the writes the handle holds and never fsyncs on the
++            // host; a directory holds no pending writes, so it succeeds as
++            // a file with nothing pending does.
++            Kind::Root { .. } | Kind::Dir { .. } => {}
+             // Linux fsync(2) returns EINVAL for fds "bound to a special file
+             // (e.g., a pipe, FIFO, or socket) which does not support
+             // synchronization.", mirror that behaviour
