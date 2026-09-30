@@ -46,10 +46,10 @@ its own rather than folded into hangup, which would tell an epoll set
 that a stream it can still write to has hung up.
 
 diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
-index f250835..0e842db 100644
+index 0edfd56..3b05aab 100644
 --- a/lib/wasix/src/net/socket.rs
 +++ b/lib/wasix/src/net/socket.rs
-@@ -1980,6 +1980,27 @@ pub(crate) mod tests {
+@@ -2006,6 +2006,27 @@ pub(crate) mod tests {
      /// only has to be one a backend could answer with.
      pub(crate) type MockHandlerSlot = Arc<StdMutex<Option<Box<dyn InterestHandler + Send + Sync>>>>;
  

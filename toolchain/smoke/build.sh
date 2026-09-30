@@ -31,3 +31,4 @@ guest-cc -O2 -pthread "$sources/epoll-close-during-dispatch.c" \
   -o "$out/epoll-close-during-dispatch.wasm"
 guest-cc -O2 -pthread "$sources/signal-during-handler.c" -o "$out/signal-during-handler.wasm"
 guest-cc -O2 "$sources/lseek-under-signal.c" -o "$out/lseek-under-signal.wasm"
+guest-cc -O2 "$sources/socket-filetypes.c" -o "$out/socket-filetypes.wasm"

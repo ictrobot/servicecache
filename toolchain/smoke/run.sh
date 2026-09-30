@@ -92,3 +92,4 @@ expect_fixes epoll-close-during-dispatch.wasm \
   "WASIX epoll sets close during dispatch without wedging the selector" 20s
 expect_fixes signal-during-handler.wasm "WASIX signal during a handler still wakes the wait"
 expect_fixes lseek-under-signal.wasm "WASIX seeks and syncs survive a signal flood"
+expect_fixes socket-filetypes.wasm "WASIX sockets report their type in every state"

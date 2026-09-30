@@ -47,7 +47,7 @@ index 76b938a..a010315 100644
          let env = ctx.data_mut(&mut store);
          let memory = unsafe { env.memory() }.clone();
 diff --git a/lib/wasix/src/fs/mod.rs b/lib/wasix/src/fs/mod.rs
-index cc67f8e..3b051e3 100644
+index 3207e78..989aa84 100644
 --- a/lib/wasix/src/fs/mod.rs
 +++ b/lib/wasix/src/fs/mod.rs
 @@ -19,6 +19,7 @@ mod fd_list;
@@ -58,7 +58,7 @@ index cc67f8e..3b051e3 100644
  
  use std::{
      borrow::Cow,
-@@ -441,6 +442,7 @@ pub struct WasiFsRoot {
+@@ -438,6 +439,7 @@ pub struct WasiFsRoot {
  
  impl WasiFsRoot {
      pub fn from_mount_fs(root: MountFileSystem) -> Self {
@@ -66,7 +66,7 @@ index cc67f8e..3b051e3 100644
          Self {
              root: Arc::new(root),
              memory_limiter: None,
-@@ -451,6 +453,7 @@ impl WasiFsRoot {
+@@ -448,6 +450,7 @@ impl WasiFsRoot {
          let root = MountFileSystem::new();
          root.mount(Path::new("/"), fs)
              .expect("mounting the root fs on an empty mount fs should succeed");

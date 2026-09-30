@@ -92,10 +92,10 @@ index 82aee4b..7562ba1 100644
  ///
  /// It does not depend on suspension: a coroutine that can suspend hands the
 diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
-index 7232756..f250835 100644
+index f48b974..0edfd56 100644
 --- a/lib/wasix/src/net/socket.rs
 +++ b/lib/wasix/src/net/socket.rs
-@@ -1932,7 +1932,7 @@ pub(crate) mod tests {
+@@ -1958,7 +1958,7 @@ pub(crate) mod tests {
          net::{Ipv4Addr, Shutdown, SocketAddr},
          pin::Pin,
          sync::{
@@ -104,7 +104,7 @@ index 7232756..f250835 100644
              atomic::{AtomicUsize, Ordering},
          },
          task::{Context, Poll},
-@@ -1951,6 +1951,47 @@ pub(crate) mod tests {
+@@ -1977,6 +1977,47 @@ pub(crate) mod tests {
          write_calls: Arc<AtomicUsize>,
          close_calls: Arc<AtomicUsize>,
          status: Arc<AtomicUsize>,
@@ -152,7 +152,7 @@ index 7232756..f250835 100644
      }
  
      const MOCK_STATUS_OPENING: usize = 0;
-@@ -1997,8 +2038,9 @@ pub(crate) mod tests {
+@@ -2023,8 +2064,9 @@ pub(crate) mod tests {
  
          fn set_handler(
              &mut self,
@@ -163,7 +163,7 @@ index 7232756..f250835 100644
              Ok(())
          }
      }
-@@ -2031,6 +2073,11 @@ pub(crate) mod tests {
+@@ -2057,6 +2099,11 @@ pub(crate) mod tests {
      }
  
      impl VirtualTcpSocket for MockTcpSocket {
@@ -175,7 +175,7 @@ index 7232756..f250835 100644
          fn set_recv_buf_size(&mut self, _size: usize) -> NetResult<()> {
              Ok(())
          }
-@@ -2121,10 +2168,8 @@ pub(crate) mod tests {
+@@ -2147,10 +2194,8 @@ pub(crate) mod tests {
      pub(crate) fn close_tracking_socket(close_calls: Arc<AtomicUsize>) -> InodeSocket {
          InodeSocket::new(InodeSocketKind::TcpStream {
              socket: Box::new(MockTcpSocket {
@@ -187,7 +187,7 @@ index 7232756..f250835 100644
              }),
              write_timeout: None,
              read_timeout: None,
-@@ -2194,8 +2239,8 @@ pub(crate) mod tests {
+@@ -2220,8 +2265,8 @@ pub(crate) mod tests {
              socket: Box::new(MockTcpSocket {
                  read_calls: read_calls.clone(),
                  write_calls: write_calls.clone(),
@@ -197,7 +197,7 @@ index 7232756..f250835 100644
              }),
              write_timeout: None,
              read_timeout: None,
-@@ -2215,10 +2260,8 @@ pub(crate) mod tests {
+@@ -2241,10 +2286,8 @@ pub(crate) mod tests {
          let status = Arc::new(AtomicUsize::new(MOCK_STATUS_OPENING));
          let inode = InodeSocket::new(InodeSocketKind::TcpStream {
              socket: Box::new(MockTcpSocket {

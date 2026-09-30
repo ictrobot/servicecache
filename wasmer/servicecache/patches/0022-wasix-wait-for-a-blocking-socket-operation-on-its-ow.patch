@@ -40,10 +40,10 @@ Each operation reports one trace event saying which path answered it and
 with what.
 
 diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
-index 0e842db..ed36ea0 100644
+index 3b05aab..f044063 100644
 --- a/lib/wasix/src/net/socket.rs
 +++ b/lib/wasix/src/net/socket.rs
-@@ -2001,6 +2001,19 @@ pub(crate) mod tests {
+@@ -2027,6 +2027,19 @@ pub(crate) mod tests {
          (socket, handler, reads)
      }
  

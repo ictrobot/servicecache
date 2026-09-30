@@ -1736,10 +1736,10 @@ index c3dcab5..82aee4b 100644
      for entry in &entries {
          let entry = *entry;
 diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
-index b654795..7232756 100644
+index fbea194..f48b974 100644
 --- a/lib/wasix/src/net/socket.rs
 +++ b/lib/wasix/src/net/socket.rs
-@@ -1728,6 +1728,13 @@ impl InodeSocket {
+@@ -1754,6 +1754,13 @@ impl InodeSocket {
              _ => false,
          }
      }
@@ -1753,7 +1753,7 @@ index b654795..7232756 100644
  }
  
  /// On connected UDP sockets, discard datagrams not from the stored peer.
-@@ -1792,6 +1799,32 @@ impl InodeSocketProtected {
+@@ -1818,6 +1825,32 @@ impl InodeSocketProtected {
          }
      }
  
@@ -1786,7 +1786,7 @@ index b654795..7232756 100644
      pub fn poll_read_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
          match &mut self.kind {
              InodeSocketKind::TcpListener { socket, .. } => socket.poll_read_ready(cx),
-@@ -2112,6 +2145,46 @@ pub(crate) mod tests {
+@@ -2138,6 +2171,46 @@ pub(crate) mod tests {
          }
      }
  

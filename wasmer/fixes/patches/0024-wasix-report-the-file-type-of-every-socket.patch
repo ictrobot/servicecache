@@ -1,0 +1,133 @@
+Subject: wasix: report the file type of every socket
+Last-Update: 2026-09-30
+
+fd_fdstat_get named the type of a socket from its state, and only a
+connected TCP stream, a raw socket and a socket not yet bound had one: a
+bound or listening TCP socket and a UDP socket reported an unknown type,
+and so did each end of a sock_pair pair, which is a duplex pipe.
+fd_filestat_get reported the type in the socket inode's stat, which
+sock_open and sock_accept leave at the default, unknown. wasix-libc's
+getsockopt(SO_TYPE) therefore refused a listener as not a socket, as Go's
+net.FileListener on its wasip1 port does, and fstat reported no socket
+in any state.
+
+InodeSocket::filetype gives the type a socket's kind implies: a listener
+is a stream socket and a UDP socket a datagram socket, as WASI defines
+the types, and a socket not yet bound, a bound TCP socket and one
+restored from a journal have the type they were created with. Both calls
+report it, and fd_fdstat_get reports a sock_pair end as the stream socket
+its stat already names.
+
+diff --git a/lib/wasix/src/fs/mod.rs b/lib/wasix/src/fs/mod.rs
+index cc67f8e..3207e78 100644
+--- a/lib/wasix/src/fs/mod.rs
++++ b/lib/wasix/src/fs/mod.rs
+@@ -33,10 +33,7 @@ use std::{
+     task::{Context, Poll},
+ };
+ 
+-use crate::{
+-    net::socket::InodeSocketKind,
+-    state::{Stderr, Stdin, Stdout},
+-};
++use crate::state::{Stderr, Stdin, Stdout};
+ use futures::{Future, future::BoxFuture};
+ use tracing::{debug, trace, warn};
+ use virtual_fs::{
+@@ -48,7 +45,7 @@ use wasmer_wasix_types::{
+     types::{__WASI_STDERR_FILENO, __WASI_STDIN_FILENO, __WASI_STDOUT_FILENO},
+     wasi::{
+         Errno, Fd as WasiFd, Fdflags, Fdflagsext, Fdstat, Filesize, Filestat, Filetype,
+-        Preopentype, Prestat, PrestatEnum, Rights, Socktype,
++        Preopentype, Prestat, PrestatEnum, Rights,
+     },
+ };
+ 
+@@ -1891,18 +1888,9 @@ impl WasiFs {
+                 Kind::File { .. } => Filetype::RegularFile,
+                 Kind::Dir { .. } => Filetype::Directory,
+                 Kind::Symlink { .. } => Filetype::SymbolicLink,
+-                Kind::Socket { socket } => match &socket.inner.protected.read().unwrap().kind {
+-                    InodeSocketKind::TcpStream { .. } => Filetype::SocketStream,
+-                    InodeSocketKind::Raw { .. } => Filetype::SocketRaw,
+-                    InodeSocketKind::PreSocket { props, .. } => match props.ty {
+-                        Socktype::Stream => Filetype::SocketStream,
+-                        Socktype::Dgram => Filetype::SocketDgram,
+-                        Socktype::Raw => Filetype::SocketRaw,
+-                        Socktype::Seqpacket => Filetype::SocketSeqpacket,
+-                        _ => Filetype::Unknown,
+-                    },
+-                    _ => Filetype::Unknown,
+-                },
++                Kind::Socket { socket } => socket.filetype(),
++                // Each end of a sock_pair pair is a duplex pipe.
++                Kind::DuplexPipe { .. } => Filetype::SocketStream,
+                 _ => Filetype::Unknown,
+             },
+             fs_flags: fd.inner.flags,
+diff --git a/lib/wasix/src/net/socket.rs b/lib/wasix/src/net/socket.rs
+index b654795..fbea194 100644
+--- a/lib/wasix/src/net/socket.rs
++++ b/lib/wasix/src/net/socket.rs
+@@ -15,7 +15,9 @@ use virtual_net::{
+     VirtualTcpListener, VirtualTcpSocket, VirtualUdpSocket, net_error_into_io_err,
+ };
+ use wasmer_types::MemorySize;
+-use wasmer_wasix_types::wasi::{Addressfamily, Errno, Rights, SockProto, Sockoption, Socktype};
++use wasmer_wasix_types::wasi::{
++    Addressfamily, Errno, Filetype, Rights, SockProto, Sockoption, Socktype,
++};
+ 
+ use crate::{VirtualTaskManager, net::net_error_into_wasi_err};
+ 
+@@ -264,6 +266,30 @@ impl InodeSocket {
+         }
+     }
+ 
++    /// The socket's file type, as fd_fdstat_get and fd_filestat_get report
++    /// it: the type its kind implies, or the one it was created with.
++    pub(crate) fn filetype(&self) -> Filetype {
++        match &self.inner.protected.read().unwrap().kind {
++            InodeSocketKind::TcpStream { .. } | InodeSocketKind::TcpListener { .. } => {
++                Filetype::SocketStream
++            }
++            InodeSocketKind::UdpSocket { .. } => Filetype::SocketDgram,
++            InodeSocketKind::Raw(_) => Filetype::SocketRaw,
++            InodeSocketKind::PreSocket { props, .. }
++            | InodeSocketKind::BoundTcp { props, .. }
++            | InodeSocketKind::RemoteSocket { props, .. } => match props.ty {
++                Socktype::Stream => Filetype::SocketStream,
++                Socktype::Dgram => Filetype::SocketDgram,
++                Socktype::Raw => Filetype::SocketRaw,
++                Socktype::Seqpacket => Filetype::SocketSeqpacket,
++                _ => Filetype::Unknown,
++            },
++            // An ICMP socket may be a datagram or a raw one, which its kind
++            // does not record.
++            InodeSocketKind::Icmp(_) => Filetype::Unknown,
++        }
++    }
++
+     pub fn poll_read_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+         let mut inner = self.inner.protected.write().unwrap();
+         inner.poll_read_ready(cx)
+diff --git a/lib/wasix/src/syscalls/wasi/fd_filestat_get.rs b/lib/wasix/src/syscalls/wasi/fd_filestat_get.rs
+index b1974c3..65cac9f 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_filestat_get.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_filestat_get.rs
+@@ -55,8 +55,13 @@ pub(crate) fn fd_filestat_get_internal(
+         return Err(Errno::Access);
+     }
+ 
+-    let guard = fd_entry.inode.stat.read().unwrap();
+-    Ok(*guard.deref())
++    let mut stat = *fd_entry.inode.stat.read().unwrap();
++    // A socket's inode keeps the default stat it was created with, whose type
++    // is unknown; the socket says what it is.
++    if let Kind::Socket { socket } = fd_entry.inode.read().deref() {
++        stat.st_filetype = socket.filetype();
++    }
++    Ok(stat)
+ }
+ 
+ /// ### `fd_filestat_get_old()`
