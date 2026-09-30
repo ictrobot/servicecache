@@ -22,18 +22,10 @@ let
     in
     map (line: ../. + "/${line}") (builtins.filter (line: line != "" && !lib.hasPrefix "#" line) lines);
   # Stock is the unpatched tag, so patch handling never invalidates it or the
-  # target directory built from it. Patched sources share its name, "source",
-  # so every variant unpacks at the same path.
-  sourceFor =
-    variant:
-    if variant == "stock" then
-      upstream
-    else
-      pkgs.applyPatches {
-        name = "source";
-        src = upstream;
-        patches = lib.concatMap patchSeries (patchDirectories variant);
-      };
+  # target directory built from it. Variants patch the tag in their own patch
+  # phase, so every variant unpacks at the same path.
+  patchesFor =
+    variant: if variant == "stock" then [ ] else lib.concatMap patchSeries (patchDirectories variant);
 
   # Patched variants start from stock's target directory, kept as a zstd tar
   # in stock's artifacts output, so third-party crates compile once. Cargo
@@ -71,15 +63,33 @@ let
     else
       { preBuild = restoreTarget stockBuild; };
   # Every crate in the variant's lockfile is its own download, keyed by its
-  # checksum, so crates the variants share download once.
-  cargoLockFor = variant: { lockFile = "${sourceFor variant}/Cargo.lock"; };
+  # checksum, so crates the variants share download once. Only the patched
+  # lockfile is kept, not the patched tree.
+  cargoLockFor = variant: {
+    lockFile =
+      if variant == "stock" then
+        "${upstream}/Cargo.lock"
+      else
+        pkgs.stdenvNoCC.mkDerivation {
+          name = "wasmer-${variant}-Cargo.lock";
+          src = upstream;
+          patches = patchesFor variant;
+          phases = [
+            "unpackPhase"
+            "patchPhase"
+            "installPhase"
+          ];
+          installPhase = ''cp Cargo.lock "$out"'';
+        };
+  };
   buildFor =
     variant:
     pkgs.rustPlatform.buildRustPackage (
       {
         pname = "wasmer-${variant}";
         inherit version;
-        src = sourceFor variant;
+        src = upstream;
+        patches = patchesFor variant;
         cargoLock = cargoLockFor variant;
         # Wasmer's build script queries cargo metadata; cargo-auditable asks for
         # unsupported optional-dependency feature names in this workspace.
@@ -126,7 +136,8 @@ let
       {
         pname = "wasmer-${variant}-tests";
         inherit version;
-        src = sourceFor variant;
+        src = upstream;
+        patches = patchesFor variant;
         cargoLock = cargoLockFor variant;
         auditable = false;
         env.WASMER_REPRODUCIBLE_BUILD = "1";
