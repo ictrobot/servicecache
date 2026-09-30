@@ -96,3 +96,4 @@ expect_fixes socket-filetypes.wasm "WASIX sockets report their type in every sta
 expect_fixes poll-zero-timeout.wasm "WASIX answers a poll with a zero timeout at once" 20s
 expect_fixes root-create.wasm "WASIX creates and removes entries at the root through its pre-open"
 expect_fixes dir-fsync.wasm "WASIX syncs a directory"
+expect_fixes unlink-directory.wasm "WASIX refuses to unlink a directory and leaves it intact"

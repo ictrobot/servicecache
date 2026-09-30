@@ -1,0 +1,30 @@
+Subject: wasix: refuse to unlink a directory before removing its entry
+Last-Update: 2026-09-30
+
+path_unlink_file removed the entry from the parent directory and
+decremented the link count before it looked at what it had removed, and
+only then answered EISDIR for a directory. The directory stayed in
+place, in the memory filesystem or on the host, but the parent no
+longer listed it until a later lookup recreated the entry. Go's
+os.Remove unlinks first and rmdirs on EISDIR, so it failed with ENOENT
+and left the directory; os.RemoveAll took the ENOENT of its next step
+as already gone and returned success with the tree intact. The check
+now comes first, as unlink(2) does, and nothing is touched.
+
+diff --git a/lib/wasix/src/syscalls/wasi/path_unlink_file.rs b/lib/wasix/src/syscalls/wasi/path_unlink_file.rs
+index 83844c4..0d87b5f 100644
+--- a/lib/wasix/src/syscalls/wasi/path_unlink_file.rs
++++ b/lib/wasix/src/syscalls/wasi/path_unlink_file.rs
+@@ -56,6 +56,12 @@ pub(crate) fn path_unlink_file_internal(
+     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
+ 
+     let inode = wasi_try_ok!(state.fs.get_inode_at_path(inodes, fd, path, false));
++    // unlink(2) refuses a directory before touching anything. Refusing it
++    // below, after the parent's entry was removed, left the directory in
++    // place but unreachable until a lookup recreated the entry.
++    if matches!(inode.read().deref(), Kind::Dir { .. } | Kind::Root { .. }) {
++        return Ok(Errno::Isdir);
++    }
+     let (parent_inode, child_name) = wasi_try_ok!(state.fs.get_parent_inode_at_path(
+         inodes,
+         fd,
