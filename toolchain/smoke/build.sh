@@ -17,10 +17,11 @@ guest-cc -O2 "$sources/stdio-net.c" -o "$out/stdio-net.wasm"
 guest-cc -O2 "$sources/netprobe.c" -o "$out/netprobe.wasm"
 
 # The libc patches (toolchain/sources/wasix-libc/patches and
-# toolchain/sources/mimalloc/patches); each fixture fails on the unpatched
-# libc.
+# toolchain/sources/mimalloc/patches); each fixture fails without the change
+# it checks.
 guest-cc -O2 -pthread "$sources/relpath-race.c" -o "$out/relpath-race.wasm"
 guest-cc -O2 "$sources/select-sleeps.c" -o "$out/select-sleeps.wasm"
+guest-cc -O2 "$sources/getenv-at-start.c" -o "$out/getenv-at-start.wasm"
 guest-cc -O2 -pthread "$sources/malloc-threads.c" -o "$out/malloc-threads.wasm"
 
 # The Wasmer fixes patch set.

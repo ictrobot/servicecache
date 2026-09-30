@@ -36,11 +36,12 @@ command -v timeout >/dev/null 2>&1 || fail "required host command not found: tim
 stock="$SC_ROOT/work/wasmer/stock/bin/wasmer"
 fixes="$SC_ROOT/work/wasmer/fixes/bin/wasmer"
 
-# expect_stock module expected-output
+# expect_stock module expected-output [wasmer-run-option...]
 expect_stock() {
-  local output
-  output="$("$stock" run "$modules/$1")" || fail "$1 failed"
-  [[ "$output" == "$2" ]] || fail "$1: expected \"$2\", got \"$output\""
+  local module="$1" expected="$2" output
+  shift 2
+  output="$("$stock" run "$@" "$modules/$module")" || fail "$module failed"
+  [[ "$output" == "$expected" ]] || fail "$module: expected \"$expected\", got \"$output\""
   printf '%s\n' "$output"
 }
 
@@ -73,12 +74,16 @@ expect_stock wasix_cpp.wasm $'WASIX C++ exception works\nWASIX pthread works'
 
 # Two threads making relative-path syscalls at once must not corrupt each
 # other's paths, select() and pselect() must wait for a timeout under one
-# second rather than return at once, and threads that end must give their
-# memory back to malloc.
+# second rather than return at once, a program given an environment must
+# start whether or not it references environ, and threads that end must give
+# their memory back to malloc.
 "$stock" run "$modules/relpath-race.wasm" > /dev/null ||
   fail "relative-path race smoke test failed"
 echo "WASIX relative-path race test passed"
 expect_stock select-sleeps.wasm "WASIX select and pselect wait for their timeouts"
+expect_stock getenv-at-start.wasm \
+  "WASIX starts with an environment and no reference to environ" \
+  --env "SC_SMOKE_GETENV=set by run.sh"
 expect_stock malloc-threads.wasm "WASIX malloc works across threads"
 
 expect_fixes signal-epoll.wasm "WASIX signal wakes every epoll registration"

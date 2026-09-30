@@ -1,5 +1,5 @@
 Subject: Add mimalloc as a malloc implementation
-Last-Update: 2026-09-27
+Last-Update: 2026-09-30
 
 dlmalloc takes one lock around every allocation and release, so the threads
 of a program that allocates often spend their time waiting for each other;
@@ -132,7 +132,7 @@ diff --git a/mimalloc/malloc.c b/mimalloc/malloc.c
 new file mode 100644
 --- /dev/null
 +++ b/mimalloc/malloc.c
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,74 @@
 +// libc's malloc for MALLOC_IMPL=mimalloc: mimalloc's single-file build, from
 +// the source tree MIMALLOC_DIR names, and libc's allocation functions
 +// forwarded to it, as dlmalloc/src/dlmalloc.c wraps dlmalloc.
@@ -143,6 +143,21 @@ new file mode 100644
 +// delete call malloc and free, so they need nothing here.
 +
 +#include "src/static.c"
++
++// mimalloc reads its options with getenv as it initializes, except before
++// its constructor at priority 101, when it leaves them for later. libc copies
++// the environment in, allocating to do it, on the first getenv, or at
++// priority 50 in a program that references environ.
++//
++// In a program that does not reference environ, the first getenv is
++// mimalloc's, so the copy is made while mimalloc is initializing: with any
++// variable set, the copy's allocation reenters mimalloc, which calls getenv
++// and starts another copy, until the call stack is exhausted. Referencing
++// environ here makes every program copy the environment at priority 50
++// instead, where the copy's allocation initializes mimalloc without calling
++// getenv.
++extern char **environ;
++__attribute__((used)) static char ***const environ_reference = &environ;
 +
 +// mimalloc does not always report a failure in errno: calloc's overflow
 +// check leaves it alone in a release build, and the other failures set it only
