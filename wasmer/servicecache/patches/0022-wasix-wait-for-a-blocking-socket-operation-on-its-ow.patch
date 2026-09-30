@@ -64,7 +64,7 @@ index 0e842db..ed36ea0 100644
          let handler: MockHandlerSlot = Arc::new(StdMutex::new(None));
          let socket = InodeSocket::new(InodeSocketKind::TcpStream {
 diff --git a/lib/wasix/src/syscalls/mod.rs b/lib/wasix/src/syscalls/mod.rs
-index 944beb5..4510f9a 100644
+index 944beb5..c1abde9 100644
 --- a/lib/wasix/src/syscalls/mod.rs
 +++ b/lib/wasix/src/syscalls/mod.rs
 @@ -719,6 +719,341 @@ pub(crate) fn __sock_check_rights(
