@@ -1,0 +1,1014 @@
+Subject: virtual-fs: lock the memory filesystem once per operation
+Last-Update: 2026-09-30
+
+The in-memory filesystem looked a name up under its read lock, released
+it, and made the change under the write lock. remove_file, remove_dir,
+rename and an open file's unlink then removed a position that another
+thread's removal could have made stale: Vec::remove panicked and
+poisoned the lock, after which every operation failed. open,
+create_dir, create_symlink and the insert helpers created an entry that
+another thread could have created meanwhile, so an exclusive create or
+a mkdir could succeed twice and leave two entries of one name, and open
+could reach a file whose inode had been freed and reused. Each now looks
+up and changes under one write lock, released before a path is handed
+on to another mounted filesystem, and create_dir refuses a name taken
+by a file as well as by a directory.
+
+The other way round, a handle took the write lock to read, to seek and
+to flush, though none of them changes the filesystem: a read and a seek
+move the handle's own cursor, and every memory-backed node's flush is a
+no-op. Readers of different files serialised on one lock; they now take
+the read lock, and the no-op flush methods are gone.
+
+The remove_file test held a read guard while calling remove_file, which
+now waits for the write lock, so it releases the guard first. New tests
+race exclusive creates and directory creation across threads.
+
+diff --git a/lib/virtual-fs/src/mem_fs/file.rs b/lib/virtual-fs/src/mem_fs/file.rs
+index 311d65a..898a967 100644
+--- a/lib/virtual-fs/src/mem_fs/file.rs
++++ b/lib/virtual-fs/src/mem_fs/file.rs
+@@ -244,45 +244,33 @@ impl VirtualFile for FileHandle {
+ 
+     fn unlink(&mut self) -> Result<()> {
+         let filesystem = self.filesystem.clone();
+-        let inode = self.inode;
+-
+-        let (inode_of_parent, position, inode_of_file) = {
+-            // Read lock.
+-            let fs = filesystem.inner.read().map_err(|_| FsError::Lock)?;
+-
+-            // The inode of the file.
+-            let inode_of_file = inode;
+-
+-            // Find the position of the file in the parent, and the
+-            // inode of the parent.
+-            let (position, inode_of_parent) = fs
+-                .storage
+-                .iter()
+-                .find_map(|(inode_of_parent, node)| match node {
+-                    Node::Directory(DirectoryNode { children, .. }) => {
+-                        children.iter().enumerate().find_map(|(nth, inode)| {
+-                            if inode == &inode_of_file {
+-                                Some((nth, inode_of_parent))
+-                            } else {
+-                                None
+-                            }
+-                        })
+-                    }
+-
+-                    _ => None,
+-                })
+-                .ok_or(FsError::BaseNotDirectory)?;
+-
+-            (inode_of_parent, position, inode_of_file)
+-        };
++        let inode_of_file = self.inode;
++
++        // Find the file in its parent and unlink it under one write lock, so
++        // that another thread cannot change the parent in between.
++        let mut fs = filesystem.inner.write().map_err(|_| FsError::Lock)?;
++
++        // Find the position of the file in the parent, and the
++        // inode of the parent.
++        let (position, inode_of_parent) = fs
++            .storage
++            .iter()
++            .find_map(|(inode_of_parent, node)| match node {
++                Node::Directory(DirectoryNode { children, .. }) => {
++                    children.iter().enumerate().find_map(|(nth, inode)| {
++                        if inode == &inode_of_file {
++                            Some((nth, inode_of_parent))
++                        } else {
++                            None
++                        }
++                    })
++                }
+ 
+-        {
+-            // Write lock.
+-            let mut fs = filesystem.inner.write().map_err(|_| FsError::Lock)?;
+-            fs.unlink_file_inode(inode_of_parent, position, inode_of_file)?;
+-        }
++                _ => None,
++            })
++            .ok_or(FsError::BaseNotDirectory)?;
+ 
+-        Ok(())
++        fs.unlink_file_inode(inode_of_parent, position, inode_of_file)
+     }
+ 
+     fn get_special_fd(&self) -> Option<u32> {
+@@ -868,13 +856,13 @@ impl AsyncRead for FileHandle {
+ 
+         let mut cursor = self.cursor;
+         let ret = {
+-            let mut fs = self
++            let fs = self
+                 .filesystem
+                 .inner
+-                .write()
+-                .map_err(|_| io::Error::other("failed to acquire a write lock"))?;
++                .read()
++                .map_err(|_| io::Error::other("failed to acquire a read lock"))?;
+ 
+-            let inode = fs.storage.get_mut(self.inode);
++            let inode = fs.storage.get(self.inode);
+             match inode {
+                 Some(Node::File(node)) => {
+                     let read = unsafe {
+@@ -958,13 +946,13 @@ impl AsyncSeek for FileHandle {
+     fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
+         let mut cursor = self.cursor;
+         let ret = {
+-            let mut fs = self
++            let fs = self
+                 .filesystem
+                 .inner
+-                .write()
+-                .map_err(|_| io::Error::other("failed to acquire a write lock"))?;
++                .read()
++                .map_err(|_| io::Error::other("failed to acquire a read lock"))?;
+ 
+-            let inode = fs.storage.get_mut(self.inode);
++            let inode = fs.storage.get(self.inode);
+             match inode {
+                 Some(Node::File(node)) => {
+                     node.file.seek(position, &mut cursor)?;
+@@ -1011,13 +999,13 @@ impl AsyncSeek for FileHandle {
+     }
+ 
+     fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+-        let mut fs = self
++        let fs = self
+             .filesystem
+             .inner
+-            .write()
+-            .map_err(|_| io::Error::other("failed to acquire a write lock"))?;
++            .read()
++            .map_err(|_| io::Error::other("failed to acquire a read lock"))?;
+ 
+-        let inode = fs.storage.get_mut(self.inode);
++        let inode = fs.storage.get(self.inode);
+         match inode {
+             Some(Node::File { .. }) => Poll::Ready(Ok(self.cursor)),
+             Some(Node::OffloadedFile { .. }) => Poll::Ready(Ok(self.cursor)),
+@@ -1215,17 +1203,17 @@ impl AsyncWrite for FileHandle {
+     }
+ 
+     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        let mut fs = self
++        let fs = self
+             .filesystem
+             .inner
+-            .write()
+-            .map_err(|_| io::Error::other("failed to acquire a write lock"))?;
++            .read()
++            .map_err(|_| io::Error::other("failed to acquire a read lock"))?;
+ 
+-        let inode = fs.storage.get_mut(self.inode);
++        let inode = fs.storage.get(self.inode);
+         match inode {
+-            Some(Node::File(node)) => Poll::Ready(node.file.flush()),
+-            Some(Node::OffloadedFile(node)) => Poll::Ready(node.file.flush()),
+-            Some(Node::ReadOnlyFile(node)) => Poll::Ready(node.file.flush()),
++            Some(Node::File(_)) => Poll::Ready(Ok(())),
++            Some(Node::OffloadedFile(_)) => Poll::Ready(Ok(())),
++            Some(Node::ReadOnlyFile(_)) => Poll::Ready(Ok(())),
+             Some(Node::CustomFile(node)) => {
+                 let mut file = node.file.lock().unwrap();
+                 let file = Pin::new(file.as_mut());
+@@ -1780,10 +1768,6 @@ impl File {
+ 
+         Ok(buf.len())
+     }
+-
+-    fn flush(&mut self) -> io::Result<()> {
+-        Ok(())
+-    }
+ }
+ 
+ /// Read only file that uses copy-on-write
+@@ -1856,8 +1840,4 @@ impl ReadOnlyFile {
+             "file is read-only",
+         ))
+     }
+-
+-    pub fn flush(&mut self) -> io::Result<()> {
+-        Ok(())
+-    }
+ }
+diff --git a/lib/virtual-fs/src/mem_fs/file_opener.rs b/lib/virtual-fs/src/mem_fs/file_opener.rs
+index 2047b00..6bf91c8 100644
+--- a/lib/virtual-fs/src/mem_fs/file_opener.rs
++++ b/lib/virtual-fs/src/mem_fs/file_opener.rs
+@@ -1,4 +1,4 @@
+-use super::filesystem::InodeResolution;
++use super::filesystem::{FileSystemInner, InodeResolution};
+ use super::*;
+ use crate::{FileType, FsError, Metadata, OpenOptionsConfig, Result, VirtualFile};
+ use shared_buffer::OwnedBuffer;
+@@ -10,7 +10,9 @@ impl FileSystem {
+     /// (this is required for zero-copy creation of the same file)
+     pub fn insert_ro_file(&self, path: &Path, contents: OwnedBuffer) -> Result<()> {
+         let _ = crate::FileSystem::remove_file(self, path);
+-        let (inode_of_parent, maybe_inode_of_file, name_of_file) = self.insert_inode(path)?;
++        // Look the name up and insert the file under one write lock.
++        let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
++        let (inode_of_parent, maybe_inode_of_file, name_of_file) = fs.insert_inode(path)?;
+ 
+         let inode_of_parent = match inode_of_parent {
+             InodeResolution::Found(a) => a,
+@@ -25,9 +27,6 @@ impl FileSystem {
+ 
+             // The file doesn't already exist; it's OK to create it if
+             None => {
+-                // Write lock.
+-                let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+-
+                 let file = ReadOnlyFile::new(contents);
+                 let file_len = file.len() as u64;
+ 
+@@ -77,8 +76,10 @@ impl FileSystem {
+         source_path: PathBuf,
+     ) -> Result<()> {
+         let _ = crate::FileSystem::remove_file(self, target_path.as_path());
++        // Look the name up and insert the entry under one write lock.
++        let mut fs_lock = self.inner.write().map_err(|_| FsError::Lock)?;
+         let (inode_of_parent, maybe_inode_of_file, name_of_file) =
+-            self.insert_inode(target_path.as_path())?;
++            fs_lock.insert_inode(target_path.as_path())?;
+ 
+         let inode_of_parent = match inode_of_parent {
+             InodeResolution::Found(a) => a,
+@@ -93,9 +94,6 @@ impl FileSystem {
+ 
+             // The file doesn't already exist; it's OK to create it if
+             None => {
+-                // Write lock.
+-                let mut fs_lock = self.inner.write().map_err(|_| FsError::Lock)?;
+-
+                 // Read the metadata or generate a dummy one
+                 let meta = match fs.metadata(&target_path) {
+                     Ok(meta) => meta,
+@@ -158,8 +156,10 @@ impl FileSystem {
+         source_path: PathBuf,
+     ) -> Result<()> {
+         let _ = crate::FileSystem::remove_dir(self, target_path.as_path());
++        // Look the name up and insert the entry under one write lock.
++        let mut fs_lock = self.inner.write().map_err(|_| FsError::Lock)?;
+         let (inode_of_parent, maybe_inode_of_file, name_of_file) =
+-            self.insert_inode(target_path.as_path())?;
++            fs_lock.insert_inode(target_path.as_path())?;
+ 
+         let inode_of_parent = match inode_of_parent {
+             InodeResolution::Found(a) => a,
+@@ -174,9 +174,6 @@ impl FileSystem {
+ 
+             // The file doesn't already exist; it's OK to create it if
+             None => {
+-                // Write lock.
+-                let mut fs_lock = self.inner.write().map_err(|_| FsError::Lock)?;
+-
+                 // Creating the file in the storage.
+                 let inode_of_file = fs_lock.storage.vacant_entry().key();
+                 let real_inode_of_file =
+@@ -232,8 +229,10 @@ impl FileSystem {
+         file: Box<dyn crate::VirtualFile + Send + Sync>,
+     ) -> Result<()> {
+         let _ = crate::FileSystem::remove_file(self, path.as_path());
++        // Look the name up and insert the file under one write lock.
++        let mut fs_lock = self.inner.write().map_err(|_| FsError::Lock)?;
+         let (inode_of_parent, maybe_inode_of_file, name_of_file) =
+-            self.insert_inode(path.as_path())?;
++            fs_lock.insert_inode(path.as_path())?;
+ 
+         let inode_of_parent = match inode_of_parent {
+             InodeResolution::Found(a) => a,
+@@ -247,8 +246,6 @@ impl FileSystem {
+             // TODO: restore previous inode?
+             return Err(FsError::AlreadyExists);
+         }
+-        // Write lock.
+-        let mut fs_lock = self.inner.write().map_err(|_| FsError::Lock)?;
+ 
+         // Creating the file in the storage.
+         let inode_of_file = fs_lock.storage.vacant_entry().key();
+@@ -282,14 +279,16 @@ impl FileSystem {
+ 
+         Ok(())
+     }
++}
+ 
+-    fn insert_inode(
++impl FileSystemInner {
++    /// Find the parent of a file about to be inserted or opened, and the
++    /// file itself if it exists. The caller holds the write lock across the
++    /// lookup and what it does with the result, so neither can go stale.
++    pub(super) fn insert_inode(
+         &self,
+         path: &Path,
+     ) -> Result<(InodeResolution, Option<InodeResolution>, OsString)> {
+-        // Read lock.
+-        let fs = self.inner.read().map_err(|_| FsError::Lock)?;
+-
+         // Check the path has a parent.
+         let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
+ 
+@@ -300,7 +299,7 @@ impl FileSystem {
+             .to_os_string();
+ 
+         // Find the parent inode.
+-        let inode_of_parent = match fs.inode_of_parent(parent_of_path)? {
++        let inode_of_parent = match self.inode_of_parent(parent_of_path)? {
+             InodeResolution::Found(a) => a,
+             InodeResolution::Redirect(fs, parent_path) => {
+                 return Ok((
+@@ -312,7 +311,7 @@ impl FileSystem {
+         };
+ 
+         // Find the inode of the file if it exists.
+-        let maybe_inode_of_file = fs
++        let maybe_inode_of_file = self
+             .as_parent_get_position_and_inode_of_file(inode_of_parent, &name_of_file)?
+             .map(|(_nth, inode)| inode);
+ 
+@@ -356,13 +355,19 @@ impl crate::FileOpener for FileSystem {
+             write = false;
+         }
+ 
+-        let (inode_of_parent, maybe_inode_of_file, name_of_file) = self.insert_inode(path)?;
++        // Look the file up and open or create it under one write lock: a file
++        // found under a read lock can be removed, and its inode reused, before
++        // the write lock is held, and a file found missing can be created by
++        // another thread, so that an exclusive create would succeed twice.
++        let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
++        let (inode_of_parent, maybe_inode_of_file, name_of_file) = fs.insert_inode(path)?;
+ 
+         let inode_of_parent = match inode_of_parent {
+             InodeResolution::Found(a) => a,
+-            InodeResolution::Redirect(fs, mut parent_path) => {
++            InodeResolution::Redirect(other, mut parent_path) => {
++                drop(fs);
+                 parent_path.push(name_of_file);
+-                return fs
++                return other
+                     .new_open_options()
+                     .options(conf.clone())
+                     .open(parent_path);
+@@ -370,8 +375,9 @@ impl crate::FileOpener for FileSystem {
+         };
+         let maybe_inode_of_file = match maybe_inode_of_file {
+             Some(InodeResolution::Found(inode)) => Some(inode),
+-            Some(InodeResolution::Redirect(fs, path)) => {
+-                return fs.new_open_options().options(conf.clone()).open(path);
++            Some(InodeResolution::Redirect(other, path)) => {
++                drop(fs);
++                return other.new_open_options().options(conf.clone()).open(path);
+             }
+             None => None,
+         };
+@@ -384,9 +390,6 @@ impl crate::FileOpener for FileSystem {
+ 
+             // The file already exists; it's OK.
+             Some(inode_of_file) => {
+-                // Write lock.
+-                let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+-
+                 let handle_lifecycle = match fs.storage.get_mut(inode_of_file) {
+                     Some(Node::File(FileNode {
+                         metadata,
+@@ -486,9 +489,6 @@ impl crate::FileOpener for FileSystem {
+             // 1. `create_new` is used with `write` or `append`,
+             // 2. `create` is used with `write` or `append`.
+             None if (create_new || create) && (create_new || write || append) => {
+-                // Write lock.
+-                let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+-
+                 let handle_lifecycle: Arc<FileLifecycle> = Arc::default();
+                 let metadata = {
+                     let time = time();
+@@ -548,6 +548,8 @@ impl crate::FileOpener for FileSystem {
+ 
+             None => return Err(FsError::EntryNotFound),
+         };
++        // The node counts this handle as open, so the rest needs no lock.
++        drop(fs);
+ 
+         #[cfg(test)]
+         test_file_opener::run_open_before_handle_hook();
+@@ -609,6 +611,36 @@ mod test_file_opener {
+         }
+     }
+ 
++    #[test]
++    fn test_create_new_is_exclusive_across_threads() {
++        // Threads race to create one name exclusively, round after round:
++        // exactly one of them may succeed each time.
++        const THREADS: usize = 8;
++        const ROUNDS: usize = 200;
++        let fs = FileSystem::default();
++        for _ in 0..ROUNDS {
++            let barrier = std::sync::Barrier::new(THREADS);
++            let winners: usize = std::thread::scope(|scope| {
++                let racers: Vec<_> = (0..THREADS)
++                    .map(|_| {
++                        scope.spawn(|| {
++                            barrier.wait();
++                            fs.new_open_options()
++                                .write(true)
++                                .create_new(true)
++                                .open(path!("/race.txt"))
++                                .is_ok() as usize
++                        })
++                    })
++                    .collect();
++                racers.into_iter().map(|racer| racer.join().unwrap()).sum()
++            });
++            assert_eq!(winners, 1, "an exclusive create succeeded {winners} times");
++            fs.remove_file(path!("/race.txt"))
++                .expect("remove the winner's file");
++        }
++    }
++
+     #[cfg(test)]
+     pub(super) fn run_open_before_handle_hook() {
+         OPEN_BEFORE_HANDLE_HOOK.with(|slot| {
+diff --git a/lib/virtual-fs/src/mem_fs/filesystem.rs b/lib/virtual-fs/src/mem_fs/filesystem.rs
+index 2409b6d..d8bfdfd 100644
+--- a/lib/virtual-fs/src/mem_fs/filesystem.rs
++++ b/lib/virtual-fs/src/mem_fs/filesystem.rs
+@@ -256,30 +256,28 @@ impl FileSystem {
+     }
+ 
+     pub fn create_symlink(&self, source: &Path, target: &Path) -> Result<()> {
+-        let (inode_of_parent, name_of_symlink) = {
+-            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+-            let path = guard.canonicalize_without_inode(target)?;
+-            let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
+-            let name_of_symlink = path
+-                .file_name()
+-                .ok_or(FsError::InvalidInput)?
+-                .to_os_string();
+-            let inode_of_parent = match guard.inode_of_parent(parent_of_path)? {
+-                InodeResolution::Found(a) => a,
+-                InodeResolution::Redirect(fs, mut redirected_path) => {
+-                    redirected_path.push(&name_of_symlink);
+-                    drop(guard);
+-                    let fs_ref: &dyn crate::FileSystem = fs.as_ref();
+-                    if let Some(mem_fs) = fs_ref.downcast_ref::<Self>() {
+-                        return mem_fs.create_symlink(source, redirected_path.as_path());
+-                    }
+-                    return Err(FsError::Unsupported);
++        // Resolve the parent and create the symlink under one write lock, so
++        // the parent cannot be removed in between.
++        let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
++        let path = fs.canonicalize_without_inode(target)?;
++        let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
++        let name_of_symlink = path
++            .file_name()
++            .ok_or(FsError::InvalidInput)?
++            .to_os_string();
++        let inode_of_parent = match fs.inode_of_parent(parent_of_path)? {
++            InodeResolution::Found(a) => a,
++            InodeResolution::Redirect(other, mut redirected_path) => {
++                redirected_path.push(&name_of_symlink);
++                drop(fs);
++                let fs_ref: &dyn crate::FileSystem = other.as_ref();
++                if let Some(mem_fs) = fs_ref.downcast_ref::<Self>() {
++                    return mem_fs.create_symlink(source, redirected_path.as_path());
+                 }
+-            };
+-            (inode_of_parent, name_of_symlink)
++                return Err(FsError::Unsupported);
++            }
+         };
+ 
+-        let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+         if fs.canonicalize(target).is_ok() {
+             return Err(FsError::AlreadyExists);
+         }
+@@ -388,76 +386,70 @@ impl crate::FileSystem for FileSystem {
+             return Err(FsError::AlreadyExists);
+         }
+ 
+-        let (inode_of_parent, name_of_directory) = {
+-            // Read lock.
+-            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+-
+-            // Canonicalize the path without checking the path exists,
+-            // because it's about to be created.
+-            let path = guard.canonicalize_without_inode(path)?;
++        // Check that the name is free and create the directory under one
++        // write lock, so that two calls cannot both create it.
++        let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+ 
+-            // Check the path has a parent.
+-            let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
++        // Canonicalize the path without checking the path exists,
++        // because it's about to be created.
++        let path = fs.canonicalize_without_inode(path)?;
+ 
+-            // Check the directory name.
+-            let name_of_directory = path
+-                .file_name()
+-                .ok_or(FsError::InvalidInput)?
+-                .to_os_string();
++        // Check the path has a parent.
++        let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
+ 
+-            // Find the parent inode.
+-            let inode_of_parent = match guard.inode_of_parent(parent_of_path)? {
+-                InodeResolution::Found(a) => a,
+-                InodeResolution::Redirect(fs, mut path) => {
+-                    drop(guard);
+-                    path.push(name_of_directory);
+-                    return fs.create_dir(path.as_path());
+-                }
+-            };
++        // Check the directory name.
++        let name_of_directory = path
++            .file_name()
++            .ok_or(FsError::InvalidInput)?
++            .to_os_string();
+ 
+-            (inode_of_parent, name_of_directory)
++        // Find the parent inode.
++        let inode_of_parent = match fs.inode_of_parent(parent_of_path)? {
++            InodeResolution::Found(a) => a,
++            InodeResolution::Redirect(other, mut path) => {
++                drop(fs);
++                path.push(name_of_directory);
++                return other.create_dir(path.as_path());
++            }
+         };
+ 
+-        if self.read_dir(path).is_ok() {
++        // Nothing of that name may exist in the parent yet.
++        if fs
++            .as_parent_get_position_and_inode(inode_of_parent, &name_of_directory)?
++            .is_some()
++        {
+             return Err(FsError::AlreadyExists);
+         }
+ 
+-        {
+-            // Write lock.
+-            let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+-
+-            // Creating the directory in the storage.
+-            let inode_of_directory = fs.storage.vacant_entry().key();
+-            let real_inode_of_directory = fs.storage.insert(Node::Directory(DirectoryNode {
+-                inode: inode_of_directory,
+-                name: name_of_directory,
+-                children: Vec::new(),
+-                metadata: {
+-                    let time = time();
+-
+-                    Metadata {
+-                        ft: FileType {
+-                            dir: true,
+-                            ..Default::default()
+-                        },
+-                        accessed: time,
+-                        created: time,
+-                        modified: time,
+-                        len: 0,
+-                    }
+-                },
+-            }));
++        // Creating the directory in the storage.
++        let inode_of_directory = fs.storage.vacant_entry().key();
++        let real_inode_of_directory = fs.storage.insert(Node::Directory(DirectoryNode {
++            inode: inode_of_directory,
++            name: name_of_directory,
++            children: Vec::new(),
++            metadata: {
++                let time = time();
+ 
+-            assert_eq!(
+-                inode_of_directory, real_inode_of_directory,
+-                "new directory inode should have been correctly calculated",
+-            );
++                Metadata {
++                    ft: FileType {
++                        dir: true,
++                        ..Default::default()
++                    },
++                    accessed: time,
++                    created: time,
++                    modified: time,
++                    len: 0,
++                }
++            },
++        }));
+ 
+-            // Adding the new directory to its parent.
+-            fs.add_child_to_node(inode_of_parent, inode_of_directory)?;
+-        }
++        assert_eq!(
++            inode_of_directory, real_inode_of_directory,
++            "new directory inode should have been correctly calculated",
++        );
+ 
+-        Ok(())
++        // Adding the new directory to its parent.
++        fs.add_child_to_node(inode_of_parent, inode_of_directory)
+     }
+ 
+     fn create_symlink(&self, source: &Path, target: &Path) -> Result<()> {
+@@ -465,72 +457,64 @@ impl crate::FileSystem for FileSystem {
+     }
+ 
+     fn remove_dir(&self, path: &Path) -> Result<()> {
+-        let (inode_of_parent, position, inode_of_directory) = {
+-            // Read lock.
+-            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
+-
+-            // Canonicalize the path.
+-            let (path, _) = guard.canonicalize(path)?;
+-
+-            // Check the path has a parent.
+-            let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
++        // Find the directory and remove it under one write lock: a position
++        // found under the read lock can be stale by the time the write lock
++        // is held, if another thread has changed the parent in between.
++        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
+ 
+-            // Check the directory name.
+-            let name_of_directory = path
+-                .file_name()
+-                .ok_or(FsError::InvalidInput)?
+-                .to_os_string();
++        // Canonicalize the path.
++        let (path, _) = guard.canonicalize(path)?;
+ 
+-            // Find the parent inode.
+-            let inode_of_parent = match guard.inode_of_parent(parent_of_path)? {
+-                InodeResolution::Found(a) => a,
+-                InodeResolution::Redirect(fs, mut parent_path) => {
+-                    drop(guard);
+-                    parent_path.push(name_of_directory);
+-                    return fs.remove_dir(parent_path.as_path());
+-                }
+-            };
++        // Check the path has a parent.
++        let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
+ 
+-            // Get the child index to remove in the parent node, in
+-            // addition to the inode of the directory to remove.
+-            let (position, inode_of_directory) = guard
+-                .as_parent_get_position_and_inode_of_directory(
+-                    inode_of_parent,
+-                    &name_of_directory,
+-                    DirectoryMustBeEmpty::Yes,
+-                )?;
++        // Check the directory name.
++        let name_of_directory = path
++            .file_name()
++            .ok_or(FsError::InvalidInput)?
++            .to_os_string();
+ 
+-            (inode_of_parent, position, inode_of_directory)
++        // Find the parent inode.
++        let inode_of_parent = match guard.inode_of_parent(parent_of_path)? {
++            InodeResolution::Found(a) => a,
++            InodeResolution::Redirect(fs, mut parent_path) => {
++                drop(guard);
++                parent_path.push(name_of_directory);
++                return fs.remove_dir(parent_path.as_path());
++            }
+         };
+ 
++        // Get the child index to remove in the parent node, in
++        // addition to the inode of the directory to remove.
++        let (position, inode_of_directory) = guard.as_parent_get_position_and_inode_of_directory(
++            inode_of_parent,
++            &name_of_directory,
++            DirectoryMustBeEmpty::Yes,
++        )?;
++
+         let inode_of_directory = match inode_of_directory {
+             InodeResolution::Found(a) => a,
+             InodeResolution::Redirect(fs, path) => {
++                drop(guard);
+                 return fs.remove_dir(path.as_path());
+             }
+         };
+ 
+-        {
+-            // Write lock.
+-            let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+-
+-            // Remove the directory from the storage.
+-            fs.storage.remove(inode_of_directory);
+-
+-            // Remove the child from the parent directory.
+-            fs.remove_child_from_node(inode_of_parent, position)?;
+-        }
++        // Remove the directory from the storage.
++        guard.storage.remove(inode_of_directory);
+ 
+-        Ok(())
++        // Remove the child from the parent directory.
++        guard.remove_child_from_node(inode_of_parent, position)
+     }
+ 
+     fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, Result<()>> {
+         Box::pin(async move {
+-            let name_of_to;
+-
+-            // Read lock.
+-            let (name_of_from, inode_of_from_parent, name_of_to, inode_of_to_parent) = {
+-                let fs = self.inner.read().map_err(|_| FsError::Lock)?;
++            // A rename within this filesystem is found and made under one
++            // write lock, so that no other thread can change either directory
++            // in between. A rename that involves another filesystem is handed
++            // over once the lock is released.
++            let handover = {
++                let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+ 
+                 let from = fs.canonicalize_without_inode(from)?;
+                 let to = fs.canonicalize_without_inode(to)?;
+@@ -544,7 +528,7 @@ impl crate::FileSystem for FileSystem {
+                     .file_name()
+                     .ok_or(FsError::InvalidInput)?
+                     .to_os_string();
+-                name_of_to = to.file_name().ok_or(FsError::InvalidInput)?.to_os_string();
++                let name_of_to = to.file_name().ok_or(FsError::InvalidInput)?.to_os_string();
+ 
+                 // Find the parent inodes.
+                 let inode_of_from_parent = match fs.inode_of_parent(parent_of_from)? {
+@@ -562,54 +546,27 @@ impl crate::FileSystem for FileSystem {
+                     }
+                 };
+ 
+-                (
+-                    name_of_from,
+-                    inode_of_from_parent,
+-                    name_of_to,
+-                    inode_of_to_parent,
+-                )
+-            };
+-
+-            match (inode_of_from_parent, inode_of_to_parent) {
+-                // Rename within this MemFS instance
+-                (Either::Left(inode_of_from_parent), Either::Left(inode_of_to_parent)) => {
+-                    let fs = self.inner.read().map_err(|_| FsError::Lock)?;
+-
+-                    // Find the inode of the dest file if it exists
+-                    let maybe_position_and_inode_of_file = fs
+-                        .as_parent_get_position_and_inode_of_file(
++                match (inode_of_from_parent, inode_of_to_parent) {
++                    // Rename within this MemFS instance
++                    (Either::Left(inode_of_from_parent), Either::Left(inode_of_to_parent)) => {
++                        // Find the inode of the dest file if it exists
++                        let inode_dest = fs.as_parent_get_position_and_inode_of_file(
+                             inode_of_to_parent,
+                             &name_of_to,
+                         )?;
+ 
+-                    // Get the child indexes to update in the parent nodes, in
+-                    // addition to the inode of the directory to update.
+-                    let (position_of_from, inode) = fs
+-                        .as_parent_get_position_and_inode(inode_of_from_parent, &name_of_from)?
+-                        .ok_or(FsError::EntryNotFound)?;
+-
+-                    let (
+-                        (position_of_from, inode, inode_of_from_parent),
+-                        (inode_of_to_parent, name_of_to),
+-                        inode_dest,
+-                    ) = (
+-                        (position_of_from, inode, inode_of_from_parent),
+-                        (inode_of_to_parent, name_of_to),
+-                        maybe_position_and_inode_of_file,
+-                    );
+-
+-                    let inode = match inode {
+-                        InodeResolution::Found(a) => a,
+-                        InodeResolution::Redirect(..) => {
+-                            return Err(FsError::InvalidInput);
+-                        }
+-                    };
+-
+-                    drop(fs);
++                        // Get the child index to update in the parent node, in
++                        // addition to the inode of the file to update.
++                        let (position_of_from, inode) = fs
++                            .as_parent_get_position_and_inode(inode_of_from_parent, &name_of_from)?
++                            .ok_or(FsError::EntryNotFound)?;
+ 
+-                    {
+-                        // Write lock.
+-                        let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
++                        let inode = match inode {
++                            InodeResolution::Found(a) => a,
++                            InodeResolution::Redirect(..) => {
++                                return Err(FsError::InvalidInput);
++                            }
++                        };
+ 
+                         if let Some((position, inode_of_file)) = inode_dest {
+                             // Remove the file from the storage.
+@@ -647,21 +604,26 @@ impl crate::FileSystem for FileSystem {
+                                 _ => return Err(FsError::UnknownError),
+                             }
+                         }
++
++                        return Ok(());
+                     }
+ 
+-                    Ok(())
+-                }
++                    // Rename within the same mounted FS instance
++                    (Either::Right((from_fs, from_path)), Either::Right((to_fs, to_path)))
++                        if Arc::ptr_eq(&from_fs, &to_fs) =>
++                    {
++                        Some((from_fs, from_path, to_path))
++                    }
+ 
+-                // Rename within the same mounted FS instance
+-                (Either::Right((from_fs, from_path)), Either::Right((to_fs, to_path)))
+-                    if Arc::ptr_eq(&from_fs, &to_fs) =>
+-                {
+-                    let same_fs = from_fs;
+-                    same_fs.rename(&from_path, &to_path).await
++                    // Rename across file systems
++                    _ => None,
+                 }
++            };
+ 
++            match handover {
++                Some((same_fs, from_path, to_path)) => same_fs.rename(&from_path, &to_path).await,
+                 // Rename across file systems; we need to do a create and a delete
+-                _ => crate::ops::move_across_filesystems(self, self, from, to).await,
++                None => crate::ops::move_across_filesystems(self, self, from, to).await,
+             }
+         })
+     }
+@@ -701,55 +663,45 @@ impl crate::FileSystem for FileSystem {
+     }
+ 
+     fn remove_file(&self, path: &Path) -> Result<()> {
+-        let (inode_of_parent, position, inode_of_file) = {
+-            // Read lock.
+-            let guard = self.inner.read().map_err(|_| FsError::Lock)?;
++        // As remove_dir: find the file and unlink it under one write lock.
++        let mut guard = self.inner.write().map_err(|_| FsError::Lock)?;
+ 
+-            // Canonicalize the path.
+-            let path = guard.canonicalize_without_inode(path)?;
+-
+-            // Check the path has a parent.
+-            let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
+-
+-            // Check the file name.
+-            let name_of_file = path
+-                .file_name()
+-                .ok_or(FsError::InvalidInput)?
+-                .to_os_string();
++        // Canonicalize the path.
++        let path = guard.canonicalize_without_inode(path)?;
+ 
+-            // Find the parent inode.
+-            let inode_of_parent = match guard.inode_of_parent(parent_of_path)? {
+-                InodeResolution::Found(a) => a,
+-                InodeResolution::Redirect(fs, mut parent_path) => {
+-                    parent_path.push(name_of_file);
+-                    return fs.remove_file(parent_path.as_path());
+-                }
+-            };
++        // Check the path has a parent.
++        let parent_of_path = path.parent().ok_or(FsError::BaseNotDirectory)?;
+ 
+-            // Find the inode of the file if it exists, along with its position.
+-            let maybe_position_and_inode_of_file =
+-                guard.as_parent_get_position_and_inode_of_file(inode_of_parent, &name_of_file)?;
++        // Check the file name.
++        let name_of_file = path
++            .file_name()
++            .ok_or(FsError::InvalidInput)?
++            .to_os_string();
+ 
+-            match maybe_position_and_inode_of_file {
+-                Some((position, inode_of_file)) => (inode_of_parent, position, inode_of_file),
+-                None => return Err(FsError::EntryNotFound),
++        // Find the parent inode.
++        let inode_of_parent = match guard.inode_of_parent(parent_of_path)? {
++            InodeResolution::Found(a) => a,
++            InodeResolution::Redirect(fs, mut parent_path) => {
++                drop(guard);
++                parent_path.push(name_of_file);
++                return fs.remove_file(parent_path.as_path());
+             }
+         };
+ 
++        // Find the inode of the file if it exists, along with its position.
++        let (position, inode_of_file) = guard
++            .as_parent_get_position_and_inode_of_file(inode_of_parent, &name_of_file)?
++            .ok_or(FsError::EntryNotFound)?;
++
+         let inode_of_file = match inode_of_file {
+             InodeResolution::Found(a) => a,
+             InodeResolution::Redirect(fs, path) => {
++                drop(guard);
+                 return fs.remove_file(path.as_path());
+             }
+         };
+ 
+-        {
+-            // Write lock.
+-            let mut fs = self.inner.write().map_err(|_| FsError::Lock)?;
+-            fs.unlink_file_inode(inode_of_parent, position, inode_of_file)?;
+-        }
+-
+-        Ok(())
++        guard.unlink_file_inode(inode_of_parent, position, inode_of_file)
+     }
+ 
+     fn new_open_options(&self) -> OpenOptions<'_> {
+@@ -1241,6 +1193,48 @@ mod test_filesystem {
+         };
+     }
+ 
++    #[test]
++    fn test_create_dir_is_exclusive_across_threads() {
++        // Threads race to create one directory, round after round: exactly
++        // one of them may succeed, and the parent must list it once.
++        const THREADS: usize = 8;
++        const ROUNDS: usize = 200;
++        let fs = FileSystem::default();
++        for _ in 0..ROUNDS {
++            let barrier = std::sync::Barrier::new(THREADS);
++            let winners: usize = std::thread::scope(|scope| {
++                let racers: Vec<_> = (0..THREADS)
++                    .map(|_| {
++                        scope.spawn(|| {
++                            barrier.wait();
++                            fs.create_dir(path!("/race")).is_ok() as usize
++                        })
++                    })
++                    .collect();
++                racers.into_iter().map(|racer| racer.join().unwrap()).sum()
++            });
++            assert_eq!(
++                winners, 1,
++                "create_dir succeeded {winners} times for one name"
++            );
++            let listed = fs.read_dir(path!("/")).unwrap().count();
++            assert_eq!(listed, 1, "the parent lists {listed} entries");
++            fs.remove_dir(path!("/race"))
++                .expect("remove the winner's directory");
++        }
++    }
++
++    #[test]
++    fn test_create_dir_over_a_file() {
++        let fs = FileSystem::default();
++        fs.new_open_options()
++            .write(true)
++            .create_new(true)
++            .open(path!("/taken"))
++            .expect("create /taken");
++        assert_eq!(fs.create_dir(path!("/taken")), Err(FsError::AlreadyExists));
++    }
++
+     #[tokio::test]
+     async fn test_new_filesystem() {
+         let fs = FileSystem::default();
+@@ -1824,12 +1818,14 @@ mod test_filesystem {
+ 
+         drop(file);
+ 
+-        let fs_inner = fs.inner.read().unwrap();
+-        assert_eq!(
+-            fs_inner.storage.len(),
+-            1,
+-            "storage drops the file once the last open handle closes"
+-        );
++        {
++            let fs_inner = fs.inner.read().unwrap();
++            assert_eq!(
++                fs_inner.storage.len(),
++                1,
++                "storage drops the file once the last open handle closes"
++            );
++        }
+ 
+         assert_eq!(
+             fs.remove_file(path!("/foo.txt")),
+diff --git a/lib/virtual-fs/src/mem_fs/offloaded_file.rs b/lib/virtual-fs/src/mem_fs/offloaded_file.rs
+index f270b02..fc5107f 100644
+--- a/lib/virtual-fs/src/mem_fs/offloaded_file.rs
++++ b/lib/virtual-fs/src/mem_fs/offloaded_file.rs
+@@ -357,10 +357,6 @@ impl OffloadedFile {
+         Ok(data.len())
+     }
+ 
+-    pub fn flush(&mut self) -> io::Result<()> {
+-        Ok(())
+-    }
+-
+     pub fn resize(&mut self, new_len: u64, value: u8) {
+         let mut cur_len = self.len();
+         if new_len > cur_len {
