@@ -1,0 +1,134 @@
+Subject: wasix: hold a file's lock across its flush
+Last-Update: 2026-10-01
+
+A file's descriptors share one host handle, a tokio file, behind a lock.
+While an operation of the file is in flight only the last task to poll
+it is woken when it completes, so every use of the handle holds the
+lock from its first poll until it is done - except the flush that close,
+fdatasync, fd_renumber and posix_spawn's dup2 made, which took the lock
+afresh on each poll. A host write returns before it has finished, and a
+flush that finds one under way waits for it: between two of the flush's
+polls another thread's write could take the lock, wait on the same
+write and take over the wakeup, so that the flush was never polled
+again. With threads writing a file, a close or an fdatasync of it hung.
+A flush now holds the lock across its whole wait, as every other use
+does.
+
+Closing descriptors in bulk, when a process exits or execs, still takes
+the lock afresh on each poll: its futures must be Send, and one holding
+the lock across the wait would not be. Such a flush can still stall
+while another thread or process writes the same file.
+
+diff --git a/lib/wasix/src/fs/mod.rs b/lib/wasix/src/fs/mod.rs
+index 1d42df2..3b26702 100644
+--- a/lib/wasix/src/fs/mod.rs
++++ b/lib/wasix/src/fs/mod.rs
+@@ -37,8 +37,8 @@ use crate::state::{Stderr, Stdin, Stdout};
+ use futures::{Future, future::BoxFuture};
+ use tracing::{debug, trace, warn};
+ use virtual_fs::{
+-    ArcFileSystem, FileSystem, FsError, MountFileSystem, OpenOptions, OverlayFileSystem,
+-    TmpFileSystem, VirtualFile, limiter::DynFsMemoryLimiter,
++    ArcFileSystem, AsyncWriteExt, FileSystem, FsError, MountFileSystem, OpenOptions,
++    OverlayFileSystem, TmpFileSystem, VirtualFile, limiter::DynFsMemoryLimiter,
+ };
+ use wasmer_config::package::PackageId;
+ use wasmer_wasix_types::{
+@@ -87,6 +87,16 @@ impl CloseFdOutcome {
+     }
+ }
+ 
++/// Flush a file's shared host handle, holding its lock across the whole flush
++/// as a write does. The handle's flush can wait on a write still under way;
++/// had the lock been released between polls, a write from another thread could
++/// take over that wait's wakeup, and the flush would never be polled again.
++#[allow(clippy::await_holding_lock)]
++pub(crate) async fn flush_file(file: VirtualFileLock) -> Result<(), Errno> {
++    let mut file = file.write().unwrap();
++    file.flush().await.map_err(|_| Errno::Io)
++}
++
+ impl Future for FlushPoller {
+     type Output = Result<(), Errno>;
+ 
+diff --git a/lib/wasix/src/syscalls/wasi/fd_close.rs b/lib/wasix/src/syscalls/wasi/fd_close.rs
+index d309644..29b48f0 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_close.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_close.rs
+@@ -1,5 +1,5 @@
+ use super::*;
+-use crate::fs::FlushPoller;
++use crate::fs::flush_file;
+ use crate::syscalls::*;
+ 
+ /// Best-effort flush of a file handle captured before fd removal.
+@@ -13,7 +13,7 @@ pub(crate) fn flush_captured_handle(
+         return Ok(Errno::Success);
+     };
+ 
+-    match __asyncify_light(env, None, FlushPoller { file })? {
++    match __asyncify_light(env, None, flush_file(file))? {
+         Ok(_)
+         | Err(Errno::Isdir)
+         | Err(Errno::Io)
+diff --git a/lib/wasix/src/syscalls/wasi/fd_datasync.rs b/lib/wasix/src/syscalls/wasi/fd_datasync.rs
+index 42e8985..f4bb45a 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_datasync.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_datasync.rs
+@@ -1,5 +1,5 @@
+ use super::*;
+-use crate::fs::FlushPoller;
++use crate::fs::flush_file;
+ use crate::syscalls::*;
+ 
+ /// ### `fd_datasync()`
+@@ -35,6 +35,6 @@ pub fn fd_datasync(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<E
+     Ok(wasi_try_ok!(__asyncify_uninterruptible(
+         &mut ctx,
+         None,
+-        async move { FlushPoller { file }.await.map(|_| Errno::Success) }
++        async move { flush_file(file).await.map(|_| Errno::Success) }
+     )?))
+ }
+diff --git a/lib/wasix/src/syscalls/wasi/fd_renumber.rs b/lib/wasix/src/syscalls/wasi/fd_renumber.rs
+index 6c42a18..ca13e67 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_renumber.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_renumber.rs
+@@ -1,5 +1,5 @@
+ use super::*;
+-use crate::fs::FlushPoller;
++use crate::fs::flush_file;
+ use crate::syscalls::*;
+ 
+ /// ### `fd_renumber()`
+@@ -48,7 +48,7 @@ pub(crate) fn fd_renumber_internal(
+ 
+     // Best-effort flush of the replaced entry; result depends only on map updates.
+     if let Some(file) = flush_target {
+-        let _ = __asyncify_light(env, None, FlushPoller { file })?;
++        let _ = __asyncify_light(env, None, flush_file(file))?;
+     }
+ 
+     Ok(Errno::Success)
+diff --git a/lib/wasix/src/syscalls/wasix/proc_spawn3.rs b/lib/wasix/src/syscalls/wasix/proc_spawn3.rs
+index 10da8db..5b76866 100644
+--- a/lib/wasix/src/syscalls/wasix/proc_spawn3.rs
++++ b/lib/wasix/src/syscalls/wasix/proc_spawn3.rs
+@@ -2,7 +2,7 @@ use virtual_mio::block_on;
+ use wasmer_wasix_types::wasi::ProcSpawnFdOpName;
+ 
+ use super::*;
+-use crate::{VIRTUAL_ROOT_FD, WasiFs, syscalls::*};
++use crate::{VIRTUAL_ROOT_FD, WasiFs, fs::flush_file, syscalls::*};
+ 
+ /// Spawns a new sub-process (posix-spawn style) with proper `WasmPtr<WasmPtr<u8>>` string lists.
+ ///
+@@ -212,7 +212,7 @@ pub(crate) fn apply_fd_op<M: MemorySize>(
+         ProcSpawnFdOpName::Dup2 => {
+             let flush_target = env.state.fs.dup2_at(op.src_fd, op.fd)?;
+             if let Some(file) = flush_target {
+-                block_on(WasiFs::flush_file_best_effort(file));
++                let _ = block_on(flush_file(file));
+             }
+             Ok(())
+         }

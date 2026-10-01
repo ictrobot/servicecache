@@ -98,3 +98,4 @@ expect_fixes root-create.wasm "WASIX creates and removes entries at the root thr
 expect_fixes dir-fsync.wasm "WASIX syncs a directory"
 expect_fixes unlink-directory.wasm "WASIX refuses to unlink a directory and leaves it intact"
 expect_fixes memfs-race.wasm "WASIX threads create, rename and unlink in one memory directory" 30s
+expect_fixes flush-while-writing.wasm "WASIX closes and syncs a file while other threads write it" 20s
