@@ -1,0 +1,47 @@
+Subject: wasix: sweep dead inodes when the table has doubled, not every
+ hundred
+Last-Update: 2026-10-01
+
+The inode table removed its dead entries whenever its length modulo 100
+was one, and each of these sweeps goes over the whole table. A program
+that keeps creating and deleting files, with its number of live files
+just under a multiple of 100, swept every few inserts, or on every
+insert at worst. The sweep now runs once the table has doubled in size
+since the last one, so its cost per insert stays constant.
+
+diff --git a/lib/wasix/src/fs/mod.rs b/lib/wasix/src/fs/mod.rs
+index 13b4fc5..0f52587 100644
+--- a/lib/wasix/src/fs/mod.rs
++++ b/lib/wasix/src/fs/mod.rs
+@@ -326,6 +326,8 @@ enum ComponentResolution {
+ #[derive(Debug)]
+ struct WasiInodesProtected {
+     lookup: HashMap<Inode, Weak<InodeVal>>,
++    /// Entries left after the last sweep of dead weak references.
++    swept_len: usize,
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -338,6 +340,7 @@ impl WasiInodes {
+         Self {
+             protected: Arc::new(RwLock::new(WasiInodesProtected {
+                 lookup: Default::default(),
++                swept_len: 0,
+             })),
+         }
+     }
+@@ -354,9 +357,12 @@ impl WasiInodes {
+         let ino = Inode(st_ino);
+         guard.lookup.insert(ino, Arc::downgrade(&val));
+ 
+-        // every 100 calls we clear out dead weaks
+-        if guard.lookup.len() % 100 == 1 {
++        // Drop dead weak references once the map has doubled since the last
++        // sweep, and has at least 128 entries, so that each pass over the map
++        // is paid for by the inserts that grew it.
++        if guard.lookup.len() >= 2 * guard.swept_len.max(64) {
+             guard.lookup.retain(|_, v| Weak::strong_count(v) > 0);
++            guard.swept_len = guard.lookup.len();
+         }
+ 
+         let open_handles = Arc::new(AtomicI32::new(0));
