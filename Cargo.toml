@@ -37,3 +37,8 @@ wasmer-wasix-types = { path = "work/src/wasmer/servicecache/lib/wasi-types" }
 # stay as they are.
 [profile.bench]
 debug = "line-tables-only"
+
+# Optimise dependencies in debug builds: unoptimised, Wasmer and Cranelift
+# load and compile guest modules many times slower.
+[profile.dev.package."*"]
+opt-level = 2
