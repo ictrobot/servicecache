@@ -1,0 +1,663 @@
+Subject: net: use WASIX sockets on wasip1 with the wasix build tag
+Last-Update: 2026-10-04
+
+Without socket calls, wasip1 answers Listen and Dial from an in-process
+fake network. With the wasix build tag, socket opens a real socket
+through the syscall package and binds and listens it or connects it; the
+descriptor is then served by the same non-blocking reads, writes and
+poll_oneoff waits as an inherited socket. As on the Unix ports, a stream
+connect waits for the socket to become writable, within the context's
+deadline, and confirms it with SO_ERROR and the peer's address; a
+datagram socket connects before the poller registers it; and a Control
+function runs before the bind or connect. The datagram methods go to the
+descriptor, the address-typed ones through the generic calls, and File
+fails, since WASI preview 1 cannot duplicate a descriptor. The fake
+network's socket moves to a file of its own.
+
+On every wasip1 build, an accepted connection carries the peer's
+address, where the runtime reports one, and the listener's as its local
+address. Keep-alive, no-delay and the buffer sizes go to the runtime,
+and a stream listener reuses its address, so a restarted server binds at
+once. The runtime has no keep-alive idle time, interval or count, so
+setting those succeeds and keeps its defaults.
+
+diff --git a/src/net/fd_fake.go b/src/net/fd_fake.go
+index 946805a..66dd58c 100644
+--- a/src/net/fd_fake.go
++++ b/src/net/fd_fake.go
+@@ -86,7 +86,7 @@ func (fd *netFD) accept() (netfd *netFD, err error) {
+ 	if fd.fakeNetFD != nil {
+ 		return fd.fakeNetFD.accept(fd.laddr)
+ 	}
+-	d, _, errcall, err := fd.pfd.Accept()
++	d, rsa, errcall, err := fd.pfd.Accept()
+ 	if err != nil {
+ 		if errcall != "" {
+ 			err = wrapSyscallError(errcall, err)
+@@ -98,6 +98,12 @@ func (fd *netFD) accept() (netfd *netFD, err error) {
+ 		netfd.Close()
+ 		return nil, err
+ 	}
++	// The connection's local address is the listener's; the peer's address
++	// comes with the accept where the runtime reports one.
++	netfd.laddr = fd.laddr
++	if rsa != nil {
++		netfd.raddr = sockaddrToTCP(rsa)
++	}
+ 	return netfd, nil
+ }
+ 
+diff --git a/src/net/net_fake.go b/src/net/net_fake.go
+index cc35d90..c3c7824 100644
+--- a/src/net/net_fake.go
++++ b/src/net/net_fake.go
+@@ -40,40 +40,6 @@ func fakeAddr(sa sockaddr) fakeSockAddr {
+ 	}
+ }
+ 
+-// socket returns a network file descriptor that is ready for
+-// I/O using the fake network.
+-func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr, ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error) (*netFD, error) {
+-	if raddr != nil && ctrlCtxFn != nil {
+-		return nil, os.NewSyscallError("socket", syscall.ENOTSUP)
+-	}
+-	switch sotype {
+-	case syscall.SOCK_STREAM, syscall.SOCK_SEQPACKET, syscall.SOCK_DGRAM:
+-	default:
+-		return nil, os.NewSyscallError("socket", syscall.ENOTSUP)
+-	}
+-
+-	fd := &netFD{
+-		family: family,
+-		sotype: sotype,
+-		net:    net,
+-	}
+-	fd.fakeNetFD = newFakeNetFD(fd)
+-
+-	if raddr == nil {
+-		if err := fakeListen(fd, laddr); err != nil {
+-			fd.Close()
+-			return nil, err
+-		}
+-		return fd, nil
+-	}
+-
+-	if err := fakeConnect(ctx, fd, laddr, raddr); err != nil {
+-		fd.Close()
+-		return nil, err
+-	}
+-	return fd, nil
+-}
+-
+ func validateResolvedAddr(net string, family int, sa sockaddr) error {
+ 	validateIP := func(ip IP) error {
+ 		switch family {
+@@ -682,10 +648,6 @@ func (dt *deadlineTimer) Reset(deadline time.Time) bool {
+ 	return true
+ }
+ 
+-func sysSocket(family, sotype, proto int) (int, error) {
+-	return 0, os.NewSyscallError("sysSocket", syscall.ENOSYS)
+-}
+-
+ func fakeListen(fd *netFD, laddr sockaddr) (err error) {
+ 	wrapErr := func(err error) error {
+ 		if errno, ok := err.(syscall.Errno); ok {
+diff --git a/src/net/socket_fake.go b/src/net/socket_fake.go
+new file mode 100644
+index 0000000..50a1114
+--- /dev/null
++++ b/src/net/socket_fake.go
+@@ -0,0 +1,54 @@
++// Copyright 2018 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Sockets on the fake network for js/wasm and wasip1/wasm; wasip1 with
++// the wasix build tag has real ones in socket_wasix.go.
++
++//go:build (js || wasip1) && !wasix
++
++package net
++
++import (
++	"context"
++	"os"
++	"syscall"
++)
++
++// socket returns a network file descriptor that is ready for
++// I/O using the fake network.
++func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr, ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error) (*netFD, error) {
++	if raddr != nil && ctrlCtxFn != nil {
++		return nil, os.NewSyscallError("socket", syscall.ENOTSUP)
++	}
++	switch sotype {
++	case syscall.SOCK_STREAM, syscall.SOCK_SEQPACKET, syscall.SOCK_DGRAM:
++	default:
++		return nil, os.NewSyscallError("socket", syscall.ENOTSUP)
++	}
++
++	fd := &netFD{
++		family: family,
++		sotype: sotype,
++		net:    net,
++	}
++	fd.fakeNetFD = newFakeNetFD(fd)
++
++	if raddr == nil {
++		if err := fakeListen(fd, laddr); err != nil {
++			fd.Close()
++			return nil, err
++		}
++		return fd, nil
++	}
++
++	if err := fakeConnect(ctx, fd, laddr, raddr); err != nil {
++		fd.Close()
++		return nil, err
++	}
++	return fd, nil
++}
++
++func sysSocket(family, sotype, proto int) (int, error) {
++	return 0, os.NewSyscallError("sysSocket", syscall.ENOSYS)
++}
+diff --git a/src/net/socket_wasix.go b/src/net/socket_wasix.go
+new file mode 100644
+index 0000000..f51baf5
+--- /dev/null
++++ b/src/net/socket_wasix.go
+@@ -0,0 +1,376 @@
++//go:build wasip1 && wasix
++
++package net
++
++import (
++	"context"
++	"os"
++	"runtime"
++	"syscall"
++)
++
++// Sockets over the WASIX extension: a listen binds and listens a socket
++// the runtime opens, a dial connects one, and the descriptor is then
++// served by the same non-blocking reads, writes and poll_oneoff waits
++// an inherited socket gets on wasip1.
++
++func sysSocket(family, sotype, proto int) (int, error) {
++	s, err := syscall.Socket(family, sotype, proto)
++	if err != nil {
++		return -1, os.NewSyscallError("socket", err)
++	}
++	if err = syscall.SetNonblock(s, true); err != nil {
++		syscall.Close(s)
++		return -1, os.NewSyscallError("setnonblock", err)
++	}
++	return s, nil
++}
++
++// wasixAddr is the Addr for a socket address on the given network.
++func wasixAddr(net string, sa syscall.Sockaddr) Addr {
++	if sa == nil {
++		return nil
++	}
++	switch net[:3] {
++	case "tcp":
++		return sockaddrToTCP(sa)
++	case "udp":
++		return sockaddrToUDP(sa)
++	}
++	return nil
++}
++
++// socket returns a network file descriptor that is ready for
++// I/O: listening on laddr when raddr is nil, connected to raddr
++// otherwise.
++func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr, ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error) (*netFD, error) {
++	s, err := sysSocket(family, sotype, proto)
++	if err != nil {
++		return nil, err
++	}
++	if err := setDefaultSockopts(s, family, sotype, ipv6only); err != nil {
++		syscall.Close(s)
++		return nil, err
++	}
++	fd := newFD(net, s)
++	fd.family = family
++	fd.sotype = sotype
++	fd.pfd.IsStream = sotype == syscall.SOCK_STREAM
++	fd.pfd.ZeroReadIsEOF = sotype != syscall.SOCK_DGRAM && sotype != syscall.SOCK_RAW
++
++	// A Control function runs against the socket before it is bound or
++	// connected, after the defaults, as on the Unix ports.
++	control := func() error {
++		if ctrlCtxFn == nil {
++			return nil
++		}
++		addr := raddr
++		if raddr == nil {
++			addr = laddr
++		}
++		var address string
++		if addr != nil {
++			address = addr.String()
++		}
++		return ctrlCtxFn(ctx, fd.ctrlNetwork(), address, newRawConn(fd))
++	}
++
++	if laddr != nil {
++		lsa, err := laddr.sockaddr(family)
++		if err != nil {
++			fd.Close()
++			return nil, err
++		}
++		if raddr == nil && sotype == syscall.SOCK_STREAM {
++			// A listener reuses an address whose earlier connections are
++			// still closing, so a restarted server binds at once.
++			if err := setDefaultListenerSockopts(s); err != nil {
++				fd.Close()
++				return nil, err
++			}
++		}
++		if err := control(); err != nil {
++			fd.Close()
++			return nil, err
++		}
++		if lsa != nil {
++			if err := syscall.Bind(s, lsa); err != nil {
++				fd.Close()
++				return nil, os.NewSyscallError("bind", err)
++			}
++		}
++	}
++	if raddr == nil {
++		if sotype == syscall.SOCK_STREAM {
++			if err := syscall.Listen(s, listenerBacklog()); err != nil {
++				fd.Close()
++				return nil, os.NewSyscallError("listen", err)
++			}
++		}
++		if err := fd.init(); err != nil {
++			fd.Close()
++			return nil, err
++		}
++		local := Addr(laddr)
++		if lsa, err := syscall.Getsockname(s); err == nil {
++			if a := wasixAddr(net, lsa); a != nil {
++				local = a
++			}
++		}
++		fd.setAddr(local, nil)
++		return fd, nil
++	}
++
++	rsa, err := raddr.sockaddr(family)
++	if err != nil {
++		fd.Close()
++		return nil, err
++	}
++	if laddr == nil {
++		if err := control(); err != nil {
++			fd.Close()
++			return nil, err
++		}
++	}
++	if sotype == syscall.SOCK_DGRAM {
++		// A datagram socket connects at once, so it is connected before
++		// the poller registers it, as on the Unix ports: a registration
++		// need not survive the connect.
++		if err := syscall.Connect(s, rsa); err != nil {
++			fd.Close()
++			return nil, os.NewSyscallError("connect", err)
++		}
++		select {
++		case <-ctx.Done():
++			fd.Close()
++			return nil, mapErr(ctx.Err())
++		default:
++		}
++		if err := fd.init(); err != nil {
++			fd.Close()
++			return nil, err
++		}
++	} else {
++		if err := fd.init(); err != nil {
++			fd.Close()
++			return nil, err
++		}
++		if err := fd.wasixConnect(ctx, s, rsa); err != nil {
++			fd.Close()
++			return nil, err
++		}
++	}
++	fd.isConnected = true
++	local, remote := Addr(laddr), Addr(raddr)
++	if lsa, err := syscall.Getsockname(s); err == nil {
++		if a := wasixAddr(net, lsa); a != nil {
++			local = a
++		}
++	}
++	if psa, err := syscall.Getpeername(s); err == nil {
++		if a := wasixAddr(net, psa); a != nil {
++			remote = a
++		}
++	}
++	fd.setAddr(local, remote)
++	return fd, nil
++}
++
++// ctrlNetwork is the network a Control function is told, with the address
++// family made explicit as the Unix ports do.
++func (fd *netFD) ctrlNetwork() string {
++	switch fd.net[len(fd.net)-1] {
++	case '4', '6':
++		return fd.net
++	}
++	if fd.family == syscall.AF_INET {
++		return fd.net + "4"
++	}
++	return fd.net + "6"
++}
++
++// wasixConnect connects the non-blocking socket, waiting for the
++// connection to complete for as long as the context allows.
++func (fd *netFD) wasixConnect(ctx context.Context, s int, rsa syscall.Sockaddr) (ret error) {
++	if deadline, ok := ctx.Deadline(); ok {
++		fd.pfd.SetWriteDeadline(deadline)
++		defer fd.pfd.SetWriteDeadline(noDeadline)
++	}
++	if ctx.Done() != nil {
++		// A cancellation ends the wait below by expiring the write
++		// deadline, as the Unix ports do. A connect that completed just
++		// before is not returned either, since its deadline is expired
++		// all the same; the caller closes the socket on an error.
++		stop := context.AfterFunc(ctx, func() {
++			fd.pfd.SetWriteDeadline(aLongTimeAgo)
++		})
++		defer func() {
++			if !stop() && ret == nil {
++				ret = mapErr(ctx.Err())
++			}
++		}()
++	}
++	err := syscall.Connect(s, rsa)
++	for {
++		switch err {
++		case nil, syscall.EISCONN:
++			return nil
++		case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR, syscall.EAGAIN:
++		default:
++			return os.NewSyscallError("connect", err)
++		}
++		if err := fd.pfd.WaitWrite(); err != nil {
++			select {
++			case <-ctx.Done():
++				return mapErr(ctx.Err())
++			default:
++			}
++			return err
++		}
++		nerr, gerr := syscall.GetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_ERROR)
++		if gerr != nil {
++			return os.NewSyscallError("getsockopt", gerr)
++		}
++		err = syscall.Errno(nerr)
++		if nerr == 0 {
++			// The poller can report the socket writable before it is
++			// connected; a peer address says that it is, as on the
++			// Unix ports.
++			if _, perr := syscall.Getpeername(s); perr == nil {
++				return nil
++			}
++			err = syscall.EINPROGRESS
++		}
++	}
++}
++
++func wasixBoolint(b bool) int {
++	if b {
++		return 1
++	}
++	return 0
++}
++
++// The names the datagram and message calls report in errors.
++const (
++	readFromSyscallName = "sock_recv_from"
++	readMsgSyscallName  = "recvmsg"
++	writeToSyscallName  = "sock_send_to"
++	writeMsgSyscallName = "sendmsg"
++)
++
++// The datagram methods below shadow the fake network's, which netFD would
++// otherwise take from its embedded fakeNetFD, nil on a WASIX socket.
++
++func (fd *netFD) readFrom(p []byte) (n int, sa syscall.Sockaddr, err error) {
++	n, sa, err = fd.pfd.ReadFrom(p)
++	runtime.KeepAlive(fd)
++	return n, sa, wrapSyscallError(readFromSyscallName, err)
++}
++
++// The address-typed variants go through the generic calls: WASIX has one
++// receive and one send call, which answer every address family. A sender
++// of the socket's family is copied; an IPv4 sender to an IPv6 socket is
++// reported mapped, as the kernels report it; any other is an error, not
++// a zero address.
++
++func sockaddrInto4(sa syscall.Sockaddr, into *syscall.SockaddrInet4) error {
++	if sa, ok := sa.(*syscall.SockaddrInet4); ok {
++		*into = *sa
++		return nil
++	}
++	return wrapSyscallError(readFromSyscallName, syscall.EAFNOSUPPORT)
++}
++
++func sockaddrInto6(sa syscall.Sockaddr, into *syscall.SockaddrInet6) error {
++	switch sa := sa.(type) {
++	case *syscall.SockaddrInet6:
++		*into = *sa
++	case *syscall.SockaddrInet4:
++		*into = syscall.SockaddrInet6{Port: sa.Port, Addr: [16]byte{10: 0xff, 11: 0xff}}
++		copy(into.Addr[12:], sa.Addr[:])
++	default:
++		return wrapSyscallError(readFromSyscallName, syscall.EAFNOSUPPORT)
++	}
++	return nil
++}
++
++func (fd *netFD) readFromInet4(p []byte, from *syscall.SockaddrInet4) (int, error) {
++	n, sa, err := fd.readFrom(p)
++	if err == nil {
++		err = sockaddrInto4(sa, from)
++	}
++	return n, err
++}
++
++func (fd *netFD) readFromInet6(p []byte, from *syscall.SockaddrInet6) (int, error) {
++	n, sa, err := fd.readFrom(p)
++	if err == nil {
++		err = sockaddrInto6(sa, from)
++	}
++	return n, err
++}
++
++func (fd *netFD) readMsg(p []byte, oob []byte, flags int) (n, oobn, retflags int, sa syscall.Sockaddr, err error) {
++	n, oobn, retflags, sa, err = fd.pfd.ReadMsg(p, oob, flags)
++	runtime.KeepAlive(fd)
++	return n, oobn, retflags, sa, wrapSyscallError(readMsgSyscallName, err)
++}
++
++func (fd *netFD) readMsgInet4(p []byte, oob []byte, flags int, from *syscall.SockaddrInet4) (n, oobn, retflags int, err error) {
++	n, oobn, retflags, sa, err := fd.readMsg(p, oob, flags)
++	if err == nil {
++		err = sockaddrInto4(sa, from)
++	}
++	return n, oobn, retflags, err
++}
++
++func (fd *netFD) readMsgInet6(p []byte, oob []byte, flags int, from *syscall.SockaddrInet6) (n, oobn, retflags int, err error) {
++	n, oobn, retflags, sa, err := fd.readMsg(p, oob, flags)
++	if err == nil {
++		err = sockaddrInto6(sa, from)
++	}
++	return n, oobn, retflags, err
++}
++
++func (fd *netFD) writeTo(p []byte, sa syscall.Sockaddr) (n int, err error) {
++	n, err = fd.pfd.WriteTo(p, sa)
++	runtime.KeepAlive(fd)
++	return n, wrapSyscallError(writeToSyscallName, err)
++}
++
++func (fd *netFD) writeToInet4(p []byte, sa *syscall.SockaddrInet4) (int, error) {
++	return fd.writeTo(p, sa)
++}
++
++func (fd *netFD) writeToInet6(p []byte, sa *syscall.SockaddrInet6) (int, error) {
++	return fd.writeTo(p, sa)
++}
++
++func (fd *netFD) writeMsg(p []byte, oob []byte, sa syscall.Sockaddr) (n int, oobn int, err error) {
++	n, oobn, err = fd.pfd.WriteMsg(p, oob, sa)
++	runtime.KeepAlive(fd)
++	return n, oobn, wrapSyscallError(writeMsgSyscallName, err)
++}
++
++// A connected socket writes with a nil address, which must reach the
++// generic call as a nil Sockaddr rather than a nil pointer inside one.
++func (fd *netFD) writeMsgInet4(p []byte, oob []byte, sa *syscall.SockaddrInet4) (int, int, error) {
++	if sa == nil {
++		return fd.writeMsg(p, oob, nil)
++	}
++	return fd.writeMsg(p, oob, sa)
++}
++
++func (fd *netFD) writeMsgInet6(p []byte, oob []byte, sa *syscall.SockaddrInet6) (int, int, error) {
++	if sa == nil {
++		return fd.writeMsg(p, oob, nil)
++	}
++	return fd.writeMsg(p, oob, sa)
++}
++
++// dup fails: WASI preview 1 has no call that duplicates a descriptor, so a
++// File of a connection cannot be made.
++func (fd *netFD) dup() (*os.File, error) {
++	return nil, os.NewSyscallError("dup", syscall.ENOSYS)
++}
+diff --git a/src/net/sockopt_fake.go b/src/net/sockopt_fake.go
+index 9d9f7ea..efec0d8 100644
+--- a/src/net/sockopt_fake.go
++++ b/src/net/sockopt_fake.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build js || wasip1
++//go:build (js || wasip1) && !wasix
+ 
+ package net
+ 
+diff --git a/src/net/sockopt_wasix.go b/src/net/sockopt_wasix.go
+new file mode 100644
+index 0000000..68a4361
+--- /dev/null
++++ b/src/net/sockopt_wasix.go
+@@ -0,0 +1,48 @@
++//go:build wasip1 && wasix
++
++package net
++
++import (
++	"runtime"
++	"syscall"
++)
++
++func setDefaultSockopts(s, family, sotype int, ipv6only bool) error {
++	if family == syscall.AF_INET6 {
++		// Best effort, as on other ports.
++		syscall.SetsockoptInt(s, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, wasixBoolint(ipv6only))
++	}
++	if sotype == syscall.SOCK_DGRAM && family != syscall.AF_UNIX {
++		// Allow broadcast. Best effort: the runtime may refuse the option
++		// on a socket that is not yet bound.
++		syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1)
++	}
++	return nil
++}
++
++func setDefaultListenerSockopts(s int) error {
++	// Allow reuse of recently-used addresses.
++	return wrapSyscallError("setsockopt", syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1))
++}
++
++func setReadBuffer(fd *netFD, bytes int) error {
++	err := syscall.SetsockoptInt(fd.pfd.Sysfd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, bytes)
++	runtime.KeepAlive(fd)
++	return wrapSyscallError("setsockopt", err)
++}
++
++func setWriteBuffer(fd *netFD, bytes int) error {
++	err := syscall.SetsockoptInt(fd.pfd.Sysfd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, bytes)
++	runtime.KeepAlive(fd)
++	return wrapSyscallError("setsockopt", err)
++}
++
++func setKeepAlive(fd *netFD, keepalive bool) error {
++	err := syscall.SetsockoptInt(fd.pfd.Sysfd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, wasixBoolint(keepalive))
++	runtime.KeepAlive(fd)
++	return wrapSyscallError("setsockopt", err)
++}
++
++func setLinger(fd *netFD, sec int) error {
++	return syscall.ENOPROTOOPT
++}
+diff --git a/src/net/tcpsockopt_stub.go b/src/net/tcpsockopt_stub.go
+index b789e0a..4249755 100644
+--- a/src/net/tcpsockopt_stub.go
++++ b/src/net/tcpsockopt_stub.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build js || wasip1
++//go:build (js || wasip1) && !wasix
+ 
+ package net
+ 
+diff --git a/src/net/tcpsockopt_wasix.go b/src/net/tcpsockopt_wasix.go
+new file mode 100644
+index 0000000..8bd95ed
+--- /dev/null
++++ b/src/net/tcpsockopt_wasix.go
+@@ -0,0 +1,30 @@
++//go:build wasip1 && wasix
++
++package net
++
++import (
++	"runtime"
++	"syscall"
++	"time"
++)
++
++func setNoDelay(fd *netFD, noDelay bool) error {
++	err := syscall.SetsockoptInt(fd.pfd.Sysfd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, wasixBoolint(noDelay))
++	runtime.KeepAlive(fd)
++	return wrapSyscallError("setsockopt", err)
++}
++
++// The runtime has a keep-alive switch (setKeepAlive) but no idle time,
++// interval or count for it, so those keep the runtime's defaults.
++
++func setKeepAliveIdle(_ *netFD, _ time.Duration) error {
++	return nil
++}
++
++func setKeepAliveInterval(_ *netFD, _ time.Duration) error {
++	return nil
++}
++
++func setKeepAliveCount(_ *netFD, _ int) error {
++	return nil
++}

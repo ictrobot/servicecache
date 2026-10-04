@@ -1,0 +1,86 @@
+Subject: runtime: park a goroutine waiting on a note with no deadline on
+ wasip1
+Last-Update: 2026-10-04
+
+notetsleepg waited for a note by calling sched_yield and Gosched in a
+loop until the note was signalled or the deadline passed. The signal
+queue's receiver waits on its note with no deadline, so a program that
+calls signal.Notify kept its one thread yielding for the rest of its
+run, at a full core, though no signal is ever delivered on wasip1.
+
+A wait with no deadline now parks the goroutine with the note holding
+it, and notewakeup readies a parked goroutine before marking the note
+signalled. The thread then blocks in poll_oneoff like any idle
+program's. A wait with a deadline keeps the yield loop; nothing on
+wasip1 uses one.
+
+diff --git a/src/runtime/lock_wasip1.go b/src/runtime/lock_wasip1.go
+index 55153c3..f0c0885 100644
+--- a/src/runtime/lock_wasip1.go
++++ b/src/runtime/lock_wasip1.go
+@@ -6,10 +6,14 @@
+ 
+ package runtime
+ 
++import "unsafe"
++
+ // wasm has no support for threads yet. There is no preemption.
+ // See proposal: https://github.com/WebAssembly/threads
+ // Waiting for a mutex or timeout is implemented as a busy loop
+-// while allowing other goroutines to run.
++// while allowing other goroutines to run. A note wait with no deadline
++// parks the goroutine instead, since the one thread has nothing to spin
++// for: the wakeup can only come from another goroutine.
+ 
+ const (
+ 	mutex_unlocked = 0
+@@ -67,11 +71,16 @@ func noteclear(n *note) {
+ }
+ 
+ func notewakeup(n *note) {
+-	if n.key != 0 {
++	if n.key == 1 {
+ 		print("notewakeup - double wakeup (", n.key, ")\n")
+ 		throw("notewakeup - double wakeup")
+ 	}
++	// Any other value is the goroutine notetsleepg parked on the note.
++	parked := n.key
+ 	n.key = 1
++	if parked != 0 {
++		goready((*g)(unsafe.Pointer(parked)), 0)
++	}
+ }
+ 
+ func notesleep(n *note) {
+@@ -90,16 +99,29 @@ func notetsleepg(n *note, ns int64) bool {
+ 		throw("notetsleepg on g0")
+ 	}
+ 
++	if n.key == 1 {
++		return true
++	}
++	if ns < 0 {
++		// No deadline: park until notewakeup readies this goroutine. A
++		// yield loop here would keep the thread busy for as long as the
++		// note stays unsignalled, which for the signal queue's note on
++		// this port, where no signal ever arrives, is the whole run.
++		n.key = uintptr(unsafe.Pointer(gp))
++		gopark(nil, nil, waitReasonSleep, traceBlockGeneric, 1)
++		return true
++	}
++
+ 	deadline := nanotime() + ns
+ 	for {
+-		if n.key != 0 {
++		if n.key == 1 {
+ 			return true
+ 		}
+ 		if sched_yield() != 0 {
+ 			throw("sched_yield failed")
+ 		}
+ 		Gosched()
+-		if ns >= 0 && nanotime() >= deadline {
++		if nanotime() >= deadline {
+ 			return false
+ 		}
+ 	}

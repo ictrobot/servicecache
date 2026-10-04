@@ -55,5 +55,7 @@ in
     ) scope.libraries
     // {
       smoke-toolchain = sc.toolchain.smoke;
+      go-toolchain = sc.goToolchain.go;
+      go-toolchain-tests = sc.goToolchain.tests;
     };
 }

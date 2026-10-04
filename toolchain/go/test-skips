@@ -1,0 +1,38 @@
+# Tests test.sh leaves out of the wasip1 packages: a package, then a pattern
+# for go test's -skip. A subtest pattern (/name) goes last in its package:
+# -skip takes the first alternative that matches a test's name, and that one
+# matches every test without skipping it.
+
+# The series has no linger option.
+net ^TestNotTemporaryRead$
+
+# WASIX has no Unix-domain sockets.
+net ^TestUnix
+net ^TestListenConfigControl$
+net ^TestPacketConn$
+net ^TestConnAndPacketConn$
+net /^unix
+
+# Expects a goroutine in a note sleep to be runnable, as in upstream's yield
+# loop; the series parks it, so the test waits forever.
+runtime ^TestProfBufWakeup$
+
+# Wasmer's mapped filesystem differs, with unpatched Go too: file times, a
+# long link's target, /dev/null's mode, a NUL in a path, links in a copied
+# tree.
+os ^TestChtimes
+os ^TestRootChtimes$
+os ^TestLongSymlink$
+os ^TestDevNullFile$
+os ^TestErrPathNUL$
+os ^TestCopyFS$
+os ^TestCopyFSWithSymlinks$
+
+# Wasmer does not open a read-only file through a directory handle, and the
+# toolchain's files are read-only.
+os ^TestRootDirFS$
+
+# Wasmer makes a hard link only in its directory cache, so the file outlives
+# its original name and the directory cannot be removed, with unpatched Go
+# too.
+os ^TestRootLinkFrom$

@@ -1,0 +1,41 @@
+Go guests are built with the Go release pinned in ../sources/go/default.nix
+and the patch series beside it, which gives Go's wasip1 port sockets and
+name resolution over WASIX behind the wasix build tag. default.nix and
+go.sh build that tree with Go's own make.bash, bootstrapped by nixpkgs' Go,
+into a Go installation.
+
+A program built with it is a wasip1 module that listens on the port it asks
+for, dials out where the runtime's policy allows, and resolves names. Its
+goroutines run on one thread, which blocks in poll_oneoff when idle, as a
+freeze needs it to.
+
+A Go service's package passes `toolchain = sc.goToolchain` to
+sc.mkGuestBuild and declares two sources: its upstream tree, and the
+modules that tree's go.mod names, vendored by sc.fetchGoModules. Its
+build.sh copies the modules to vendor/ inside the tree and runs the go
+command through sc_go, which keeps the build cache inside the build
+directory. The toolchain's environment sets GOOS, GOARCH, the wasix tag and
+vendor mode, and turns fetching off, so an untouched tree builds with
+
+    sc_go -C "$tree" build -o "$SC_BUILD_DIR/server.wasm" ./cmd/server
+
+Nix caches the built toolchain; each service build compiles the standard
+library for wasip1 into its own cache.
+
+`./x go` links the installation at work/build/go-toolchain, for building a
+tree by hand. Its servicecache.env holds the environment a service build
+sets; a tree that fetches its modules needs only the target and the tag:
+
+    export PATH="$PWD/work/build/go-toolchain/bin:$PATH"
+    GOOS=wasip1 GOARCH=wasm go build -tags wasix -o server.wasm ./cmd/server
+    toolchain/run-wasix.sh server.wasm
+
+`./x go --test` runs Go's own tests of the packages the series changes,
+through test.sh: the wasip1 packages as guests of the Wasmer CLI built from
+source, and the compiler, assembler and linker packages natively. The
+source guests are built from leaves Go's test files out, so the tests run
+with the same toolchain built from the release with its tests. test-skips
+lists the tests left out, each with its reason.
+
+The series is developed on the wasix branch of a Go checkout, work/go by
+default, and written back with export-patches.sh.

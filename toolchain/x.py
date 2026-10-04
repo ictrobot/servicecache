@@ -337,6 +337,19 @@ def plan_wasmer(args: argparse.Namespace) -> list[Action]:
     return [build_wasmer(variants)]
 
 
+def plan_go(args: argparse.Namespace) -> list[Action]:
+    if args.test:
+        # Go's own tests of what the patch series changes, with the toolchain
+        # built from the release with its tests and the Wasmer CLI the guest
+        # tests run under.
+        return [
+            Build((("go-toolchain-tests", "work/build/go-toolchain-tests"),)),
+            build_wasmer(["fixes"]),
+            cmd("toolchain/go/test.sh"),
+        ]
+    return [Build((("go-toolchain", "work/build/go-toolchain"),))]
+
+
 def plan_setup_wasmer(args: argparse.Namespace) -> list[Step]:
     if args.dev:
         return [cmd("wasmer/setup-dev.sh", *absolute(args.checkout))]
@@ -544,6 +557,13 @@ COMMANDS = (
                 " (CHECKOUT, or work/wasmer-dev)",
             ),
         ),
+    ),
+    Command(
+        "go",
+        "build the Go toolchain into work/build/go-toolchain",
+        plan_go,
+        None,
+        (Option(("--test",), "run Go's own tests of the packages its series changes instead"),),
     ),
     Command(
         "test",

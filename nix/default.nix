@@ -9,6 +9,7 @@ let
     mkSource = import ./mk-source.nix { inherit pkgs lib; };
     fetchSelectedGit = import ./fetch-selected-git.nix { inherit pkgs lib; };
     fetchSelectedArchive = import ./fetch-selected-archive.nix { inherit pkgs lib; };
+    fetchGoModules = import ./fetch-go-modules.nix { inherit pkgs lib; };
     patchSeries = import ./patch-series.nix { inherit lib; };
     collectMetadata = import ./collect-metadata.nix { inherit lib; };
     mkServiceSource = import ./mk-service-source.nix { inherit pkgs lib; };
@@ -17,10 +18,14 @@ let
     inherit pkgs;
     sc = base;
   };
+  goToolchain = import ../toolchain/go {
+    inherit pkgs;
+    sc = base;
+  };
 in
 base
 // {
-  inherit toolchain;
+  inherit toolchain goToolchain;
   mkGuestBuild = import ./mk-guest-build.nix {
     inherit
       pkgs

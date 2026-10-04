@@ -1,0 +1,563 @@
+Subject: syscall: add sockets over WASIX on wasip1 behind the wasix build tag
+Last-Update: 2026-10-04
+
+WASI preview 1 has no socket calls beyond accepting on, reading, writing
+and shutting down an inherited socket. WASIX, the extension a WASIX
+runtime provides in the wasix_32v1 import namespace beside
+wasi_snapshot_preview1, has the rest: sock_open, sock_bind, sock_listen,
+an accept that reports the peer, sock_connect, the local and peer
+addresses, options, and datagram send and receive.
+
+With the wasix build tag Socket, Bind, Listen, Accept, Connect,
+Getsockname, Getpeername, SetsockoptInt, GetsockoptInt, Recvfrom and
+Sendto are implemented over those calls; without it the ENOSYS stubs
+remain, now in a file of their own. Addresses are converted to WASIX's
+addr_port layout; families, protocols and options to its numbering. A
+non-blocking Connect reports EINPROGRESS until the socket becomes
+writable, when GetsockoptInt with SO_ERROR answers from the runtime's
+LastError option. A Sendto with no address sends to a connected socket's
+peer. A runtime may report a port with its bytes swapped from the order
+it was given in, so, as wasix-libc does, the package binds a throwaway
+socket to a known port once to learn whether ports read back swapped.
+The option names take Linux's numbers, and so do the two the fake
+network defines, on every wasip1 build, so that none collide.
+
+diff --git a/src/syscall/net_fake.go b/src/syscall/net_fake.go
+index 549f2be..0a82381 100644
+--- a/src/syscall/net_fake.go
++++ b/src/syscall/net_fake.go
+@@ -34,10 +34,11 @@ const (
+ 	SOMAXCONN = 0x80
+ )
+ 
++// Linux's numbers, so that they do not collide with the options the
++// wasix build tag adds.
+ const (
+-	_ = iota
+-	IPV6_V6ONLY
+-	SO_ERROR
++	IPV6_V6ONLY = 0x1a
++	SO_ERROR    = 0x4
+ )
+ 
+ // Misc constants expected by package net but not supported.
+diff --git a/src/syscall/net_wasip1.go b/src/syscall/net_wasip1.go
+index fefd939..f07eac2 100644
+--- a/src/syscall/net_wasip1.go
++++ b/src/syscall/net_wasip1.go
+@@ -14,64 +14,14 @@ const (
+ 
+ type sdflags = uint32
+ 
+-//go:wasmimport wasi_snapshot_preview1 sock_accept
+-//go:noescape
+-func sock_accept(fd int32, flags fdflags, newfd *int32) Errno
+-
+ //go:wasmimport wasi_snapshot_preview1 sock_shutdown
+ //go:noescape
+ func sock_shutdown(fd int32, flags sdflags) Errno
+ 
+-func Socket(proto, sotype, unused int) (fd int, err error) {
+-	return 0, ENOSYS
+-}
+-
+-func Bind(fd int, sa Sockaddr) error {
+-	return ENOSYS
+-}
+-
+ func StopIO(fd int) error {
+ 	return ENOSYS
+ }
+ 
+-func Listen(fd int, backlog int) error {
+-	return ENOSYS
+-}
+-
+-func Accept(fd int) (int, Sockaddr, error) {
+-	var newfd int32
+-	errno := sock_accept(int32(fd), 0, &newfd)
+-	return int(newfd), nil, errnoErr(errno)
+-}
+-
+-func Connect(fd int, sa Sockaddr) error {
+-	return ENOSYS
+-}
+-
+-func Recvfrom(fd int, p []byte, flags int) (n int, from Sockaddr, err error) {
+-	return 0, nil, ENOSYS
+-}
+-
+-func Sendto(fd int, p []byte, flags int, to Sockaddr) error {
+-	return ENOSYS
+-}
+-
+-func Recvmsg(fd int, p, oob []byte, flags int) (n, oobn, recvflags int, from Sockaddr, err error) {
+-	return 0, 0, 0, nil, ENOSYS
+-}
+-
+-func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error) {
+-	return 0, ENOSYS
+-}
+-
+-func GetsockoptInt(fd, level, opt int) (value int, err error) {
+-	return 0, ENOSYS
+-}
+-
+-func SetsockoptInt(fd, level, opt int, value int) error {
+-	return ENOSYS
+-}
+-
+ func SetReadDeadline(fd int, t int64) error {
+ 	return ENOSYS
+ }
+diff --git a/src/syscall/net_wasip1_stub.go b/src/syscall/net_wasip1_stub.go
+new file mode 100644
+index 0000000..3ac88e3
+--- /dev/null
++++ b/src/syscall/net_wasip1_stub.go
+@@ -0,0 +1,61 @@
++// Copyright 2023 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build wasip1 && !wasix
++
++package syscall
++
++// WASI preview 1 has no socket calls beyond accepting on, reading,
++// writing and shutting down an inherited socket; net_wasix.go provides
++// the rest over the WASIX extension when it is selected.
++
++//go:wasmimport wasi_snapshot_preview1 sock_accept
++//go:noescape
++func sock_accept(fd int32, flags fdflags, newfd *int32) Errno
++
++func Socket(proto, sotype, unused int) (fd int, err error) {
++	return 0, ENOSYS
++}
++
++func Bind(fd int, sa Sockaddr) error {
++	return ENOSYS
++}
++
++func Listen(fd int, backlog int) error {
++	return ENOSYS
++}
++
++func Accept(fd int) (int, Sockaddr, error) {
++	var newfd int32
++	errno := sock_accept(int32(fd), 0, &newfd)
++	return int(newfd), nil, errnoErr(errno)
++}
++
++func Connect(fd int, sa Sockaddr) error {
++	return ENOSYS
++}
++
++func Recvfrom(fd int, p []byte, flags int) (n int, from Sockaddr, err error) {
++	return 0, nil, ENOSYS
++}
++
++func Sendto(fd int, p []byte, flags int, to Sockaddr) error {
++	return ENOSYS
++}
++
++func Recvmsg(fd int, p, oob []byte, flags int) (n, oobn, recvflags int, from Sockaddr, err error) {
++	return 0, 0, 0, nil, ENOSYS
++}
++
++func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error) {
++	return 0, ENOSYS
++}
++
++func GetsockoptInt(fd, level, opt int) (value int, err error) {
++	return 0, ENOSYS
++}
++
++func SetsockoptInt(fd, level, opt int, value int) error {
++	return ENOSYS
++}
+diff --git a/src/syscall/net_wasix.go b/src/syscall/net_wasix.go
+new file mode 100644
+index 0000000..562df0b
+--- /dev/null
++++ b/src/syscall/net_wasix.go
+@@ -0,0 +1,378 @@
++//go:build wasip1 && wasix
++
++package syscall
++
++import (
++	"sync"
++	"unsafe"
++)
++
++// Sockets over the WASIX extension of WASI preview 1: the wasix_32v1
++// import namespace, which a WASIX runtime provides beside
++// wasi_snapshot_preview1. The calls take addresses in WASIX's addr_port
++// layout and name families, types, protocols and options by WASIX's
++// own numbering; the conversions from the values the rest of this package
++// uses are below.
++
++//go:wasmimport wasix_32v1 sock_open
++//go:noescape
++func sock_open(af int32, socktype int32, proto int32, fd unsafe.Pointer) Errno
++
++//go:wasmimport wasix_32v1 sock_bind
++//go:noescape
++func sock_bind(fd int32, addr unsafe.Pointer) Errno
++
++//go:wasmimport wasix_32v1 sock_listen
++func sock_listen(fd int32, backlog int32) Errno
++
++// The wasix_32v1 sock_accept also returns the peer's address.
++//
++//go:wasmimport wasix_32v1 sock_accept
++//go:noescape
++func sock_accept_addr(fd int32, flags fdflags, newfd unsafe.Pointer, addr unsafe.Pointer) Errno
++
++//go:wasmimport wasix_32v1 sock_connect
++//go:noescape
++func sock_connect(fd int32, addr unsafe.Pointer) Errno
++
++//go:wasmimport wasix_32v1 sock_addr_local
++//go:noescape
++func sock_addr_local(fd int32, addr unsafe.Pointer) Errno
++
++//go:wasmimport wasix_32v1 sock_addr_peer
++//go:noescape
++func sock_addr_peer(fd int32, addr unsafe.Pointer) Errno
++
++//go:wasmimport wasix_32v1 sock_set_opt_flag
++func sock_set_opt_flag(fd int32, opt int32, flag int32) Errno
++
++//go:wasmimport wasix_32v1 sock_get_opt_flag
++//go:noescape
++func sock_get_opt_flag(fd int32, opt int32, flag unsafe.Pointer) Errno
++
++//go:wasmimport wasix_32v1 sock_set_opt_size
++func sock_set_opt_size(fd int32, opt int32, size int64) Errno
++
++//go:wasmimport wasix_32v1 sock_get_opt_size
++//go:noescape
++func sock_get_opt_size(fd int32, opt int32, size unsafe.Pointer) Errno
++
++//go:wasmimport wasix_32v1 sock_recv_from
++//go:noescape
++func sock_recv_from(fd int32, iovs unsafe.Pointer, iovsLen size, riFlags int32, nread unsafe.Pointer, roFlags unsafe.Pointer, addr unsafe.Pointer) Errno
++
++//go:wasmimport wasix_32v1 sock_send_to
++//go:noescape
++func sock_send_to(fd int32, iovs unsafe.Pointer, iovsLen size, siFlags int32, addr unsafe.Pointer, nwritten unsafe.Pointer) Errno
++
++// Socket option levels and names, for SetsockoptInt and GetsockoptInt:
++// Linux's numbers, as the fake network's are.
++const (
++	SOL_SOCKET   = 1
++	SO_REUSEADDR = 2
++	SO_BROADCAST = 6
++	SO_SNDBUF    = 7
++	SO_RCVBUF    = 8
++	SO_KEEPALIVE = 9
++	TCP_NODELAY  = 1
++)
++
++// WASIX's numbering.
++const (
++	wasixAddressFamilyInet4 = 1
++	wasixAddressFamilyInet6 = 2
++	wasixAddressFamilyUnix  = 3
++
++	wasixSockProtoTCP = 6
++	wasixSockProtoUDP = 17
++
++	wasixSockoptReuseAddr   = 2
++	wasixSockoptNoDelay     = 3
++	wasixSockoptOnlyV6      = 5
++	wasixSockoptBroadcast   = 6
++	wasixSockoptLastError   = 11
++	wasixSockoptKeepAlive   = 12
++	wasixSockoptRecvBufSize = 15
++	wasixSockoptSendBufSize = 16
++)
++
++// wasixAddrPort is WASIX's addr_port: the family tag, a padding byte the
++// runtime requires to be zero, the port in host order and the address
++// octets, 4 of them for IPv4 and 16 for IPv6.
++type wasixAddrPort struct {
++	tag     uint8
++	padding uint8
++	port    uint16
++	octets  [16]uint8
++}
++
++func wasixFamily(domain int) (int32, error) {
++	switch domain {
++	case AF_INET:
++		return wasixAddressFamilyInet4, nil
++	case AF_INET6:
++		return wasixAddressFamilyInet6, nil
++	case AF_UNIX:
++		return wasixAddressFamilyUnix, nil
++	}
++	return 0, EAFNOSUPPORT
++}
++
++// wasixProto is the protocol sock_open takes, which the socket type
++// implies: the net package passes 0, and Socket admits only streams and
++// datagrams.
++func wasixProto(sotype int) int32 {
++	if sotype == SOCK_DGRAM {
++		return wasixSockProtoUDP
++	}
++	return wasixSockProtoTCP
++}
++
++// wasixSockaddr encodes a Sockaddr for the runtime. Unix sockets use a
++// different layout the runtime does not expose through addr_port.
++func wasixSockaddr(sa Sockaddr) (wasixAddrPort, error) {
++	var addr wasixAddrPort
++	switch sa := sa.(type) {
++	case *SockaddrInet4:
++		if sa.Port < 0 || sa.Port > 0xFFFF {
++			return addr, EINVAL
++		}
++		addr.tag = wasixAddressFamilyInet4
++		addr.port = uint16(sa.Port)
++		copy(addr.octets[:], sa.Addr[:])
++	case *SockaddrInet6:
++		if sa.Port < 0 || sa.Port > 0xFFFF {
++			return addr, EINVAL
++		}
++		addr.tag = wasixAddressFamilyInet6
++		addr.port = uint16(sa.Port)
++		copy(addr.octets[:], sa.Addr[:])
++	case nil:
++		return addr, EINVAL
++	default:
++		return addr, EAFNOSUPPORT
++	}
++	return addr, nil
++}
++
++// The byte order of a port the runtime writes back. A runtime may report
++// a port with its bytes swapped from the order it was given in; wasix-libc
++// settles the question once by binding a socket to a known port and
++// reading it back, and so does this package.
++var (
++	portProbe        sync.Once
++	portReadsSwapped bool
++)
++
++func portFromRuntime(port uint16) uint16 {
++	portProbe.Do(func() {
++		portReadsSwapped = probePortByteOrder()
++	})
++	if portReadsSwapped {
++		return port>>8 | port<<8
++	}
++	return port
++}
++
++// probePortByteOrder binds a throwaway socket to a known port and reports
++// whether the runtime reads it back byte-swapped. When no port can be
++// bound the answer is that it does, as wasix-libc assumes.
++func probePortByteOrder() bool {
++	var fd int32
++	if sock_open(wasixAddressFamilyInet4, SOCK_STREAM, wasixSockProtoTCP, unsafe.Pointer(&fd)) != 0 {
++		return true
++	}
++	defer Close(int(fd))
++	for port := uint16(9000); port < 9020; port++ {
++		addr := wasixAddrPort{tag: wasixAddressFamilyInet4, port: port, octets: [16]uint8{127, 0, 0, 1}}
++		if sock_bind(fd, unsafe.Pointer(&addr)) != 0 {
++			continue
++		}
++		var local wasixAddrPort
++		if sock_addr_local(fd, unsafe.Pointer(&local)) != 0 {
++			return true
++		}
++		return local.port != port
++	}
++	return true
++}
++
++// sockaddr decodes an address the runtime wrote; nil for a family this
++// package has no type for.
++func (addr *wasixAddrPort) sockaddr() Sockaddr {
++	switch addr.tag {
++	case wasixAddressFamilyInet4:
++		sa := &SockaddrInet4{Port: int(portFromRuntime(addr.port))}
++		copy(sa.Addr[:], addr.octets[:4])
++		return sa
++	case wasixAddressFamilyInet6:
++		sa := &SockaddrInet6{Port: int(portFromRuntime(addr.port))}
++		copy(sa.Addr[:], addr.octets[:])
++		return sa
++	}
++	return nil
++}
++
++func Socket(domain, sotype, proto int) (int, error) {
++	family, err := wasixFamily(domain)
++	if err != nil {
++		return -1, err
++	}
++	switch sotype {
++	case SOCK_STREAM, SOCK_DGRAM:
++	default:
++		return -1, EPROTOTYPE
++	}
++	var fd int32
++	if errno := sock_open(family, int32(sotype), wasixProto(sotype), unsafe.Pointer(&fd)); errno != 0 {
++		return -1, errnoErr(errno)
++	}
++	return int(fd), nil
++}
++
++func Bind(fd int, sa Sockaddr) error {
++	addr, err := wasixSockaddr(sa)
++	if err != nil {
++		return err
++	}
++	return errnoErr(sock_bind(int32(fd), unsafe.Pointer(&addr)))
++}
++
++func Listen(fd int, backlog int) error {
++	return errnoErr(sock_listen(int32(fd), int32(backlog)))
++}
++
++func Accept(fd int) (int, Sockaddr, error) {
++	var newfd int32
++	var addr wasixAddrPort
++	if errno := sock_accept_addr(int32(fd), 0, unsafe.Pointer(&newfd), unsafe.Pointer(&addr)); errno != 0 {
++		return -1, nil, errnoErr(errno)
++	}
++	return int(newfd), addr.sockaddr(), nil
++}
++
++// Connect starts a connection. On a non-blocking socket it reports
++// EINPROGRESS until the connection completes, when the socket becomes
++// writable and GetsockoptInt(fd, SOL_SOCKET, SO_ERROR) tells the outcome.
++func Connect(fd int, sa Sockaddr) error {
++	addr, err := wasixSockaddr(sa)
++	if err != nil {
++		return err
++	}
++	return errnoErr(sock_connect(int32(fd), unsafe.Pointer(&addr)))
++}
++
++func Getsockname(fd int) (Sockaddr, error) {
++	var addr wasixAddrPort
++	if errno := sock_addr_local(int32(fd), unsafe.Pointer(&addr)); errno != 0 {
++		return nil, errnoErr(errno)
++	}
++	return addr.sockaddr(), nil
++}
++
++func Getpeername(fd int) (Sockaddr, error) {
++	var addr wasixAddrPort
++	if errno := sock_addr_peer(int32(fd), unsafe.Pointer(&addr)); errno != 0 {
++		return nil, errnoErr(errno)
++	}
++	return addr.sockaddr(), nil
++}
++
++// wasixSockopt maps a level and option to the runtime's option, and
++// whether it is a flag rather than a size.
++func wasixSockopt(level, opt int) (option int32, flag bool, err error) {
++	switch {
++	case level == SOL_SOCKET && opt == SO_REUSEADDR:
++		return wasixSockoptReuseAddr, true, nil
++	case level == SOL_SOCKET && opt == SO_KEEPALIVE:
++		return wasixSockoptKeepAlive, true, nil
++	case level == SOL_SOCKET && opt == SO_BROADCAST:
++		return wasixSockoptBroadcast, true, nil
++	case level == SOL_SOCKET && opt == SO_RCVBUF:
++		return wasixSockoptRecvBufSize, false, nil
++	case level == SOL_SOCKET && opt == SO_SNDBUF:
++		return wasixSockoptSendBufSize, false, nil
++	case level == SOL_SOCKET && opt == SO_ERROR:
++		return wasixSockoptLastError, false, nil
++	case level == IPPROTO_TCP && opt == TCP_NODELAY:
++		return wasixSockoptNoDelay, true, nil
++	case level == IPPROTO_IPV6 && opt == IPV6_V6ONLY:
++		return wasixSockoptOnlyV6, true, nil
++	}
++	return 0, false, ENOPROTOOPT
++}
++
++func SetsockoptInt(fd, level, opt int, value int) error {
++	option, flag, err := wasixSockopt(level, opt)
++	if err != nil {
++		return err
++	}
++	if flag {
++		var on int32
++		if value != 0 {
++			on = 1
++		}
++		return errnoErr(sock_set_opt_flag(int32(fd), option, on))
++	}
++	return errnoErr(sock_set_opt_size(int32(fd), option, int64(value)))
++}
++
++// GetsockoptInt with SO_ERROR answers the socket's pending error, as the
++// runtime reports it through its LastError option: 0 once a connection
++// is open or while it is still being made.
++func GetsockoptInt(fd, level, opt int) (int, error) {
++	option, flag, err := wasixSockopt(level, opt)
++	if err != nil {
++		return 0, err
++	}
++	if flag {
++		var on uint8
++		if errno := sock_get_opt_flag(int32(fd), option, unsafe.Pointer(&on)); errno != 0 {
++			return 0, errnoErr(errno)
++		}
++		return int(on), nil
++	}
++	var value uint64
++	if errno := sock_get_opt_size(int32(fd), option, unsafe.Pointer(&value)); errno != 0 {
++		return 0, errnoErr(errno)
++	}
++	return int(value), nil
++}
++
++func Recvfrom(fd int, p []byte, flags int) (n int, from Sockaddr, err error) {
++	var nread size
++	var roFlags uint16
++	var addr wasixAddrPort
++	errno := sock_recv_from(int32(fd), unsafe.Pointer(makeIOVec(p)), 1, int32(flags), unsafe.Pointer(&nread), unsafe.Pointer(&roFlags), unsafe.Pointer(&addr))
++	if errno != 0 {
++		return 0, nil, errnoErr(errno)
++	}
++	return int(nread), addr.sockaddr(), nil
++}
++
++// Sendto sends p to the address, or to the peer of a connected socket when
++// to is nil.
++func Sendto(fd int, p []byte, flags int, to Sockaddr) error {
++	if to == nil {
++		_, err := Write(fd, p)
++		return err
++	}
++	addr, err := wasixSockaddr(to)
++	if err != nil {
++		return err
++	}
++	var nwritten size
++	return errnoErr(sock_send_to(int32(fd), unsafe.Pointer(makeIOVec(p)), 1, int32(flags), unsafe.Pointer(&addr), unsafe.Pointer(&nwritten)))
++}
++
++func Recvmsg(fd int, p, oob []byte, flags int) (n, oobn, recvflags int, from Sockaddr, err error) {
++	n, from, err = Recvfrom(fd, p, flags)
++	return n, 0, 0, from, err
++}
++
++func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error) {
++	if err := Sendto(fd, p, flags, to); err != nil {
++		return 0, err
++	}
++	return len(p), nil
++}

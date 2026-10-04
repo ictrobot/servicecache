@@ -110,6 +110,7 @@ This repository distributes patches and build scripts, not built binaries. A gue
 
 ServiceCache is an independent project. It is not affiliated with, sponsored by, or endorsed by the trademark owners noted below, or by the maintainers of the software it builds and depends on.
 
+- Go and the Go logo are trademarks of Google.
 - MariaDB is a registered trademark of MariaDB plc.
 - Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its affiliates.
 - Postgres, PostgreSQL and the Slonik Logo are trademarks or registered trademarks of the PostgreSQL Community Association of Canada.

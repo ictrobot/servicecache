@@ -1,0 +1,155 @@
+Subject: net: resolve names through the WASIX runtime with the wasix build tag
+Last-Update: 2026-10-04
+
+The cgo resolver's entry points are implemented over WASIX's resolve
+call, which answers from the runtime's resolver, so a program needs
+neither /etc/resolv.conf nor a UDP socket to look up a name. wasip1
+prefers it whenever it is available, as Windows and Android prefer
+theirs. The runtime resolves names to addresses only: a port lookup
+reports the port unknown, as a resolver reports one it does not find,
+and the package reads its own table; a canonical-name lookup reports
+that the runtime does not offer it and the package asks DNS; and a
+reverse lookup fails.
+
+diff --git a/src/net/cgo_stub.go b/src/net/cgo_stub.go
+index 640f5a4..4ef2717 100644
+--- a/src/net/cgo_stub.go
++++ b/src/net/cgo_stub.go
+@@ -9,7 +9,7 @@
+ //   (Darwin always provides the cgo functions, in cgo_unix_syscall.go)
+ // - on wasip1, where cgo is never available
+ 
+-//go:build (netgo && unix) || (unix && !cgo && !darwin) || js || wasip1
++//go:build (netgo && unix) || (unix && !cgo && !darwin) || js || (wasip1 && !wasix)
+ 
+ package net
+ 
+diff --git a/src/net/cgo_wasix.go b/src/net/cgo_wasix.go
+new file mode 100644
+index 0000000..8059740
+--- /dev/null
++++ b/src/net/cgo_wasix.go
+@@ -0,0 +1,106 @@
++//go:build wasip1 && wasix
++
++package net
++
++import (
++	"context"
++	"syscall"
++	"unsafe"
++)
++
++// Name resolution through the WASIX runtime's resolve call, which takes
++// the place of the C library's getaddrinfo on this port: the runtime
++// answers from the system's resolver, so a program needs neither
++// /etc/resolv.conf nor a UDP socket to look up a name.
++
++const cgoAvailable = true
++
++//go:wasmimport wasix_32v1 resolve
++//go:noescape
++func wasix_resolve(host unsafe.Pointer, hostLen uint32, port int32, addrs unsafe.Pointer, naddrs uint32, ret unsafe.Pointer) syscall.Errno
++
++// wasixAddrOf is WASIX's addr: the family tag, a padding byte and the
++// address octets.
++type wasixAddrOf struct {
++	tag     uint8
++	padding uint8
++	octets  [16]uint8
++}
++
++func wasixLookupIP(name string) ([]IPAddr, error) {
++	if name == "" {
++		return nil, &DNSError{Err: errNoSuchHost.Error(), Name: name, IsNotFound: true}
++	}
++	var addrs [32]wasixAddrOf
++	var n uint32
++	host := []byte(name)
++	errno := wasix_resolve(unsafe.Pointer(&host[0]), uint32(len(host)), 0, unsafe.Pointer(&addrs[0]), uint32(len(addrs)), unsafe.Pointer(&n))
++	if errno != 0 {
++		return nil, &DNSError{Err: errno.Error(), Name: name, IsNotFound: errno == syscall.ENOENT}
++	}
++	var ips []IPAddr
++	for _, addr := range addrs[:n] {
++		switch addr.tag {
++		case 1:
++			ips = append(ips, IPAddr{IP: IPv4(addr.octets[0], addr.octets[1], addr.octets[2], addr.octets[3])})
++		case 2:
++			ip := make(IP, IPv6len)
++			copy(ip, addr.octets[:])
++			ips = append(ips, IPAddr{IP: ip})
++		}
++	}
++	if len(ips) == 0 {
++		return nil, &DNSError{Err: errNoSuchHost.Error(), Name: name, IsNotFound: true}
++	}
++	return ips, nil
++}
++
++func cgoLookupHost(ctx context.Context, name string) (addrs []string, err error) {
++	ips, err := wasixLookupIP(name)
++	if err != nil {
++		return nil, err
++	}
++	for _, ip := range ips {
++		addrs = append(addrs, ip.String())
++	}
++	return addrs, nil
++}
++
++func cgoLookupPort(ctx context.Context, network, service string) (port int, err error) {
++	// The runtime has no services database; the caller falls back to the
++	// package's own table.
++	return 0, newDNSError(errUnknownPort, network+"/"+service, "")
++}
++
++func cgoLookupIP(ctx context.Context, network, name string) (addrs []IPAddr, err error) {
++	ips, err := wasixLookupIP(name)
++	if err != nil {
++		return nil, err
++	}
++	for _, ip := range ips {
++		switch network {
++		case "ip4":
++			if ip.IP.To4() == nil {
++				continue
++			}
++		case "ip6":
++			if ip.IP.To4() != nil {
++				continue
++			}
++		}
++		addrs = append(addrs, ip)
++	}
++	if len(addrs) == 0 {
++		return nil, &DNSError{Err: errNoSuchHost.Error(), Name: name, IsNotFound: true}
++	}
++	return addrs, nil
++}
++
++func cgoLookupCNAME(ctx context.Context, name string) (cname string, err error) {
++	// The runtime resolves names to addresses only.
++	return "", &DNSError{Err: "canonical name lookup is not available", Name: name}
++}
++
++func cgoLookupPTR(ctx context.Context, addr string) (ptrs []string, err error) {
++	return nil, &DNSError{Err: "reverse lookup is not available", Name: addr}
++}
+diff --git a/src/net/conf.go b/src/net/conf.go
+index 92c5618..faacb85 100644
+--- a/src/net/conf.go
++++ b/src/net/conf.go
+@@ -185,6 +185,12 @@ func goosPrefersCgo() bool {
+ 	case "android":
+ 		return true
+ 
++	// On wasip1 the cgo resolver is available only with the wasix build
++	// tag, where it is the runtime's own resolver, and the program has
++	// no resolv.conf of its own.
++	case "wasip1":
++		return true
++
+ 	default:
+ 		return false
+ 	}

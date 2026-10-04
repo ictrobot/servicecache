@@ -3,12 +3,13 @@
   lib,
   toolchain,
   buildMetadata,
-}:
+}@context:
 {
   name,
   version,
   script,
   sources,
+  toolchain ? context.toolchain,
   libraries ? { },
   extensions ? { },
   manifest ? null,

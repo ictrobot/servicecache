@@ -49,6 +49,7 @@ sc_store_path() {
 # A step can add a setting explicitly with sc_guest env NAME=value command.
 SC_GUEST_ENVIRONMENT=(
   TMPDIR TERM JOBS SOURCE_DATE_EPOCH GIT_CEILING_DIRECTORIES 'SC_*' 'CCACHE_*'
+  'GO*' CGO_ENABLED
 )
 
 sc_guest() {
@@ -63,6 +64,14 @@ sc_guest() {
     done
   done < <(env -0)
   "${step[@]}" "$@"
+}
+
+# sc_go arguments: the go command of the Go toolchain, with its caches and
+# home inside the build directory and the toolchain's environment: GOOS,
+# GOARCH, the build tags, vendor mode and fetching off.
+sc_go() {
+  mkdir -p "$SC_BUILD_DIR/go-cache" "$SC_BUILD_DIR/home"
+  sc_guest env GOCACHE="$SC_BUILD_DIR/go-cache" GOENV=off HOME="$SC_BUILD_DIR/home" go "$@"
 }
 
 # Stage a writable source once in this build's fresh directory. Copy into an
