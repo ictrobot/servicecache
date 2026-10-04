@@ -35,6 +35,11 @@ use wasmer_wasix::{
 /// pages are resident.
 const TASK_STACK_SIZE: usize = 8 << 20;
 
+/// The most processors a guest is told it has. Guests size thread pools
+/// by the count, and a service instance is one of many on the machine.
+/// The count is advice: a guest may still start more threads.
+const MAX_THREAD_PARALLELISM: usize = 4;
+
 /// Stack of the OS thread driving a coroutine. It holds nothing but the
 /// driving loop and the frames of a future poll.
 pub(super) const DRIVER_STACK_SIZE: usize = 1 << 20;
@@ -178,7 +183,9 @@ impl VirtualTaskManager for HostTaskManager {
     }
 
     fn thread_parallelism(&self) -> Result<usize, WasiThreadError> {
-        Ok(std::thread::available_parallelism().map_or(1, usize::from))
+        Ok(std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_THREAD_PARALLELISM))
     }
 }
 
