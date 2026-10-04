@@ -16,7 +16,7 @@ Early development prototype. Interfaces, service packages and runtime patches ma
 
 - Linux on x86-64 or AArch64.
 - A host C/C++ compiler and Rust, normally installed through [rustup](https://rustup.rs/).
-- Bash, Git, GNU Make and `sha256sum`.
+- Bash, Git and `sha256sum`.
 - Python 3.11 or newer as `python3` (`SC_PYTHON` overrides the interpreter).
 - An installed single-user or multi-user [Nix](https://nixos.org/download).
 - Enough time and disk space for source builds. The guest toolchain, sources and database builds can occupy multiple gigabytes.
@@ -28,13 +28,13 @@ Nix outputs live in its store, linked from `work/services`. Smoke fixtures and W
 Build a service. Nix builds or reuses its pinned sources and guest toolchain:
 
 ```sh
-make service-mariadb-11.8.9
+./x services mariadb@11.8.9
 ```
 
 Start the manager in one terminal:
 
 ```sh
-make serve
+./x serve
 ```
 
 Write a recipe, the input for the service's own client (here SQL), and request an initialized instance in another terminal:
@@ -45,7 +45,7 @@ CREATE DATABASE app;
 CREATE TABLE app.users (id INT PRIMARY KEY, name TEXT);
 INSERT INTO app.users VALUES (1, 'first');
 EOF
-make request-mariadb-11.8.9 RECIPE=recipe.sql
+./x request mariadb@11.8.9 --recipe recipe.sql
 ```
 
 The command prints the instance's loopback endpoint, which any MariaDB client can connect to, and keeps the lease alive. Press Ctrl-C, send SIGTERM, or close its standard input to destroy the instance.
@@ -53,7 +53,7 @@ The command prints the instance's loopback endpoint, which any MariaDB client ca
 The recipe is passed verbatim to the service's own client on standard input, and ServiceCache does not interpret it. The first request for a service, version and recipe pays the bring-up. Later ones are cloned from the frozen template for as long as it lives. With `--recipe-root DIR`, a request may name recipe files under that directory by path instead, read by the server, so large fixtures are never uploaded or encoded.
 
 The manager serves an HTTP API over a per-user Unix socket, described at `/openapi.json`. The `request` command is a thin client for it.
-See `make help` and `cargo run -- --help` for the remaining targets and commands.
+See `./x --help` and `cargo run -- --help` for the remaining commands.
 
 ## Services
 
@@ -82,21 +82,21 @@ The manager API is intended to be used by the same local user through its Unix s
 
 ## Development
 
-Common checks (`make lint` needs `uv`, `cargo-deny`, and Nix):
+`./x` runs every workflow. Examples:
 
 ```sh
-make lint                 # formatting and static checks
-make test                 # Python and Rust tests
-make smoke-toolchain      # build and run the WASIX fixtures
-make smoke-services       # build and smoke-test every service version
-make lifecycle-tests      # build every service and test freeze/fork
+./x lint              # formatting and static checks
+./x test              # Rust and Python tests
+./x smoke --toolchain # build and run the WASIX fixtures
+./x smoke mariadb     # build and smoke-test every MariaDB version
+./x lifecycle         # build every service and test freeze/fork
 ```
 
-`make build` and `make test` develop the Rust host with Cargo and do not need Nix. Wasmer CLIs for smoke tests build through Nix.
+`./x cargo` and `./x test` work on servicecache itself and do not need Nix. `./x lint` needs Nix, `uv` and `cargo-deny`. Wasmer CLIs for smoke tests build through Nix.
 
-Smoke and lifecycle targets build the services they need into `work/services`. Use targets such as `smoke-service-mariadb` or `lifecycle-service-mariadb-11.8.9` to test fewer versions.
+Commands that take services accept `NAME` (every version), `NAME@VERSION`, or a version prefix, and build every version into `work/services`. With no services named, `services`, `smoke` and `lifecycle` cover every version. `-n` prints the commands without running them.
 
-A service can also be built through ccache, for example with `make ccache-service-mariadb-11.8.9`. Trusted users (including single-user Nix) mount `work/ccache` at `/ccache` for that invocation; with a daemon the sandbox writes there as a `nixbld` user, so the directory must be writable by them. Untrusted users need the daemon configured with a writable `/ccache` mount.
+A service can also be built through ccache, for example with `./x services --ccache mariadb@11.8.9`; `smoke`, `lifecycle` and `run` take `--ccache` too, to test that build. Trusted users (including single-user Nix) mount `work/ccache` at `/ccache` for that invocation; with a daemon the sandbox writes there as a `nixbld` user, so the directory must be writable by them. Untrusted users need the daemon configured with a writable `/ccache` mount.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#how-guests-are-built) for the build layout and [PROFILING.md](PROFILING.md) for perf profiling.
 

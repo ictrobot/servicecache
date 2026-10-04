@@ -34,7 +34,7 @@ fn manifests() -> Vec<PathBuf> {
     let root = repo_root().join("work/services");
     let Ok(entries) = std::fs::read_dir(&root) else {
         eprintln!(
-            "skipped: {} is not built (run `make services`)",
+            "skipped: {} is not built (run `./x services`)",
             root.display()
         );
         return Vec::new();

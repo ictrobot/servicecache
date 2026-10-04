@@ -13,7 +13,7 @@ extensions_cli="$SC_ROOT/work/wasmer/extensions/bin/wasmer"
 stock_cli="$SC_ROOT/work/wasmer/stock/bin/wasmer"
 for cli in "$extensions_cli" "$stock_cli"; do
   [[ -x "$cli" ]] || {
-    echo "Wasmer variant not built: run make wasmer-extensions and make wasmer-stock first" >&2
+    echo "Wasmer variant not built: run './x wasmer extensions stock' first" >&2
     exit 1
   }
 done

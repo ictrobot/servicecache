@@ -55,7 +55,7 @@ Only permissively licensed modules (the service and all its dependencies) import
 
 ## Services
 
-A service is a directory of artifacts plus a manifest. The directory `make services` produces (`work/services/<name>-<version>/`) is byte-for-byte the layout an installed package uses. For an imaginary service `exampledb`:
+A service is a directory of artifacts plus a manifest. The directory `./x services` produces (`work/services/<name>-<version>/`) is byte-for-byte the layout an installed package uses. For an imaginary service `exampledb`:
 
 ```text
 exampledb-1.2.3/
@@ -101,7 +101,7 @@ args   = ["--host", "{host}", "--port", "{port}"]
 
 ## How guests are built
 
-Every service version builds through Nix; `make service-<name>-<version>` builds one and links its output into `work/services`. `services/<name>/shared/` holds the package definition, the build script and the manifest, `services/<name>/versions/<version>/` the upstream pins and patches, and `services/<name>/deps/` any source only that service builds. `nix/collect-services.nix` finds every such version, and the flake exposes it as `<name>-<version>` with dots replaced by underscores, such as `beanstalkd-1_13`, beside the smoke fixtures; its `.ccache` variant compiles through ccache with the cache mounted at `/ccache`, which `make ccache-service-<name>-<version>` builds. `libs/<name>/` defines a guest library a service builds against, and `extensions/<name>/` supplies an extension's headers. The shared Nix helpers live in `nix/`, and `toolchain/` builds the guest toolchain from LLVM, wasix-libc and mimalloc, with every compiler flag in `toolchain/guest/guest.cfg`.
+Every service version builds through Nix; `./x services <name>@<version>` builds one and links its output into `work/services`. `services/<name>/shared/` holds the package definition, the build script and the manifest, `services/<name>/versions/<version>/` the upstream pins and patches, and `services/<name>/deps/` any source only that service builds. `nix/collect-services.nix` finds every such version, and the flake exposes it as `<name>-<version>` with dots replaced by underscores, such as `beanstalkd-1_13`, beside the smoke fixtures; its `.ccache` variant compiles through ccache with the cache mounted at `/ccache`, which `./x services --ccache <name>@<version>` builds. `libs/<name>/` defines a guest library a service builds against, and `extensions/<name>/` supplies an extension's headers. The shared Nix helpers live in `nix/`, and `toolchain/` builds the guest toolchain from LLVM, wasix-libc and mimalloc, with every compiler flag in `toolchain/guest/guest.cfg`.
 
 The package definition names the upstream sources, which are fetched with only the files the build reads and kept as tars, and the ServiceCache files the build reads. The flake assembles those into a source directory with a manifest naming the tars, imports it (import from derivation) and builds the service from it with the guest toolchain; a program the build compiles for WASIX and then runs, such as PostgreSQL's zic, runs under nixpkgs' Wasmer through `wasix-runner`. The link under `work/services` is a garbage-collection root.
 

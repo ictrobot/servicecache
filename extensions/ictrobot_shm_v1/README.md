@@ -135,5 +135,5 @@ and runs it under the extensions variant, a patched Wasmer carrying
 the extension patch set and fixes:
 
 ```sh
-make smoke-extension-ictrobot_shm_v1
+./x smoke --extension ictrobot_shm_v1
 ```

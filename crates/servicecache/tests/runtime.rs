@@ -1,5 +1,5 @@
 //! The embedded runtime runs a module with isolated stdio and no network.
-//! The fixtures are the toolchain's smoke modules (`make smoke-toolchain`);
+//! The fixtures are the toolchain's smoke modules (`./x smoke --toolchain`);
 //! the tests are skipped when they are not built.
 
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ fn smoke_root() -> PathBuf {
 fn run(module: &Path, args: &[&str], stdin: &[u8]) -> Option<RunOutput> {
     if !module.is_file() {
         eprintln!(
-            "skipped: {} is not built (run `make smoke-toolchain`)",
+            "skipped: {} is not built (run `./x smoke --toolchain`)",
             module.display()
         );
         return None;

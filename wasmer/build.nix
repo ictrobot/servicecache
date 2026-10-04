@@ -128,7 +128,7 @@ let
     "wasmer-wasix-types"
     "wasmer-wast"
   ];
-  # The tests are packages rather than flake checks, so make lint does not
+  # The tests are packages rather than flake checks, so `./x lint` does not
   # build them.
   testsFor =
     variant:

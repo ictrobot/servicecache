@@ -79,7 +79,8 @@ Settings:
 ## Recording ServiceCache
 
 ```sh
-make build-release service-valkey-9.1.1
+./x services valkey@9.1.1
+./x cargo build --release
 tools/profile.sh "$(mktemp -d)" target/release/servicecache --services-dir work/services run valkey@9.1.1
 ```
 
@@ -106,6 +107,6 @@ the same jitdumps. A sample in guest code shows the guest functions that led
 to it.
 
 ```sh
-make wasmer-jitdump
+./x wasmer jitdump
 tools/profile.sh "$(mktemp -d)" work/wasmer/jitdump/bin/wasmer run --profiler jitdump module.wasm
 ```

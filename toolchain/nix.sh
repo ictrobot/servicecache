@@ -7,7 +7,8 @@
 #   nix.sh check ARGS...          nix flake check ARGS
 #
 # Nix must be on PATH and have a usable store. The required
-# command features are enabled per invocation. Default builds and checks
+# command features are enabled per invocation, and the warning that the Git
+# tree has uncommitted changes is turned off. Default builds and checks
 # need no project-specific nix.conf settings. Trusted users mount work/ccache
 # at /ccache for this invocation; other users need a configured /ccache mount.
 # The cache must be writable by Nix's build user(s).
@@ -34,7 +35,7 @@ case "$command" in
   *) usage ;;
 esac
 
-options=(--extra-experimental-features "nix-command flakes")
+options=(--extra-experimental-features "nix-command flakes" --no-warn-dirty)
 install="install single-user or multi-user Nix (https://nixos.org/download)"
 
 nix="$(command -v nix)" || fail "no nix on PATH; $install"

@@ -252,8 +252,9 @@ sc_apply_series() {
     patch_path="$patch_dir/$patch_name"
     patch_hash="$(sha256sum "$patch_path" | cut -d' ' -f1)"
 
+    # Only a patch applied now is reported; one already applied is not.
     if [[ -f "$stamp_file" ]] && grep -qxF "$patch_hash  $patch_name" "$stamp_file"; then
-      echo "already applied: $patch_name"
+      continue
     elif git -C "$source_dir" apply --check --whitespace=error-all \
         "$patch_path" 2>/dev/null; then
       echo "applying $patch_name"
@@ -261,12 +262,11 @@ sc_apply_series() {
       echo "$patch_hash  $patch_name" >> "$stamp_file"
     elif git -C "$source_dir" apply --reverse --check \
         "$patch_path" 2>/dev/null; then
-      echo "already applied: $patch_name"
       echo "$patch_hash  $patch_name" >> "$stamp_file"
     else
       echo "cannot apply cleanly: $patch_name" >&2
       echo "the checkout has partial or conflicting changes (a patch that changed after it was applied?);" >&2
-      echo "remove $source_dir and rerun make setup-wasmer" >&2
+      echo "remove $source_dir and rerun './x setup-wasmer'" >&2
       return 1
     fi
   done <<< "$patches"

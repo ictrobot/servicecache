@@ -12,7 +12,7 @@ variant="${1:?usage: $0 variant}"
 out="$root/work/wasmer/$variant"
 mkdir -p "$(dirname "$out")"
 [[ -L "$out" || ! -e "$out" ]] || {
-  echo "$out is not a link; remove it with make clean-wasmer-$variant" >&2
+  echo "$out is not a link; remove it with './x wasmer --clean $variant'" >&2
   exit 1
 }
 built="$("$root/toolchain/nix.sh" build ".#wasmer-$variant" --out-link "$out")"

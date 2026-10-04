@@ -23,7 +23,7 @@ fn manifests() -> Vec<PathBuf> {
     let root = repo_root().join("work/services");
     let Ok(entries) = std::fs::read_dir(&root) else {
         eprintln!(
-            "skipped: {} is not built (run `make services`)",
+            "skipped: {} is not built (run `./x services`)",
             root.display()
         );
         return Vec::new();
@@ -262,7 +262,7 @@ fn netprobe_package(tag: &str, args: &[&str]) -> Option<PathBuf> {
     let fixture = repo_root().join("work/build/toolchain-smoke/netprobe.wasm");
     if !fixture.is_file() {
         eprintln!(
-            "skipped: {} is not built (run `make smoke-toolchain`)",
+            "skipped: {} is not built (run `./x smoke --toolchain`)",
             fixture.display()
         );
         return None;
@@ -438,7 +438,7 @@ fn extension_declarations_gate_instantiation(declare: bool) {
         repo_root().join("work/build/extension-smoke/ictrobot_shm_v1/ictrobot-shm-demo.wasm");
     if !demo.is_file() {
         eprintln!(
-            "skipped: the extension demo is not built (run `make smoke-extension-ictrobot_shm_v1`)"
+            "skipped: the extension demo is not built (run `./x smoke --extension ictrobot_shm_v1`)"
         );
         return;
     }

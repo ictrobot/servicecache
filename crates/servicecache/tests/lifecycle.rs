@@ -1,10 +1,10 @@
 //! The lifecycle tests: freeze-is-terminal and resume, proven on every
 //! assembled service. A trial per service and case, discovered at run time
 //! (`libtest-mimic`, so `cargo test`'s filters and thread count and nextest
-//! apply): `make lifecycle-tests` runs the matrix, `make lifecycle-tests-long`
+//! apply): `./x lifecycle` runs the matrix, `./x lifecycle --long`
 //! includes the ignored trials with thousands of forks; a name filter such
 //! as `cargo test --test lifecycle <service>` selects trials. Without
-//! `SERVICECACHE_LIFECYCLE` set there are no trials, so `make test` skips
+//! `SERVICECACHE_LIFECYCLE` set there are no trials, so `./x test` skips
 //! the matrix.
 //!
 //! The matrix, per service: freeze; fork N children sequentially; live
@@ -44,7 +44,7 @@ fn manifests() -> Vec<PathBuf> {
     let root = repo_root().join("work/services");
     let Ok(entries) = std::fs::read_dir(&root) else {
         eprintln!(
-            "skipped: {} is not built (run `make services`)",
+            "skipped: {} is not built (run `./x services`)",
             root.display()
         );
         return Vec::new();
@@ -548,7 +548,7 @@ fn main() {
             }
         }
     } else {
-        eprintln!("skipped: set SERVICECACHE_LIFECYCLE=1 (make lifecycle-tests)");
+        eprintln!("skipped: set SERVICECACHE_LIFECYCLE=1 (`./x lifecycle`)");
     }
     libtest_mimic::run(&args, trials).exit();
 }

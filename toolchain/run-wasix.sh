@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # run-wasix.sh [--variant NAME] module.wasm [arguments...]: run a guest module
-# under a Wasmer CLI built from source (make wasmer-<variant>), with this
+# under a Wasmer CLI built from source (`./x wasmer <variant>`), with this
 # checkout visible to it at its own path, the current directory as the
 # guest's, and networking on.
 
@@ -45,7 +45,7 @@ else
 fi
 if [[ ! -x "$wasmer" ]]; then
   variant="$(basename "$(dirname "$(dirname "$wasmer")")")"
-  echo "Wasmer CLI not built: $wasmer (run make wasmer-$variant first)" >&2
+  echo "Wasmer CLI not built: $wasmer (run './x wasmer $variant' first)" >&2
   exit 1
 fi
 
