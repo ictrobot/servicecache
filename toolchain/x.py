@@ -254,7 +254,9 @@ def plan_serve(args: argparse.Namespace) -> list[Step]:
 
 
 def plan_cargo(args: argparse.Namespace) -> list[Step]:
-    return [SETUP_WASMER, cmd("cargo", *args.cargo)]
+    # cargo run finds the services built here, unless a search path is set.
+    env = () if "SERVICECACHE_SERVICES_DIR" in os.environ else SERVICES_DIR
+    return [SETUP_WASMER, cmd("cargo", *args.cargo, env=env)]
 
 
 def plan_purge(args: argparse.Namespace) -> list[Step]:

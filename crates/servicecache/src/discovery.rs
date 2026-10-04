@@ -1,21 +1,12 @@
 use std::{
     collections::{BTreeMap, btree_map::Entry},
-    fs::{self, File},
-    io::{self, Read},
+    fs, io,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
+use anyhow::{Context, Result};
 
 use crate::manifest::Manifest;
-
-/// A file in a service package and its SHA-256 content digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContentDigest {
-    pub path: PathBuf,
-    pub sha256: String,
-}
 
 /// A package hidden by an earlier package with the same name and version.
 #[derive(Debug, Clone)]
@@ -24,37 +15,12 @@ pub struct ShadowedPackage {
     pub manifest: Manifest,
 }
 
-impl ShadowedPackage {
-    /// The package's files with their content digests, hashed on demand.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a file cannot be read, or the package
-    /// contains a symbolic link.
-    pub fn files(&self) -> Result<Vec<ContentDigest>> {
-        digest_tree(&self.directory)
-    }
-}
-
 /// The selected package for a name and version. Discovery reads only the
-/// manifests; a package's content is hashed on demand, since the trees are
-/// large and most commands never look at them.
+/// manifests.
 #[derive(Debug, Clone)]
 pub struct DiscoveredPackage {
     pub manifest: Manifest,
     pub shadowed: Vec<ShadowedPackage>,
-}
-
-impl DiscoveredPackage {
-    /// The package's files with their content digests, hashed on demand.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a file cannot be read, or the package
-    /// contains a symbolic link.
-    pub fn files(&self) -> Result<Vec<ContentDigest>> {
-        digest_tree(self.manifest.directory())
-    }
 }
 
 /// Why a name (and optional version) selected no single service.
@@ -204,60 +170,6 @@ fn manifests_in(search_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(manifests)
 }
 
-fn digest_tree(directory: &Path) -> Result<Vec<ContentDigest>> {
-    let mut files = Vec::new();
-    let mut pending = vec![directory.to_path_buf()];
-    while let Some(current) = pending.pop() {
-        let mut entries = fs::read_dir(&current)
-            .with_context(|| format!("failed to read package directory {}", current.display()))?
-            .collect::<io::Result<Vec<_>>>()
-            .with_context(|| format!("failed to read package directory {}", current.display()))?;
-        entries.sort_by_key(fs::DirEntry::file_name);
-
-        for entry in entries {
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
-            if file_type.is_dir() {
-                pending.push(entry.path());
-            } else if file_type.is_file() {
-                let path = entry.path();
-                files.push(ContentDigest {
-                    path: path
-                        .strip_prefix(directory)
-                        .expect("walked paths stay under the package directory")
-                        .to_path_buf(),
-                    sha256: digest_file(&path)?,
-                });
-            } else if file_type.is_symlink() {
-                bail!(
-                    "package entry {} is a symbolic link",
-                    entry.path().display()
-                );
-            }
-        }
-    }
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(files)
-}
-
-fn digest_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path)
-        .with_context(|| format!("failed to open package file {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .with_context(|| format!("failed to read package file {}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -318,11 +230,6 @@ mod tests {
         assert_eq!(package.manifest.directory(), first.0.join("first"));
         assert_eq!(package.shadowed.len(), 1);
         assert_eq!(package.shadowed[0].directory, second.0.join("second"));
-        assert_eq!(package.files().expect("hash the package").len(), 2);
-        assert_eq!(
-            package.shadowed[0].files().expect("hash the shadow").len(),
-            2
-        );
     }
 
     #[test]
@@ -340,27 +247,12 @@ mod tests {
             .expect("discover linked package");
         let selected = index.select("example", Some("1")).expect("select package");
         assert_eq!(selected.directory(), packages.0.join("first"));
-        let original_files = index
-            .iter()
-            .next()
-            .expect("package")
-            .files()
-            .expect("hash package");
 
         fs::remove_file(&link).expect("remove installation link");
         std::os::unix::fs::symlink(packages.0.join("second"), &link).expect("replace package link");
         assert_eq!(
             fs::read_to_string(&selected.guest.module).expect("read original module"),
             "one"
-        );
-        assert_eq!(
-            index
-                .iter()
-                .next()
-                .expect("package")
-                .files()
-                .expect("hash original package"),
-            original_files
         );
         let updated = ServiceIndex::discover(std::slice::from_ref(&installed.0))
             .expect("discover replacement");
@@ -394,12 +286,5 @@ mod tests {
         assert_eq!(package.manifest.directory(), packages.0.join("z"));
         assert_eq!(package.shadowed.len(), 1);
         assert_eq!(package.shadowed[0].directory, packages.0.join("a"));
-        assert_eq!(
-            package.shadowed[0]
-                .files()
-                .expect("hash shadowed package")
-                .len(),
-            2
-        );
     }
 }

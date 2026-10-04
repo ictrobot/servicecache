@@ -137,7 +137,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ServicesCommand {
-    /// List discovered service packages and their content digests.
+    /// List discovered service packages and the packages they shadow.
     List,
     /// Load every discovered module with the embedded runtime.
     Check,
@@ -224,7 +224,10 @@ fn run_with(
             let search_dirs = service_dirs(cli.services_dir, environment_dirs);
             let services = ServiceIndex::discover(&search_dirs)?;
             match command {
-                ServicesCommand::List => print_services(&services),
+                ServicesCommand::List => {
+                    print_services(&services);
+                    Ok(())
+                }
                 ServicesCommand::Check => {
                     let runtime = Runtime::new().with_cache(ModuleCache::new(cache_dir()?));
                     check_services(&services, &runtime)
@@ -278,7 +281,7 @@ fn service_dirs(flag_dirs: Vec<PathBuf>, environment_dirs: Option<OsString>) -> 
     defaults
 }
 
-fn print_services(services: &ServiceIndex) -> Result<()> {
+fn print_services(services: &ServiceIndex) {
     for package in services.iter() {
         println!(
             "{} {} {}",
@@ -286,17 +289,10 @@ fn print_services(services: &ServiceIndex) -> Result<()> {
             package.manifest.service.version,
             package.manifest.directory().display()
         );
-        for file in package.files()? {
-            println!("  {}  {}", file.sha256, file.path.display());
-        }
         for shadow in &package.shadowed {
             println!("  shadowed {}", shadow.directory.display());
-            for file in shadow.files()? {
-                println!("    {}  {}", file.sha256, file.path.display());
-            }
         }
     }
-    Ok(())
 }
 
 /// A `name` or `name@version` argument, split.
