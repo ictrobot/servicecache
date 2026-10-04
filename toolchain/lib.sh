@@ -50,13 +50,13 @@ sc_python() {
   printf '%s\n' "$SC_PYTHON"
 }
 
-# sc_init service version: what a service's smoke test begins with. It sets
-# where the built service is looked for, work/services (SC_OUT), and the
-# Wasmer CLI toolchain/run-wasix.sh runs its modules under (SC_WASMER): stock,
-# or the extensions variant when the manifest declares extensions.
-sc_init() {
+# sc_smoke_init service version: what a service's smoke test begins with. It
+# sets where the built service is looked for, work/services (SC_OUT).
+# SC_WASMER must name the Wasmer CLI toolchain/run-wasix.sh runs the modules
+# under; `./x smoke` sets it to the variant the service's manifest needs.
+sc_smoke_init() {
   if [[ $# -ne 2 ]]; then
-    sc_fail "usage: sc_init service version"
+    sc_fail "usage: sc_smoke_init service version"
     return 1
   fi
 
@@ -68,22 +68,13 @@ sc_init() {
   SC_SERVICE_DIR="$SC_ROOT/services/$SC_SERVICE"
   SC_OUT="$SC_WORK/services"
 
-  local manifest="$SC_OUT/$SC_SERVICE-$SC_VERSION/service.toml" extensions
+  local manifest="$SC_OUT/$SC_SERVICE-$SC_VERSION/service.toml"
   [[ -f "$manifest" ]] || { sc_fail "built service manifest not found: $manifest"; return 1; }
-  extensions="$("$(sc_python)" -c 'import sys, tomllib
-with open(sys.argv[1], "rb") as f:
-    print(" ".join(tomllib.load(f)["service"].get("extensions", [])))' "$manifest")" || return 1
-
-  local variant=stock
-  if [[ -n "$extensions" ]]; then
-    variant=extensions
+  if [[ -z "${SC_WASMER:-}" ]]; then
+    sc_fail "SC_WASMER must name the Wasmer CLI to run $SC_SERVICE $SC_VERSION under ('./x smoke' sets it)"
+    return 1
   fi
-  "$SC_ROOT/wasmer/build.sh" "$variant" >/dev/null || return 1
-  SC_WASMER="$SC_WORK/wasmer/$variant/bin/wasmer"
-  if [[ -n "$extensions" ]]; then
-    echo "$SC_SERVICE $SC_VERSION: extensions $extensions," \
-      "modules run under ${SC_WASMER#"$SC_ROOT/"}" >&2
-  fi
+  [[ -x "$SC_WASMER" ]] || { sc_fail "SC_WASMER is not an executable: $SC_WASMER"; return 1; }
 
   export SC_SERVICE SC_VERSION SC_ROOT SC_WORK SC_TOOLCHAIN SC_WASMER
   export SC_SERVICE_DIR SC_OUT

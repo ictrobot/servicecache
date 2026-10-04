@@ -2,7 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../../../toolchain/lib.sh"
-sc_init postgresql "${1:?usage: $0 version}"
+sc_smoke_init postgresql "${1:?usage: $0 version}"
 
 service_dir="$SC_OUT/postgresql-$SC_VERSION"
 for artifact in postgres.wasm postgres initdb.wasm psql.wasm service.toml \
@@ -13,7 +13,7 @@ for artifact in postgres.wasm postgres initdb.wasm psql.wasm service.toml \
   fi
 done
 
-# The server imports ictrobot_shm_v1, so sc_init routes this smoke to the
+# The server imports ictrobot_shm_v1, so this smoke runs under the
 # extensions CLI; stock refuses to instantiate the module, by design. Boot
 # a fresh cluster standalone, the way the other services' smokes drive
 # their servers, and probe it over the wire with real SQL.

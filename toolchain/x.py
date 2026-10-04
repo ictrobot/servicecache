@@ -18,8 +18,9 @@ import shlex
 import signal
 import subprocess
 import sys
+import tomllib
 import unittest
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
@@ -141,15 +142,62 @@ def cmd(
 SETUP_WASMER = cmd("wasmer/setup.sh")
 
 
-def build_services(versions: list[Version], ccache: bool = False) -> list[Step]:
-    if not versions:
-        return []
-    pairs = [part for version in versions for part in (version.service, version.version)]
-    return [cmd("toolchain/service.sh", *(["--ccache"] if ccache else []), *pairs)]
+@dataclass(frozen=True)
+class Build:
+    """A nix build of flake outputs, each linked at its path in the checkout
+    or, without one, only built; toolchain/nix.sh does both. A run merges a
+    plan's builds into one, so Nix evaluates the flake once and builds
+    everything as one graph."""
+
+    outputs: tuple[tuple[str, str | None], ...]
+    # Builds through ccache, with work/ccache mounted.
+    ccache: bool = False
+
+    def command(self) -> tuple[str, ...]:
+        arguments = [f"{link}=.#{name}" if link else f".#{name}" for name, link in self.outputs]
+        return ("toolchain/nix.sh", "build", *(["--ccache"] if self.ccache else []), *arguments)
+
+    def __str__(self) -> str:
+        return shlex.join(self.command())
 
 
-def build_wasmer(variant: str) -> Step:
-    return cmd("wasmer/build.sh", variant)
+# A step of a plan: a command, or a build.
+Action = Step | Build
+
+
+def build_services(versions: list[Version], ccache: bool = False) -> Build:
+    """Each version's package, linked at work/services/<name>-<version>."""
+    suffix = ".ccache" if ccache else ""
+    outputs = tuple(
+        (
+            f"{v.service}-{v.version.replace('.', '_')}{suffix}",
+            f"work/services/{v.service}-{v.version}",
+        )
+        for v in versions
+    )
+    return Build(outputs, ccache)
+
+
+def build_wasmer(variants: Iterable[str]) -> Build:
+    """Each Wasmer CLI, linked at work/wasmer/<variant>."""
+    return Build(tuple((f"wasmer-{variant}", f"work/wasmer/{variant}") for variant in variants))
+
+
+def wasmer_cli(variant: str) -> str:
+    return str(ROOT / "work" / "wasmer" / variant / "bin" / "wasmer")
+
+
+def wasmer_variant(version: Version) -> str:
+    """The Wasmer variant a service version's modules run under: extensions
+    when its manifest declares any, stock otherwise. The manifest is the
+    version's own, if it has one, as the package's build chooses it."""
+    directory = ROOT / "services" / version.service
+    manifest = directory / "versions" / version.version / "service.toml"
+    if not manifest.is_file():
+        manifest = directory / "shared" / "service.toml"
+    with manifest.open("rb") as file:
+        declared = tomllib.load(file)["service"].get("extensions", [])
+    return "extensions" if declared else "stock"
 
 
 def service_links(versions: list[Version]) -> list[str]:
@@ -163,7 +211,7 @@ def absolute(path: str | None) -> list[str]:
 
 def removal(*paths: str) -> Step:
     """rm -rf for paths relative to the checkout, which this must be."""
-    if not (ROOT / "flake.nix").is_file() or not (ROOT / "toolchain/service.sh").is_file():
+    if not (ROOT / "flake.nix").is_file() or not (ROOT / "toolchain/nix.sh").is_file():
         raise UsageError(f"{ROOT} is not a ServiceCache checkout; refusing to remove anything")
     return Step(("rm", "-rf", "--", *paths))
 
@@ -171,7 +219,7 @@ def removal(*paths: str) -> Step:
 # Plans, one per command.
 
 
-def plan_services(args: argparse.Namespace) -> list[Step]:
+def plan_services(args: argparse.Namespace) -> list[Action]:
     if sum((args.ccache, args.from_source_tar, args.clean)) > 1:
         raise UsageError("--ccache, --from-source-tar and --clean are separate actions; choose one")
     versions = resolve(args.selectors)
@@ -179,10 +227,12 @@ def plan_services(args: argparse.Namespace) -> list[Step]:
         return [removal(*service_links(versions))]
     if args.from_source_tar:
         return [cmd("tools/build-source-tar.sh", v.service, v.version) for v in versions]
-    return build_services(versions, ccache=args.ccache)
+    return [build_services(versions, ccache=args.ccache)]
 
 
-def plan_smoke(args: argparse.Namespace) -> list[Step]:
+def plan_smoke(args: argparse.Namespace) -> list[Action]:
+    """Each smoke test is given what it needs, built beforehand: its
+    fixtures, linked under work/build, and the Wasmer CLIs it runs under."""
     everything = not (
         args.selectors
         or args.toolchain
@@ -191,29 +241,38 @@ def plan_smoke(args: argparse.Namespace) -> list[Step]:
         or args.lib
         or args.libs
     )
-    steps: list[Step] = []
+    fixtures: list[tuple[str, str | None]] = []
+    variants: list[str] = []
+    steps: list[Action] = []
+    services: list[Action] = []
     if args.toolchain or everything:
+        fixtures.append(("smoke-toolchain", "work/build/toolchain-smoke"))
+        variants += ["stock", "fixes"]
         steps.append(cmd("toolchain/smoke/run.sh"))
     if args.selectors or everything:
         versions = resolve(args.selectors)
-        steps += build_services(versions, ccache=args.ccache)
-        steps += [cmd(f"services/{v.service}/smoke/smoke.sh", v.version) for v in versions]
+        services.append(build_services(versions, ccache=args.ccache))
+        for version in versions:
+            variant = wasmer_variant(version)
+            variants.append(variant)
+            smoke = f"services/{version.service}/smoke/smoke.sh"
+            steps.append(cmd(smoke, version.version, env=(("SC_WASMER", wasmer_cli(variant)),)))
     if args.extension or args.extensions or everything:
         names: list[str] = [] if args.extensions or everything else args.extension
         for name in choose(names, extensions(), "extension"):
-            steps += [
-                build_wasmer("extensions"),
-                build_wasmer("stock"),
-                cmd(f"extensions/{name}/smoke.sh"),
-            ]
+            fixtures.append((f"smoke-extension-{name}", f"work/build/extension-smoke/{name}"))
+            variants += ["extensions", "stock"]
+            steps.append(cmd(f"extensions/{name}/smoke.sh"))
     if args.lib or args.libs or everything:
         names = [] if args.libs or everything else args.lib
         for name in choose(names, libs(), "lib"):
-            steps += [build_wasmer("stock"), cmd(f"libs/{name}/smoke.sh")]
-    return steps
+            fixtures.append((f"smoke-{name}", f"work/build/lib-smoke/{name}"))
+            variants.append("stock")
+            steps.append(cmd(f"libs/{name}/smoke.sh"))
+    return [*services, Build(tuple(fixtures)), build_wasmer(variants), *steps]
 
 
-def plan_lifecycle(args: argparse.Namespace) -> list[Step]:
+def plan_lifecycle(args: argparse.Namespace) -> list[Action]:
     """The trials are named <service>::<version>::<case>, and the harness
     takes one name filter, a substring: each selector is a cargo test run of
     its own, filtered to its service and the version or prefix it names."""
@@ -229,18 +288,21 @@ def plan_lifecycle(args: argparse.Namespace) -> list[Step]:
             filters.append(f"{name}::{wanted}.")
     cargo = ["cargo", "test", *(["--release"] if args.release else []), "--test", "lifecycle"]
     long = ["--include-ignored"] if args.long else []
-    steps = [*build_services(resolve(args.selectors), ccache=args.ccache), SETUP_WASMER]
+    steps: list[Action] = [
+        build_services(resolve(args.selectors), ccache=args.ccache),
+        SETUP_WASMER,
+    ]
     for extra in [[name_filter, *long] for name_filter in filters] or [long]:
         steps.append(cmd(*cargo, *(["--", *extra] if extra else []), env=LIFECYCLE))
     return steps
 
 
-def plan_run(args: argparse.Namespace) -> list[Step]:
+def plan_run(args: argparse.Namespace) -> list[Action]:
     version = resolve_one(args.selector)
     options = [*(["--recipe", *absolute(args.recipe)] if args.recipe else [])]
     options += ["--clones", str(args.clones)] if args.clones is not None else []
     cargo = cmd("cargo", "run", "--release", "--", "run", str(version), *options, env=SERVICES_DIR)
-    return [*build_services([version], ccache=args.ccache), SETUP_WASMER, cargo]
+    return [build_services([version], ccache=args.ccache), SETUP_WASMER, cargo]
 
 
 def plan_request(args: argparse.Namespace) -> list[Step]:
@@ -263,15 +325,16 @@ def plan_purge(args: argparse.Namespace) -> list[Step]:
     return [removal("work", "target")]
 
 
-def plan_wasmer(args: argparse.Namespace) -> list[Step]:
+def plan_wasmer(args: argparse.Namespace) -> list[Action]:
     if args.test and args.clean:
         raise UsageError("--test and --clean are separate actions; choose one")
     variants = choose(args.variants, wasmer_variants(), "variant")
     if args.clean:
         return [removal(*(f"work/wasmer/{variant}" for variant in variants))]
     if args.test:
-        return [cmd("wasmer/test.sh", variant) for variant in variants]
-    return [build_wasmer(variant) for variant in variants]
+        # The unit tests run as the test packages build.
+        return [Build(tuple((f"wasmer-{variant}-tests", None) for variant in variants))]
+    return [build_wasmer(variants)]
 
 
 def plan_setup_wasmer(args: argparse.Namespace) -> list[Step]:
@@ -347,9 +410,10 @@ def plan_lint(args: argparse.Namespace) -> list[Step]:
     ]
 
 
-def plan_check(args: argparse.Namespace) -> list[Step]:
+def plan_check(args: argparse.Namespace) -> list[Action]:
     no_python = argparse.Namespace(python=False)
-    return [*plan_lint(no_python), *plan_test(no_python), cmd("toolchain/smoke/run.sh")]
+    toolchain = plan_smoke(parse(["smoke", "--toolchain"]))
+    return [*plan_lint(no_python), *plan_test(no_python), *toolchain]
 
 
 def plan_completion(args: argparse.Namespace) -> list[Step]:
@@ -374,7 +438,7 @@ class Option:
 class Command:
     name: str
     help: str
-    plan: Callable[[argparse.Namespace], list[Step]]
+    plan: Callable[[argparse.Namespace], Sequence[Action]]
     # What the positional arguments are: "services" (any number of
     # selectors), "service" (one selector), "variants", "path" or "shell".
     arguments: str | None = None
@@ -729,10 +793,22 @@ def wait_for(step: Step) -> int:
     return 128 - status if status < 0 else status
 
 
+def combine(actions: Sequence[Action]) -> list[Step]:
+    """A plan's commands as they run: its builds as one nix.sh build, ahead
+    of the others, and each other command once, where it first appears."""
+    builds = [action for action in actions if isinstance(action, Build)]
+    outputs = tuple(dict.fromkeys(output for build in builds for output in build.outputs))
+    rest = list(dict.fromkeys(action for action in actions if isinstance(action, Step)))
+    if not outputs:
+        return rest
+    build = Build(outputs, any(build.ccache for build in builds))
+    return [Step(build.command()), *rest]
+
+
 def execute(steps: Iterable[Step], dry_run: bool) -> int:
-    """Run each step once, in order, from the repository root, stopping at
-    the first that fails."""
-    for step in dict.fromkeys(steps):
+    """Run the steps in order from the repository root, stopping at the
+    first that fails."""
+    for step in steps:
         # A dry run's commands can be pasted or saved as they are; a run
         # marks them on stderr as bash's set -x does.
         if dry_run:
@@ -765,7 +841,7 @@ def main(argv: list[str]) -> int:
     # toolchain/lib.sh checks it.
     os.environ.setdefault("SC_PYTHON", sys.executable)
     try:
-        steps = args.plan(args)
+        steps = combine(args.plan(args))
     except UsageError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -802,7 +878,8 @@ class Selection(unittest.TestCase):
 
     def test_lifecycle_filters(self, _: object) -> None:
         args = parse(["lifecycle", "alpha@1.0", "alpha@1.0.1", "beta", "--long"])
-        runs = [step.argv[step.argv.index("--") + 1 :] for step in plan_lifecycle(args)[2:]]
+        steps = [step for step in plan_lifecycle(args) if isinstance(step, Step)][1:]
+        runs = [step.argv[step.argv.index("--") + 1 :] for step in steps]
         self.assertEqual(
             runs,
             [
@@ -815,9 +892,20 @@ class Selection(unittest.TestCase):
     def test_one_batch(self, _: object) -> None:
         for ccache in ([], ["--ccache"]):
             args = parse(["smoke", "beta", *ccache, "alpha@1.2"])
-            builds = [step for step in plan_smoke(args) if step.argv[0] == "toolchain/service.sh"]
-            pairs = ("beta", "2.0.0", "alpha", "1.2.0")
-            self.assertEqual(builds, [cmd("toolchain/service.sh", *ccache, *pairs)])
+            with patch(f"{__name__}.wasmer_variant", return_value="stock"):
+                build, *_ = combine(plan_smoke(args))
+            suffix = ".ccache" if ccache else ""
+            self.assertEqual(
+                build.argv,
+                (
+                    "toolchain/nix.sh",
+                    "build",
+                    *ccache,
+                    f"work/services/beta-2.0.0=.#beta-2_0_0{suffix}",
+                    f"work/services/alpha-1.2.0=.#alpha-1_2_0{suffix}",
+                    "work/wasmer/stock=.#wasmer-stock",
+                ),
+            )
 
     def test_completion(self, _: object) -> None:
         self.assertEqual(complete(["servi"]), [("services", BY_NAME["services"].help)])
@@ -841,7 +929,14 @@ class Execution(unittest.TestCase):
         self.assertEqual(status, 3)
         self.assertNotIn("+ true\n", output)
 
-    def test_success_statuses_and_repeats(self) -> None:
-        status, output = self.execute(cmd("false", success=(1,)), cmd("true"), cmd("true"))
+    def test_success_statuses(self) -> None:
+        status, output = self.execute(cmd("false", success=(1,)), cmd("true"))
         self.assertEqual(status, 0)
         self.assertEqual(output, "+ false\n+ true\n")
+
+    def test_combine(self) -> None:
+        steps = combine(
+            [cmd("a"), Build((("x", "work/x"),)), cmd("b"), cmd("a"), Build((("y", None),), True)]
+        )
+        nix = cmd("toolchain/nix.sh", "build", "--ccache", "work/x=.#x", ".#y")
+        self.assertEqual(steps, [nix, cmd("a"), cmd("b")])

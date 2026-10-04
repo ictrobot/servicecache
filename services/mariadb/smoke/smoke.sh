@@ -2,7 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../../../toolchain/lib.sh"
-sc_init mariadb "${1:?usage: $0 version}"
+sc_smoke_init mariadb "${1:?usage: $0 version}"
 
 service_dir="$SC_OUT/mariadb-$SC_VERSION"
 server_module="$service_dir/mariadbd.wasm"

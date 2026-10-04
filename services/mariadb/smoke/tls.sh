@@ -7,7 +7,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../../../toolchain/lib.sh"
-sc_init mariadb "${1:?usage: $0 version}"
+sc_smoke_init mariadb "${1:?usage: $0 version}"
 
 if ! command -v openssl >/dev/null 2>&1; then
   echo "openssl not found on the host; skipping the TLS test" >&2

@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# run.sh [DIRECTORY]: run the fixtures toolchain/smoke/build.sh compiled
-# under the Wasmer CLIs built from source, and check what each prints. With no
-# argument they are the flake's smoke-toolchain output, copied to
-# work/build/toolchain-smoke, which is also where the manager's own tests look
-# for them. A DIRECTORY holds fixtures already built, and may be read-only.
+# run.sh: run the fixtures toolchain/smoke/build.sh compiled, linked at
+# work/build/toolchain-smoke, under the Wasmer CLIs built from source, and
+# check what each prints.
 set -euo pipefail
 
 SC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -13,28 +11,20 @@ fail() {
   exit 1
 }
 
-if [[ $# -eq 0 ]]; then
-  built="$("$SC_ROOT/toolchain/nix.sh" build .#smoke-toolchain)"
-  [[ -d "$built" ]] || fail "the build of smoke-toolchain printed no directory: ${built:-nothing}"
-  modules="$SC_ROOT/work/build/toolchain-smoke"
-  rm -rf "$modules"
-  mkdir -p "$modules"
-  cp -r --preserve=mode "$built/." "$modules/"
-  chmod -R u+w "$modules"
-else
-  [[ $# -eq 1 && -d "$1" ]] || fail "usage: $0 [directory]"
-  modules="$(cd "$1" && pwd)"
-fi
+[[ $# -eq 0 ]] || fail "usage: $0"
+fixtures="$SC_ROOT/work/build/toolchain-smoke"
+[[ -d "$fixtures" ]] || fail "fixtures not built: $fixtures (run './x smoke --toolchain')"
+# The directory itself, not the link to it, is what Wasmer maps for a guest.
+modules="$(cd "$fixtures" && pwd -P)"
 command -v timeout >/dev/null 2>&1 || fail "required host command not found: timeout"
 
-"$SC_ROOT/wasmer/build.sh" stock >/dev/null ||
-  fail "could not build the stock Wasmer CLI (wasmer/build.sh stock)"
 # Guest fixtures for the fixes patch set run under the fixes variant: stock
 # does not carry the behaviour they test.
-"$SC_ROOT/wasmer/build.sh" fixes >/dev/null ||
-  fail "could not build the fixes Wasmer CLI (wasmer/build.sh fixes)"
 stock="$SC_ROOT/work/wasmer/stock/bin/wasmer"
 fixes="$SC_ROOT/work/wasmer/fixes/bin/wasmer"
+for cli in "$stock" "$fixes"; do
+  [[ -x "$cli" ]] || fail "Wasmer CLI not built: $cli (run './x wasmer stock fixes' first)"
+done
 
 # expect_stock module expected-output [wasmer-run-option...]
 expect_stock() {

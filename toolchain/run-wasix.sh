@@ -36,8 +36,8 @@ if [[ "$module_path" == /nix/store/*/* ]]; then
   store_volumes=(--volume "$store_root:$module_dir")
 fi
 
-# An explicit --variant wins; otherwise the CLI sc_init exports for the
-# service being smoke-tested; otherwise stock.
+# An explicit --variant wins; otherwise SC_WASMER, the CLI a service's smoke
+# test runs under; otherwise stock.
 if [[ -n "$variant" ]]; then
   wasmer="$SC_ROOT/work/wasmer/$variant/bin/wasmer"
 else

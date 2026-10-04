@@ -35,10 +35,10 @@ not build Wasmer's BUSL-1.1-licensed Singlepass and LLVM backends.
 
 The flake exposes wasmer-<variant> and wasmer-<variant>-tests packages.
 `./x wasmer` links the CLI, and `./x wasmer --test` runs its unit tests.
-Smoke tests build the CLI they need; guest builds do not. Upstream's
-integration suites and the backends we do not build are left to upstream's
-CI. Two upstream tests that download from the public registry are skipped
-in Nix's network-isolated sandbox.
+`./x smoke` builds the CLIs its tests run under; guest builds do not.
+Upstream's integration suites and the backends we do not build are left to
+upstream's CI. Two upstream tests that download from the public registry are
+skipped in Nix's network-isolated sandbox.
 
 `./x setup-wasmer` prepares work/src/wasmer/servicecache for Cargo builds
 of servicecache, without Nix. `./x cargo` and `./x test` use this checkout.

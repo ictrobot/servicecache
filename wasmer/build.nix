@@ -105,6 +105,24 @@ let
         ];
         nativeBuildInputs = [ pkgs.zstd ];
         doCheck = false;
+        # The CLI must be the pinned version with Cranelift its only compiler
+        doInstallCheck = true;
+        installCheckPhase = ''
+          runHook preInstallCheck
+          # The CLI creates its directory even to report its version.
+          export WASMER_DIR="$TMPDIR/wasmer"
+          reported="$("$out/bin/wasmer" --version)"
+          [[ "$reported" == "wasmer ${version}" ]] || {
+            echo "the CLI reports $reported, not wasmer ${version}" >&2
+            exit 1
+          }
+          runtimes="$("$out/bin/wasmer" --version --verbose | grep '^runtimes:')"
+          [[ "$runtimes" == "runtimes: Cranelift" ]] || {
+            echo "the CLI reports $runtimes, not Cranelift alone" >&2
+            exit 1
+          }
+          runHook postInstallCheck
+        '';
       }
       // shareTarget variant packages.stock
     );

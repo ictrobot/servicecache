@@ -8,6 +8,17 @@ set -euo pipefail
 # fails loudly anywhere the imports are absent.
 
 SC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+[[ $# -eq 0 ]] || {
+  echo "usage: $0" >&2
+  exit 2
+}
+demo="$SC_ROOT/work/build/extension-smoke/ictrobot_shm_v1"
+[[ -d "$demo" ]] || {
+  echo "demo not built: $demo (run './x smoke --extension ictrobot_shm_v1')" >&2
+  exit 1
+}
+# The directory itself, not the link to it, is what Wasmer maps for a guest.
+build_dir="$(cd "$demo" && pwd -P)"
 
 extensions_cli="$SC_ROOT/work/wasmer/extensions/bin/wasmer"
 stock_cli="$SC_ROOT/work/wasmer/stock/bin/wasmer"
@@ -18,17 +29,6 @@ for cli in "$extensions_cli" "$stock_cli"; do
   }
 done
 
-# The demo is copied to where the manager's own tests look for it.
-built="$("$SC_ROOT/toolchain/nix.sh" build .#smoke-extension-ictrobot_shm_v1)"
-[[ -d "$built" ]] || {
-  echo "error: the build of smoke-extension-ictrobot_shm_v1 printed no directory: ${built:-nothing}" >&2
-  exit 1
-}
-build_dir="$SC_ROOT/work/build/extension-smoke/ictrobot_shm_v1"
-rm -rf "$build_dir"
-mkdir -p "$build_dir"
-cp -r --preserve=mode "$built/." "$build_dir/"
-chmod -R u+w "$build_dir"
 module="$build_dir/ictrobot-shm-demo.wasm"
 
 # The demo spawns its child by name, found through PATH in the mapped dir.

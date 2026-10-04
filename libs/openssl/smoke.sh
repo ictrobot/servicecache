@@ -25,10 +25,9 @@ test_dir=""
 trap '[[ -z "$test_dir" ]] || rm -rf -- "$test_dir"' EXIT
 
 run_tests() {
-  local built
-  built="$("$SC_ROOT/toolchain/nix.sh" build .#smoke-openssl)"
+  local built="$SC_ROOT/work/build/lib-smoke/openssl"
   [[ -d "$built" ]] || {
-    echo "error: the build of smoke-openssl printed no directory: ${built:-nothing}" >&2
+    echo "error: tests not built: $built (run './x smoke --lib openssl')" >&2
     exit 1
   }
 

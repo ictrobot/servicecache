@@ -2,7 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../../../toolchain/lib.sh"
-sc_init mysql "${1:?usage: $0 version}"
+sc_smoke_init mysql "${1:?usage: $0 version}"
 
 service_dir="$SC_OUT/mysql-$SC_VERSION"
 server_module="$service_dir/mysqld.wasm"

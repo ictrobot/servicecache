@@ -2,7 +2,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../../../toolchain/lib.sh"
-sc_init valkey "${1:?usage: $0 version}"
+sc_smoke_init valkey "${1:?usage: $0 version}"
 
 service_dir="$SC_OUT/valkey-$SC_VERSION"
 server_module="$service_dir/valkey-server.wasm"
