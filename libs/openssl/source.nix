@@ -2,7 +2,7 @@
 let
   version = "3.5.8";
   pin = {
-    hash = "sha256-L+Jjivr1jKfPbG+ll1Z+hcZkbAZIfxwBKv8nXs8RLOE=";
+    hash = "sha256-tq2Abipt212YFpOLm7NVc4V0nca5+TDd72OOickfGNo=";
   };
 in
 sc.mkSource {
@@ -14,21 +14,21 @@ sc.mkSource {
     inherit (pin) hash;
     selection.exclude = [
       {
-        paths = [ "test" ];
+        patterns = [ "/test/" ];
         reason = "Unused with no-tests.";
       }
       {
-        paths = [ "doc/" ];
-        keep = [
-          "doc/build.info"
-          "doc/build.info.in"
-          "doc/man1/build.info"
-          "doc/perlvars.pm"
+        patterns = [
+          "/doc/"
+          "!/doc/build.info"
+          "!/doc/build.info.in"
+          "!/doc/man1/build.info"
+          "!/doc/perlvars.pm"
         ];
         reason = "Unused by build_libs and install_dev. Configure still reads the retained build descriptions.";
       }
     ];
   };
-  tarHash = "sha256-YlReoISx8I4atVbLzvBsdlfV35ZtvDzdRjgjvErbhOI=";
+  tarHash = "sha256-AAK4MirKn+ivGA7yJmuvNCoXe1auY70JJKEDMAdo3fs=";
   servicecacheFiles."libs/openssl" = ./.;
 }

@@ -1,69 +1,49 @@
 #!/usr/bin/env bash
+# Replaces an unpacked archive with a sparse checkout of it, so archives and
+# Git sources share Git's pattern matching and neither keeps empty directories.
 set -euo pipefail
-cd "${1:?source directory}"
-exclusions="${2:?exclusions file}"
-shopt -s dotglob nullglob
+source="${1:?source directory}"
+sparse="${2:?sparse-checkout patterns file}"
+checked="${3:?checked patterns file}"
 
-check_path() {
-  local path="$1" parent="$1"
-  case "/$path/" in
-    *'//'* | *'/./'* | *'/../'*)
-      echo "source exclusion needs a relative path without dot components: $path" >&2
-      exit 1
-      ;;
-  esac
-  while [[ "$parent" == */* ]]; do
-    parent="${parent%/*}"
-    [[ ! -L "$parent" ]] || {
-      echo "source exclusion traverses a symlink: $path" >&2
-      exit 1
-    }
-  done
-  [[ -e "$path" || -L "$path" ]] || {
-    echo "source exclusion or keep names a missing path: $path" >&2
-    exit 1
-  }
-}
+# Git would record a nested repository as a link and leave out its files.
+if [[ -n "$(find "$source" -name .git -print -quit)" ]]; then
+  echo "source archive contains .git" >&2
+  exit 1
+fi
 
-remove_path() {
-  local path="$1" keep child descend=false
-  for keep in "${kept[@]}"; do
-    if [[ "$path" == "$keep" || "$path" == "$keep/"* ]]; then
-      return 0
-    fi
-    if [[ "$keep" == "$path/"* ]]; then
-      descend=true
-    fi
-  done
-  if "$descend"; then
-    for child in "$path"/*; do
-      remove_path "$child"
-    done
-  else
-    rm -rf -- "$path"
-  fi
-}
+# Move the archive aside so the checkout writes into an empty directory.
+work="$(mktemp -d)"
+mv "$source" "$work/unpacked"
+mkdir "$source"
+# The caller may have been inside the directory that moved.
+cd "$source"
 
-while IFS= read -r rule; do
-  mapfile -t paths < <(jq -r '.paths[] | rtrimstr("/")' <<<"$rule")
-  mapfile -t kept < <(jq -r '.keep[] | rtrimstr("/")' <<<"$rule")
-  for path in "${paths[@]}" "${kept[@]}"; do
-    check_path "$path"
-  done
-  for keep in "${kept[@]}"; do
-    contained=false
-    for path in "${paths[@]}"; do
-      if [[ "$keep" == "$path" || "$keep" == "$path/"* ]]; then
-        contained=true
-        break
-      fi
-    done
-    "$contained" || {
-      echo "source keep is outside this rule's excluded paths: $keep" >&2
-      exit 1
-    }
-  done
-  for path in "${paths[@]}"; do
-    remove_path "$path"
-  done
-done < <(jq -c '.[]' "$exclusions")
+# A temporary repository outside the tree, unaffected by any Git configuration
+# on the machine. Its objects are discarded, so they are not compressed.
+export GIT_DIR="$work/git" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+git init --quiet --bare
+git config core.compression 0
+
+# Keep the archive's file contents exactly: no attributes apply while adding
+# or checking out, whether from the archive's own .gitattributes or the system.
+GIT_ATTR_SOURCE="$(git mktree </dev/null)"
+export GIT_ATTR_SOURCE GIT_ATTR_NOSYSTEM=1
+git config core.autocrlf false
+git config core.attributesFile /dev/null
+
+# Add every file. --force includes the ones the archive's own .gitignore
+# files would leave out.
+export GIT_WORK_TREE="$work/unpacked"
+git add --force --all
+bash "$(dirname "$0")/check-selection.sh" "$checked"
+
+# Check out the selected files. Without an index every file is new to Git, so
+# it writes each one the patterns keep.
+tree="$(git write-tree)"
+rm "$GIT_DIR/index"
+GIT_WORK_TREE="$source"
+git sparse-checkout set --no-cone --stdin <"$sparse"
+git read-tree -mu "$tree"
+
+rm -rf "$work"

@@ -17,7 +17,7 @@ sc.mkSource {
     inherit (pin) hash;
     selection.exclude = [
       {
-        paths = map (name: "${directory}/${name}") [
+        patterns = map (name: "/${directory}/${name}/") [
           "libs"
           "doc"
           "tools"

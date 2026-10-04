@@ -2,7 +2,7 @@
 let
   version = "10.47";
   pin = {
-    hash = "sha256-dnCsMBQsx2SVkZp2MYNqltcxl6zCXcem1JgN1f2iubE=";
+    hash = "sha256-DRa3C1AU8+z28dM3Zta1Hn9WMgoHd0IHxRaAdoau2js=";
   };
 in
 sc.mkSource {
@@ -14,19 +14,19 @@ sc.mkSource {
     inherit (pin) hash;
     selection.exclude = [
       {
-        paths = [ "deps/sljit" ];
+        patterns = [ "/deps/sljit/" ];
         reason = "Unused with PCRE2_SUPPORT_JIT=OFF.";
       }
       {
-        paths = [ "doc" ];
+        patterns = [ "/doc/" ];
         reason = "Unused as documentation is not installed.";
       }
       {
-        paths = [ "testdata" ];
+        patterns = [ "/testdata/" ];
         reason = "Unused with PCRE2_BUILD_TESTS=OFF.";
       }
     ];
   };
-  tarHash = "sha256-NCKBnhqSDlocojb71xiq6YduH4B945mJ2sOCA3hff68=";
+  tarHash = "sha256-6YHJBZhvX2PKCPnD16XYGIczoM6dQ4Fu30mTiNLg/EE=";
   servicecacheFiles."services/mariadb/deps/pcre2" = ./.;
 }

@@ -19,7 +19,7 @@ sc.mkSource {
     };
     selection.exclude = [
       {
-        paths = [ "win" ];
+        patterns = [ "/win/" ];
         reason = "Unused without WIN32.";
       }
     ];

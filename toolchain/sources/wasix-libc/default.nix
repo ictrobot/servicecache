@@ -3,7 +3,7 @@ let
   version = "v2026-07-30.1";
   pin = {
     rev = "67b2eccf84e5091912ee28f4b6bc0edd1b88e86f";
-    hash = "sha256-RMFNPXe1gKgqbX9W6fY518jf1mSXEOMa6YifsP6Z5HE=";
+    hash = "sha256-dMCO457Gk59vNS7u7RYLb2aXeugbOLoKoIY0u+uOm3Y=";
   };
 in
 sc.mkSource {
@@ -15,12 +15,12 @@ sc.mkSource {
     inherit (pin) hash;
     selection.exclude = [
       {
-        paths = [ "expected" ];
+        patterns = [ "/expected/" ];
         reason = "Unused with CHECK_SYMBOLS=no.";
       }
     ];
   };
   patches = sc.patchSeries ./patches;
-  tarHash = "sha256-FJH7k/G93FDAA5n3G1Z9hSsFOmBYsL8Crw1FkSw+10g=";
+  tarHash = "sha256-mm6EDBh5e+6T1Q+e6yKQPQ9T9BAG+va0Zo3s6UJBEO8=";
   servicecacheFiles."toolchain/sources/wasix-libc" = ./.;
 }

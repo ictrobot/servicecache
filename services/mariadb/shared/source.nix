@@ -26,38 +26,38 @@ sc.mkSource {
     '';
     selection.exclude = [
       {
-        paths = [ "mysql-test/" ];
-        keep = [
-          "mysql-test/CMakeLists.txt"
-          "mysql-test/mtr.out-of-source"
-          "mysql-test/mariadb-stress-test.pl"
-          "mysql-test/lib/My/SafeProcess/"
-          "mysql-test/std_data/unicode/allkeys1400.txt"
+        patterns = [
+          "/mysql-test/"
+          "!/mysql-test/CMakeLists.txt"
+          "!/mysql-test/mtr.out-of-source"
+          "!/mysql-test/mariadb-stress-test.pl"
+          "!/mysql-test/lib/My/SafeProcess/"
+          "!/mysql-test/std_data/unicode/allkeys1400.txt"
         ];
         reason = "Unused by the selected targets. Keep the files CMake configures and the Unicode data used to generate collation tables.";
       }
       {
-        paths = [ "storage/mroonga" ];
+        patterns = [ "/storage/mroonga/" ];
         reason = "Unused with PLUGIN_MROONGA=NO.";
       }
       {
-        paths = [ "storage/connect" ];
+        patterns = [ "/storage/connect/" ];
         reason = "Unused with PLUGIN_CONNECT=NO.";
       }
       {
-        paths = [ "storage/rocksdb" ];
+        patterns = [ "/storage/rocksdb/" ];
         reason = "Unused with PLUGIN_ROCKSDB=NO.";
       }
       {
-        paths = [ "storage/spider" ];
+        patterns = [ "/storage/spider/" ];
         reason = "Unused with PLUGIN_SPIDER=NO.";
       }
       {
-        paths = [ "unittest" ];
+        patterns = [ "/unittest/" ];
         reason = "Unused with WITH_UNIT_TESTS=OFF and WITH_EMBEDDED_SERVER=OFF.";
       }
       {
-        paths = [ "debian" ];
+        patterns = [ "/debian/" ];
         reason = "Unused with DEB=OFF.";
       }
     ];

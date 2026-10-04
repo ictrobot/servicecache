@@ -16,7 +16,7 @@ sc.mkSource {
     inherit (pin) hash;
     selection.exclude = [
       {
-        paths = [ "ct" ];
+        patterns = [ "/ct/" ];
         reason = "Unused by make all.";
       }
     ];

@@ -14,7 +14,7 @@ sc.mkSource {
     inherit (pin) hash;
     selection.exclude = [
       {
-        paths = [ "test" ];
+        patterns = [ "/test/" ];
         reason = "Unused as upstream tests are not built.";
       }
     ];

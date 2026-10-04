@@ -7,9 +7,9 @@
   libmariadb = {
     upstream = {
       rev = "35c41cddb3c16e9d80dee55158a59118a8fd831d";
-      hash = "sha256-oMN9fcGblKC6acWpfxGSWVGo+Sgm8a/rPQXHCxanfiE=";
+      hash = "sha256-zhM2QxO2jC4XLdP8Z2En/trHWTzyIsaB84lzb7ZXZGQ=";
     };
-    tarHash = "sha256-VVSN0Ht/uy3RrV8CCMWa1V67nFMDAJu58YXoPf1IMNQ=";
+    tarHash = "sha256-mgar1N+gK9hNQ4T4hMiukVrPz9qm62RWwJRRetWDXLc=";
   };
   wolfssl = {
     upstream = {

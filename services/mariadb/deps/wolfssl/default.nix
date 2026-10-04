@@ -15,30 +15,30 @@ sc.mkSource {
     inherit (pin) rev hash;
     selection.exclude = [
       {
-        paths = [ "IDE" ];
+        patterns = [ "/IDE/" ];
         reason = "Unused by the CMake build.";
       }
       {
-        paths = [ "debian" ];
+        patterns = [ "/debian/" ];
         reason = "Unused as distribution packages are not built.";
       }
       {
-        paths = [
-          "tests"
-          "certs"
+        patterns = [
+          "/tests/"
+          "/certs/"
         ];
         reason = "Unused as upstream tests are not built.";
       }
       {
-        paths = [ "doc" ];
+        patterns = [ "/doc/" ];
         reason = "Unused as documentation is not built or installed.";
       }
       {
-        paths = [ "wolfcrypt/src/port" ];
+        patterns = [ "/wolfcrypt/src/port/" ];
         reason = "Unused by the explicit source list.";
       }
       {
-        paths = map (name: "wolfcrypt/src/${name}") [
+        patterns = map (name: "/wolfcrypt/src/${name}") [
           "sp_arm64.c"
           "sp_armthumb.c"
           "sp_arm32.c"
@@ -47,7 +47,7 @@ sc.mkSource {
         reason = "Unused by the explicit source list.";
       }
       {
-        paths = [ "wolfcrypt/src/sp_x86_64_asm.asm" ];
+        patterns = [ "/wolfcrypt/src/sp_x86_64_asm.asm" ];
         reason = "Unused without MSVC_INTEL.";
       }
     ];

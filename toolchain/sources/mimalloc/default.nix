@@ -15,22 +15,22 @@ sc.mkSource {
     inherit (pin) hash;
     selection.exclude = [
       {
-        paths = [ "bin" ];
+        patterns = [ "/bin/" ];
         reason = "Unused outside Windows.";
       }
       {
-        paths = [
-          "doc"
-          "docs"
+        patterns = [
+          "/doc/"
+          "/docs/"
         ];
         reason = "Unused as documentation is not built or installed.";
       }
       {
-        paths = [ "ide" ];
+        patterns = [ "/ide/" ];
         reason = "Unused by the Makefile build.";
       }
       {
-        paths = [ "test" ];
+        patterns = [ "/test/" ];
         reason = "Unused as upstream tests are not built.";
       }
     ];

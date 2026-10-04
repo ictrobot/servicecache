@@ -9,7 +9,10 @@
 let
   inherit (pkgs) lib;
   pin = versionData.upstream;
-  directories = map (module: module.directory) loadableModules;
+  moduleDirectories = map (module: module.directory) loadableModules;
+  keepModulesUnder =
+    prefix:
+    map (directory: "!/${directory}/") (builtins.filter (lib.hasPrefix prefix) moduleDirectories);
 in
 sc.mkSource {
   inherit version;
@@ -20,21 +23,23 @@ sc.mkSource {
     inherit (pin) rev hash;
     selection.exclude = [
       {
-        paths = [ "src/test" ];
+        patterns = [ "/src/test/" ];
         reason = "Unused as upstream tests are not built.";
       }
       {
-        paths = [ "contrib/" ];
-        keep = [ "contrib/contrib-global.mk" ] ++ builtins.filter (lib.hasPrefix "contrib/") directories;
+        patterns = [
+          "/contrib/"
+          "!/contrib/contrib-global.mk"
+        ]
+        ++ keepModulesUnder "contrib/";
         reason = "Unused as only the listed modules are built. Keep the makefile fragment they include.";
       }
       {
-        paths = [ "src/pl/" ];
-        keep = builtins.filter (lib.hasPrefix "src/pl/") directories;
+        patterns = [ "/src/pl/" ] ++ keepModulesUnder "src/pl/";
         reason = "Unused as only the listed modules are built.";
       }
       {
-        paths = map (name: "src/${name}/po") [
+        patterns = map (name: "/src/${name}/po/") [
           "backend"
           "bin/psql"
           "bin/initdb"

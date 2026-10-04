@@ -14,15 +14,15 @@ sc.mkSource {
     inherit (pin) hash;
     selection.exclude = [
       {
-        paths = [ "doc-html" ];
+        patterns = [ "/doc-html/" ];
         reason = "Unused as documentation is not installed.";
       }
       {
-        paths = [ "support" ];
+        patterns = [ "/support/" ];
         reason = "Unused as release tooling is not run.";
       }
       {
-        paths = [ "test" ];
+        patterns = [ "/test/" ];
         reason = "Unused as upstream tests are not built.";
       }
     ];

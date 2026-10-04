@@ -18,59 +18,59 @@ sc.mkSource {
     inherit (pin) rev hash;
     selection.exclude = [
       {
-        paths = [ "mysql-test/" ];
-        keep = [
-          "mysql-test/CMakeLists.txt"
-          "mysql-test/mtr.out-of-source"
-          "mysql-test/lib/My/SafeProcess/"
+        patterns = [
+          "/mysql-test/"
+          "!/mysql-test/CMakeLists.txt"
+          "!/mysql-test/mtr.out-of-source"
+          "!/mysql-test/lib/My/SafeProcess/"
         ];
         reason = "Unused by the selected targets. CMake still configures the retained files.";
       }
       {
-        paths = [
-          "unittest"
-          "extra/googletest"
+        patterns = [
+          "/unittest/"
+          "/extra/googletest/"
         ];
         reason = "Unused with WITH_UNIT_TESTS=OFF.";
       }
       {
-        paths = [ "router/" ];
-        keep = [
-          "router/src/harness/include/"
-          "router/LICENSE.router"
-          "router/README.router"
-          "router/src/harness/README.txt"
+        patterns = [
+          "/router/"
+          "!/router/src/harness/include/"
+          "!/router/LICENSE.router"
+          "!/router/README.router"
+          "!/router/src/harness/README.txt"
         ];
         reason = "Unused with WITH_ROUTER=OFF. Keep the headers CMake configures, their licence, and the Router and harness READMEs.";
       }
       {
-        paths = [ "storage/ndb" ];
+        patterns = [ "/storage/ndb/" ];
         reason = "Unused with WITH_NDB=OFF and WITH_NDBCLUSTER=OFF.";
       }
       {
-        paths = [ "plugin/group_replication" ];
+        patterns = [ "/plugin/group_replication/" ];
         reason = "Unused as the plugin has a separate build target.";
       }
       {
-        paths = [ "plugin/x" ];
+        patterns = [ "/plugin/x/" ];
         reason = "Unused with WITH_MYSQLX=OFF.";
       }
       {
-        paths = [ "extra/gperftools" ];
+        patterns = [ "/extra/gperftools/" ];
         reason = "Unused with WITH_TCMALLOC=OFF.";
       }
       {
-        paths = [ "extra/tirpc" ];
+        patterns = [ "/extra/tirpc/" ];
         reason = "Unused without WITH_TIRPC=bundled.";
       }
       {
-        paths = [ "extra/libedit" ];
+        patterns = [ "/extra/libedit/" ];
         reason = "Unused with WITH_EDITLINE=none.";
       }
       {
-        paths = [
-          "extra/libfido2"
-          "extra/libcbor"
+        patterns = [
+          "/extra/libfido2/"
+          "/extra/libcbor/"
         ];
         reason =
           if lib.hasPrefix "8.0." version then

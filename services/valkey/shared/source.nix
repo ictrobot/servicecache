@@ -18,29 +18,29 @@ sc.mkSource {
     inherit (pin) hash;
     selection.exclude = [
       {
-        paths = [
-          "tests"
+        patterns = [
+          "/tests/"
         ]
         ++ lib.optional (builtins.elem version [
           "8.1.9"
           "9.1.1"
-        ]) "src/unit"
-        ++ lib.optional (version == "9.1.1") "deps/libvalkey/tests";
+        ]) "/src/unit/"
+        ++ lib.optional (version == "9.1.1") "/deps/libvalkey/tests/";
         reason = "Unused as upstream tests are not built.";
       }
       {
-        paths = [ "deps/jemalloc" ];
+        patterns = [ "/deps/jemalloc/" ];
         reason = "Unused with MALLOC=libc.";
       }
       {
-        paths = [ "deps/lua/doc" ];
+        patterns = [ "/deps/lua/doc/" ];
         reason = "Unused by the library build.";
       }
     ]
     ++ lib.optional (version == "8.1.9") {
-      paths = [
-        "deps/fast_float"
-        "deps/fast_float_c_interface"
+      patterns = [
+        "/deps/fast_float/"
+        "/deps/fast_float_c_interface/"
       ];
       reason = "Unused with USE_FAST_FLOAT=no.";
     };

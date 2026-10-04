@@ -5,76 +5,9 @@
   ...
 }@args:
 let
-  clean =
-    path:
-    let
-      value = lib.removeSuffix "/" path;
-    in
-    if
-      builtins.match "[A-Za-z0-9._+/-]+" value == null
-      || lib.any (part: part == "." || part == ".." || part == "") (lib.splitString "/" value)
-    then
-      throw "invalid Git source selection path: ${path}"
-    else
-      value;
-  scope = map clean (selection.scope or [ ]);
-  parents =
-    path:
-    lib.init (
-      lib.imap0 (index: _: lib.concatStringsSep "/" (lib.take (index + 1) (lib.splitString "/" path))) (
-        lib.splitString "/" path
-      )
-    );
-  scopeParents = lib.unique (lib.concatMap parents scope);
-  # A limited scope also keeps files at the repository root and beside its parent directories.
-  scopePatterns =
-    if scope == [ ] then
-      [ "/*" ]
-    else
-      [
-        "/*"
-        "!/*/"
-      ]
-      ++ lib.concatMap (path: [
-        "/${path}/*"
-        "!/${path}/*/"
-      ]) scopeParents
-      ++ map (path: "/${path}/**") scope;
-  within = path: kept: kept == path || lib.hasPrefix "${path}/" kept;
-  exclusions = map (
-    rule:
-    let
-      paths = map clean rule.paths;
-      kept = map clean (rule.keep or [ ]);
-    in
-    if lib.all (keep: lib.any (path: within path keep) paths) kept then
-      { inherit paths kept; }
-    else
-      throw "Git source keep is outside its excluded paths"
-  ) (selection.exclude or [ ]);
-  excludedPatterns = lib.concatMap (
-    rule:
-    lib.concatMap (path: [
-      "!/${path}"
-      "!/${path}/**"
-    ]) rule.paths
-    ++ lib.concatMap (path: [
-      "/${path}"
-      "/${path}/**"
-    ]) rule.kept
-  ) exclusions;
-  shellArgs = values: lib.concatMapStringsSep " " lib.escapeShellArg values;
-  checkedPaths = lib.unique (
-    map (path: "${path}/") scope ++ lib.concatMap (rule: rule.paths ++ rule.kept) exclusions
-  );
-  sparseCheckout = scopePatterns ++ excludedPatterns;
+  selected = import ./selection.nix { inherit lib; } selection;
   checkout = ''
-    for path in ${shellArgs checkedPaths}; do
-      if ! GIT_NO_LAZY_FETCH=1 git -C "$out" ls-files --error-unmatch -- ":(literal)$path" >/dev/null 2>&1; then
-        echo "Git source selection path has no tracked files: $path" >&2
-        exit 1
-      fi
-    done
+    (cd "$out" && GIT_NO_LAZY_FETCH=1 bash ${./check-selection.sh} ${selected.checked})
     ${postCheckout}
   '';
   fetcherArgs =
@@ -83,7 +16,7 @@ let
       "postCheckout"
     ]
     // {
-      inherit sparseCheckout;
+      inherit (selected) sparseCheckout;
       nonConeMode = true;
       postCheckout = checkout;
       passthru = (args.passthru or { }) // {
