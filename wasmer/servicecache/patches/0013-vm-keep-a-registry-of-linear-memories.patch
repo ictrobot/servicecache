@@ -29,11 +29,11 @@ index 52770bf..6054d8f 100644
  pub use crate::mmap::{Mmap, MmapType};
  pub use crate::probestack::PROBESTACK;
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index c8aba95..6dc2c61 100644
+index d4b79f6..373bbab 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
-@@ -2,6 +2,10 @@
- // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
+@@ -6,6 +6,10 @@
+ // without its lock.
  //
  // Modified to add the ictrobot_shm_v1 extension for shared memory.
 +//
@@ -43,7 +43,7 @@ index c8aba95..6dc2c61 100644
  
  //! Memory management for linear memories.
  //!
-@@ -21,10 +25,109 @@ use std::cell::UnsafeCell;
+@@ -25,10 +29,109 @@ use std::cell::UnsafeCell;
  use std::convert::TryInto;
  use std::ptr::NonNull;
  use std::slice;
@@ -154,7 +154,7 @@ index c8aba95..6dc2c61 100644
  // The memory mapped area
  #[derive(Debug)]
  struct WasmMmap {
-@@ -186,7 +289,9 @@ impl WasmMmap {
+@@ -190,7 +293,9 @@ impl WasmMmap {
          }
          self.alloc
              .overlay_shared_file(start, len, file, file_offset)
@@ -165,7 +165,7 @@ index c8aba95..6dc2c61 100644
      }
  
      fn restore_private_anonymous(&mut self, start: u64, len: u64) -> Result<(), MemoryError> {
-@@ -204,7 +309,9 @@ impl WasmMmap {
+@@ -208,7 +313,9 @@ impl WasmMmap {
          }
          self.alloc
              .restore_private_anonymous(start, len)
@@ -176,7 +176,7 @@ index c8aba95..6dc2c61 100644
      }
  
      /// Copies the memory
-@@ -216,7 +323,7 @@ impl WasmMmap {
+@@ -220,7 +327,7 @@ impl WasmMmap {
              .copy(Some(mem_length))
              .map_err(MemoryError::Generic)?;
          let base_ptr = alloc.as_mut_ptr();
@@ -185,7 +185,7 @@ index c8aba95..6dc2c61 100644
              vm_memory_definition: MaybeInstanceOwned::Host(Box::new(UnsafeCell::new(
                  VMMemoryDefinition {
                      base: base_ptr,
-@@ -225,7 +332,16 @@ impl WasmMmap {
+@@ -229,7 +336,16 @@ impl WasmMmap {
              ))),
              alloc,
              size: self.size,
@@ -203,7 +203,7 @@ index c8aba95..6dc2c61 100644
      }
  }
  
-@@ -405,6 +521,7 @@ impl VMOwnedMemory {
+@@ -409,6 +525,7 @@ impl VMOwnedMemory {
              let mapped_pages = memory.minimum;
              let mapped_bytes = mapped_pages.bytes();
  
@@ -211,7 +211,7 @@ index c8aba95..6dc2c61 100644
              let mut alloc =
                  Mmap::accessible_reserved(mapped_bytes.0, request_bytes, backing_file, memory_type)
                      .map_err(MemoryError::Region)?;
-@@ -433,6 +550,7 @@ impl VMOwnedMemory {
+@@ -437,6 +554,7 @@ impl VMOwnedMemory {
                  alloc,
                  size: Bytes::from(mem_length).try_into().unwrap(),
              };

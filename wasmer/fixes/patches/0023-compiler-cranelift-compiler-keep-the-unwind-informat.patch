@@ -1,6 +1,6 @@
 Subject: compiler-cranelift, compiler: keep the unwind information of
  trampolines
-Last-Update: 2026-09-14
+Last-Update: 2026-10-04
 
 Cranelift describes the frames of the function call trampolines, through
 which the host calls into a module, and of the dynamic trampolines,
@@ -406,10 +406,19 @@ index 0684304..fb605d1 100644
  /// required against the function symbol, the personality routine and the LSDA.
  ///
 diff --git a/lib/compiler-cranelift/src/trampoline/dynamic_function.rs b/lib/compiler-cranelift/src/trampoline/dynamic_function.rs
-index 8a89cd5..ec9320d 100644
+index 8a89cd5..c4fc970 100644
 --- a/lib/compiler-cranelift/src/trampoline/dynamic_function.rs
 +++ b/lib/compiler-cranelift/src/trampoline/dynamic_function.rs
-@@ -15,12 +15,12 @@ use cranelift_codegen::{
+@@ -1,5 +1,8 @@
+ // This file contains code from external sources.
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
++//
++// Modified for ServiceCache: the trampoline keeps its System V unwind
++// information.
+ 
+ //! A trampoline generator for calling dynamic host functions from Wasm.
+ 
+@@ -15,12 +18,12 @@ use cranelift_codegen::{
  use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
  use std::{cmp, mem};
  use target_lexicon::Architecture;
@@ -424,7 +433,7 @@ index 8a89cd5..ec9320d 100644
      callbacks: &Option<CraneliftCallbacks>,
      isa: &dyn TargetIsa,
      arch: Architecture,
-@@ -29,7 +29,7 @@ pub fn make_trampoline_dynamic_function(
+@@ -29,7 +32,7 @@ pub fn make_trampoline_dynamic_function(
      kind: &CompiledKind,
      func_type: &FunctionType,
      module_hash: &Option<String>,
@@ -433,7 +442,7 @@ index 8a89cd5..ec9320d 100644
      let pointer_type = isa.pointer_type();
      let frontend_config = isa.frontend_config();
      let signature = signature_to_cranelift_ir(func_type, frontend_config, arch);
-@@ -157,10 +157,8 @@ pub fn make_trampoline_dynamic_function(
+@@ -157,10 +160,8 @@ pub fn make_trampoline_dynamic_function(
          callbacks.asm_memory_buffer(kind, module_hash, arch, &code_buf)?;
      }
  
@@ -449,10 +458,19 @@ index 8a89cd5..ec9320d 100644
 +    ))
  }
 diff --git a/lib/compiler-cranelift/src/trampoline/function_call.rs b/lib/compiler-cranelift/src/trampoline/function_call.rs
-index e21f1ba..35914b4 100644
+index e21f1ba..0a8e5b7 100644
 --- a/lib/compiler-cranelift/src/trampoline/function_call.rs
 +++ b/lib/compiler-cranelift/src/trampoline/function_call.rs
-@@ -33,6 +33,27 @@ pub fn make_trampoline_function_call(
+@@ -1,5 +1,8 @@
+ // This file contains code from external sources.
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
++//
++// Modified for ServiceCache: the trampoline keeps its System V unwind
++// information.
+ 
+ //! A trampoline generator for calling Wasm functions easily.
+ //!
+@@ -33,6 +36,27 @@ pub fn make_trampoline_function_call(
      func_type: &FunctionType,
      module_hash: &Option<String>,
  ) -> Result<FunctionBody, CompileError> {
@@ -480,7 +498,7 @@ index e21f1ba..35914b4 100644
      let pointer_type = isa.pointer_type();
      let frontend_config = isa.frontend_config();
      let signature = signature_to_cranelift_ir(func_type, frontend_config, arch);
-@@ -147,10 +168,8 @@ pub fn make_trampoline_function_call(
+@@ -147,10 +171,8 @@ pub fn make_trampoline_function_call(
          callbacks.asm_memory_buffer(kind, module_hash, arch, &code_buf)?;
      }
  

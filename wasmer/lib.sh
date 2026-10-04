@@ -28,6 +28,28 @@ sc_wasmer_dev_sets() {
   echo "jitdump servicecache wasmer/servicecache/patches"
 }
 
+# sc_wasmer_check_notices <checkout> <from> <to>: fail unless every file
+# that a commit in from..to modifies, and that Wasmer marks as containing
+# code from external sources, carries a change notice after that commit.
+sc_wasmer_check_notices() {
+  local checkout="$1" from="$2" to="$3" commit commits file files content status=0
+  commits="$(git -C "$checkout" rev-list --reverse "$from..$to")" || return 1
+  for commit in $commits; do
+    files="$(git -C "$checkout" diff --name-only --diff-filter=M "$commit^" "$commit")" || return 1
+    while IFS= read -r file; do
+      [[ -n "$file" ]] || continue
+      content="$(git -C "$checkout" show "$commit^:$file")" || return 1
+      grep -qF 'This file contains code from external sources' <<< "$content" || continue
+      content="$(git -C "$checkout" show "$commit:$file")" || return 1
+      if ! grep -qE '^// Modified (for ServiceCache|to add the [^ ]+ extension)' <<< "$content"; then
+        echo "$to: ${commit:0:7} modifies $file, which has no change notice" >&2
+        status=1
+      fi
+    done <<< "$files"
+  done
+  return "$status"
+}
+
 # sc_wasmer_patch_date <previous> <current> <today>: the date an exported
 # patch carries. It keeps the date of the previous file of the same name
 # while their sc_patch_content matches, and is today otherwise.

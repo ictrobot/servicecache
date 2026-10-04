@@ -169,18 +169,19 @@ index 89894b1..abefc9e 100644
  maintenance = { status = "actively-developed" }
  
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index 801b6b5..c8aba95 100644
+index 2b0738c..d4b79f6 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
-@@ -1,5 +1,7 @@
- // This file contains code from external sources.
- // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
+@@ -4,6 +4,8 @@
+ // Modified for ServiceCache: a memory that could move under code that
+ // assumes it cannot is refused, and a shared memory's definition is read
+ // without its lock.
 +//
 +// Modified to add the ictrobot_shm_v1 extension for shared memory.
  
  //! Memory management for linear memories.
  //!
-@@ -96,6 +98,11 @@ impl WasmMmap {
+@@ -100,6 +102,11 @@ impl WasmMmap {
          if new_bytes > self.alloc.len() - conf.offset_guard_size {
              // If the new size is within the declared maximum, but needs more memory than we
              // have on hand, it's a dynamic heap and it can move.
@@ -192,7 +193,7 @@ index 801b6b5..c8aba95 100644
              let guard_bytes = conf.offset_guard_size;
              let request_bytes =
                  new_bytes
-@@ -158,6 +165,48 @@ impl WasmMmap {
+@@ -162,6 +169,48 @@ impl WasmMmap {
          Ok(())
      }
  
@@ -241,7 +242,7 @@ index 801b6b5..c8aba95 100644
      /// Copies the memory
      /// (in this case it performs a copy-on-write to save memory)
      pub fn copy(&self) -> Result<Self, MemoryError> {
-@@ -484,6 +533,20 @@ impl LinearMemory for VMOwnedMemory {
+@@ -488,6 +537,20 @@ impl LinearMemory for VMOwnedMemory {
      fn as_shared(&self) -> Result<VMSharedMemory, MemoryError> {
          Err(MemoryError::MemoryNotShared)
      }
@@ -262,7 +263,7 @@ index 801b6b5..c8aba95 100644
  }
  
  /// A shared linear memory instance.
-@@ -589,6 +652,28 @@ impl VMSharedMemory {
+@@ -593,6 +656,28 @@ impl VMSharedMemory {
              conditions: ThreadConditions::new(),
          })
      }
@@ -291,7 +292,7 @@ index 801b6b5..c8aba95 100644
  }
  
  impl LinearMemory for VMSharedMemory {
-@@ -672,6 +757,20 @@ impl LinearMemory for VMSharedMemory {
+@@ -676,6 +761,20 @@ impl LinearMemory for VMSharedMemory {
          Ok(self.clone())
      }
  
@@ -312,7 +313,7 @@ index 801b6b5..c8aba95 100644
      // Add current thread to waiter list
      unsafe fn do_wait(
          &mut self,
-@@ -782,6 +881,20 @@ impl LinearMemory for VMMemory {
+@@ -786,6 +885,20 @@ impl LinearMemory for VMMemory {
          self.0.as_shared()
      }
  
@@ -333,7 +334,7 @@ index 801b6b5..c8aba95 100644
      // Add current thread to waiter list
      unsafe fn do_wait(
          &mut self,
-@@ -960,6 +1073,26 @@ where
+@@ -964,6 +1077,26 @@ where
          Err(MemoryError::MemoryNotShared)
      }
  

@@ -1,5 +1,5 @@
 Subject: vm: read a shared memory's definition without its lock
-Last-Update: 2026-09-11
+Last-Update: 2026-10-04
 
 Every host call that reaches into guest memory builds a MemoryView, and
 building one asked the memory for its size and then for its definition.
@@ -71,10 +71,20 @@ index 8ccf7bb..017c0ac 100644
  
          Self {
 diff --git a/lib/sys-utils/src/memory/fd_memory/memories.rs b/lib/sys-utils/src/memory/fd_memory/memories.rs
-index 359cabc..3e642a4 100644
+index 23473df..59cebfa 100644
 --- a/lib/sys-utils/src/memory/fd_memory/memories.rs
 +++ b/lib/sys-utils/src/memory/fd_memory/memories.rs
-@@ -346,8 +346,10 @@ impl VMOwnedMemory {
+@@ -5,7 +5,8 @@
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
+ //
+ // Modified for ServiceCache: a memory that could move under code that
+-// assumes it cannot is refused.
++// assumes it cannot is refused, and a shared memory's definition is read
++// without its lock.
+ 
+ use std::{
+     cell::UnsafeCell,
+@@ -349,8 +350,10 @@ impl VMOwnedMemory {
                  reason: "a shared memory must be static, so that it never moves".to_string(),
              });
          }
@@ -85,7 +95,7 @@ index 359cabc..3e642a4 100644
              config: self.config,
              conditions: ThreadConditions::new(),
          })
-@@ -420,11 +422,23 @@ impl LinearMemory for VMOwnedMemory {
+@@ -423,11 +426,23 @@ impl LinearMemory for VMOwnedMemory {
  pub struct VMSharedMemory {
      // The underlying allocation.
      mmap: Arc<RwLock<WasmMmap>>,
@@ -109,7 +119,7 @@ index 359cabc..3e642a4 100644
  impl VMSharedMemory {
      /// Create a new linear memory instance with specified minimum and maximum number of wasm pages.
      ///
-@@ -453,8 +467,11 @@ impl VMSharedMemory {
+@@ -456,8 +471,11 @@ impl VMSharedMemory {
      /// Copies this memory to a new memory
      pub fn copy(&self) -> Result<Self, MemoryError> {
          let guard = self.mmap.read().unwrap();
@@ -122,7 +132,7 @@ index 359cabc..3e642a4 100644
              config: self.config.clone(),
              conditions: ThreadConditions::new(),
          })
-@@ -464,17 +481,14 @@ impl VMSharedMemory {
+@@ -467,17 +485,14 @@ impl VMSharedMemory {
  impl LinearMemory for VMSharedMemory {
      /// Returns the type for this memory.
      fn ty(&self) -> MemoryType {
@@ -144,7 +154,7 @@ index 359cabc..3e642a4 100644
      }
  
      /// Resets the memory back down to zero size
-@@ -506,9 +520,16 @@ impl LinearMemory for VMSharedMemory {
+@@ -509,9 +524,16 @@ impl LinearMemory for VMSharedMemory {
      }
  
      /// Return a `VMMemoryDefinition` for exposing the memory to compiled wasm code.
@@ -163,7 +173,7 @@ index 359cabc..3e642a4 100644
      }
  
      /// Shared memory can always be cloned
-@@ -612,6 +633,10 @@ impl LinearMemory for VMMemory {
+@@ -615,6 +637,10 @@ impl LinearMemory for VMMemory {
          self.0.vmmemory()
      }
  
@@ -174,7 +184,7 @@ index 359cabc..3e642a4 100644
      /// Attempts to clone this memory (if its cloneable)
      fn try_clone(&self) -> Result<Box<dyn LinearMemory + Send + Sync + 'static>, MemoryError> {
          self.0.try_clone()
-@@ -758,4 +783,46 @@ mod tests {
+@@ -761,4 +787,46 @@ mod tests {
              Ok(_) => panic!("a dynamic shared memory was made"),
          }
      }
@@ -222,10 +232,20 @@ index 359cabc..3e642a4 100644
 +    }
  }
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index 6d2c6d4..801b6b5 100644
+index 75f15d9..2b0738c 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
-@@ -408,8 +408,10 @@ impl VMOwnedMemory {
+@@ -2,7 +2,8 @@
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
+ //
+ // Modified for ServiceCache: a memory that could move under code that
+-// assumes it cannot is refused.
++// assumes it cannot is refused, and a shared memory's definition is read
++// without its lock.
+ 
+ //! Memory management for linear memories.
+ //!
+@@ -411,8 +412,10 @@ impl VMOwnedMemory {
                  reason: "a shared memory must be static, so that it never moves".to_string(),
              });
          }
@@ -236,7 +256,7 @@ index 6d2c6d4..801b6b5 100644
              config: self.config,
              conditions: ThreadConditions::new(),
          })
-@@ -489,12 +491,25 @@ impl LinearMemory for VMOwnedMemory {
+@@ -492,12 +495,25 @@ impl LinearMemory for VMOwnedMemory {
  pub struct VMSharedMemory {
      // The underlying allocation.
      mmap: Arc<RwLock<WasmMmap>>,
@@ -262,7 +282,7 @@ index 6d2c6d4..801b6b5 100644
  impl VMSharedMemory {
      /// Create a new linear memory instance with specified minimum and maximum number of wasm pages.
      ///
-@@ -565,8 +580,11 @@ impl VMSharedMemory {
+@@ -568,8 +584,11 @@ impl VMSharedMemory {
      /// Copies this memory to a new memory
      pub fn copy(&self) -> Result<Self, MemoryError> {
          let guard = self.mmap.read().unwrap();
@@ -275,7 +295,7 @@ index 6d2c6d4..801b6b5 100644
              config: self.config.clone(),
              conditions: ThreadConditions::new(),
          })
-@@ -576,17 +594,14 @@ impl VMSharedMemory {
+@@ -579,17 +598,14 @@ impl VMSharedMemory {
  impl LinearMemory for VMSharedMemory {
      /// Returns the type for this memory.
      fn ty(&self) -> MemoryType {
@@ -297,7 +317,7 @@ index 6d2c6d4..801b6b5 100644
      }
  
      /// Returns the memory style for this memory.
-@@ -618,9 +633,27 @@ impl LinearMemory for VMSharedMemory {
+@@ -621,9 +637,27 @@ impl LinearMemory for VMSharedMemory {
      }
  
      /// Return a `VMMemoryDefinition` for exposing the memory to compiled wasm code.
@@ -327,7 +347,7 @@ index 6d2c6d4..801b6b5 100644
      }
  
      /// Shared memory can always be cloned
-@@ -726,6 +759,10 @@ impl LinearMemory for VMMemory {
+@@ -729,6 +763,10 @@ impl LinearMemory for VMMemory {
          self.0.vmmemory()
      }
  
@@ -338,7 +358,7 @@ index 6d2c6d4..801b6b5 100644
      /// Attempts to clone this memory (if its cloneable)
      fn try_clone(&self) -> Result<Box<dyn LinearMemory + Send + Sync + 'static>, MemoryError> {
          self.0.try_clone()
-@@ -890,6 +927,16 @@ where
+@@ -893,6 +931,16 @@ where
      /// Return a `VMMemoryDefinition` for exposing the memory to compiled wasm code.
      fn vmmemory(&self) -> NonNull<VMMemoryDefinition>;
  
@@ -355,7 +375,7 @@ index 6d2c6d4..801b6b5 100644
      /// Attempts to clone this memory (if its cloneable)
      fn try_clone(&self) -> Result<Box<dyn LinearMemory + Send + Sync + 'static>, MemoryError>;
  
-@@ -999,4 +1046,92 @@ mod tests {
+@@ -1002,4 +1050,92 @@ mod tests {
              Ok(_) => panic!("a dynamic shared memory was made"),
          }
      }

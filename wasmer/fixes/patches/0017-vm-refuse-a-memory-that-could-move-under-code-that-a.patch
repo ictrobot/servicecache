@@ -1,5 +1,5 @@
 Subject: vm: refuse a memory that could move under code that assumes it cannot
-Last-Update: 2026-09-11
+Last-Update: 2026-10-04
 
 A memory moves to a new allocation whenever it grows past what it
 reserved, whatever its style: a dynamic memory reserves only what it
@@ -35,10 +35,20 @@ being accepted, and a dynamic memory being accepted as owned and
 refused as shared.
 
 diff --git a/lib/sys-utils/src/memory/fd_memory/memories.rs b/lib/sys-utils/src/memory/fd_memory/memories.rs
-index e8ffd43..359cabc 100644
+index e8ffd43..23473df 100644
 --- a/lib/sys-utils/src/memory/fd_memory/memories.rs
 +++ b/lib/sys-utils/src/memory/fd_memory/memories.rs
-@@ -273,6 +273,22 @@ impl VMOwnedMemory {
+@@ -3,6 +3,9 @@
+ //! `Memory` is to WebAssembly linear memories what `Table` is to WebAssembly tables.
+ // This file contains code from external sources.
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
++//
++// Modified for ServiceCache: a memory that could move under code that
++// assumes it cannot is refused.
+ 
+ use std::{
+     cell::UnsafeCell,
+@@ -273,6 +276,22 @@ impl VMOwnedMemory {
  
          let offset_guard_bytes = style.offset_guard_size() as usize;
  
@@ -61,7 +71,7 @@ index e8ffd43..359cabc 100644
          let minimum_pages = match style {
              MemoryStyle::Dynamic { .. } => memory.minimum,
              MemoryStyle::Static { bound, .. } => {
-@@ -320,12 +336,21 @@ impl VMOwnedMemory {
+@@ -320,12 +339,21 @@ impl VMOwnedMemory {
      }
  
      /// Converts this owned memory into shared memory
@@ -86,7 +96,7 @@ index e8ffd43..359cabc 100644
      }
  
      /// Copies this memory to a new memory
-@@ -406,7 +431,7 @@ impl VMSharedMemory {
+@@ -406,7 +434,7 @@ impl VMSharedMemory {
      /// This creates a `Memory` with owned metadata: this can be used to create a memory
      /// that will be imported into Wasm modules.
      pub fn new(memory: &MemoryType, style: &MemoryStyle) -> Result<Self, MemoryError> {
@@ -95,7 +105,7 @@ index e8ffd43..359cabc 100644
      }
  
      /// Create a new linear memory instance with specified minimum and maximum number of wasm pages.
-@@ -422,7 +447,7 @@ impl VMSharedMemory {
+@@ -422,7 +450,7 @@ impl VMSharedMemory {
          vm_memory_location: NonNull<VMMemoryDefinition>,
      ) -> Result<Self, MemoryError> {
          let owned = unsafe { VMOwnedMemory::from_definition(memory, style, vm_memory_location)? };
@@ -104,7 +114,7 @@ index e8ffd43..359cabc 100644
      }
  
      /// Copies this memory to a new memory
-@@ -676,3 +701,61 @@ pub unsafe fn initialize_memory_with_data(
+@@ -676,3 +704,61 @@ pub unsafe fn initialize_memory_with_data(
  
      Ok(())
  }
@@ -167,10 +177,19 @@ index e8ffd43..359cabc 100644
 +    }
 +}
 diff --git a/lib/vm/src/memory.rs b/lib/vm/src/memory.rs
-index de28f44..6d2c6d4 100644
+index de28f44..75f15d9 100644
 --- a/lib/vm/src/memory.rs
 +++ b/lib/vm/src/memory.rs
-@@ -328,6 +328,22 @@ impl VMOwnedMemory {
+@@ -1,5 +1,8 @@
+ // This file contains code from external sources.
+ // Attributions: https://github.com/wasmerio/wasmer/blob/main/docs/ATTRIBUTIONS.md
++//
++// Modified for ServiceCache: a memory that could move under code that
++// assumes it cannot is refused.
+ 
+ //! Memory management for linear memories.
+ //!
+@@ -328,6 +331,22 @@ impl VMOwnedMemory {
  
              let offset_guard_bytes = style.offset_guard_size() as usize;
  
@@ -193,7 +212,7 @@ index de28f44..6d2c6d4 100644
              let minimum_pages = match style {
                  MemoryStyle::Dynamic { .. } => memory.minimum,
                  MemoryStyle::Static { bound, .. } => {
-@@ -382,12 +398,21 @@ impl VMOwnedMemory {
+@@ -382,12 +401,21 @@ impl VMOwnedMemory {
      }
  
      /// Converts this owned memory into shared memory
@@ -218,7 +237,7 @@ index de28f44..6d2c6d4 100644
      }
  
      /// Copies this memory to a new memory
-@@ -476,7 +501,7 @@ impl VMSharedMemory {
+@@ -476,7 +504,7 @@ impl VMSharedMemory {
      /// This creates a `Memory` with owned metadata: this can be used to create a memory
      /// that will be imported into Wasm modules.
      pub fn new(memory: &MemoryType, style: &MemoryStyle) -> Result<Self, MemoryError> {
@@ -227,7 +246,7 @@ index de28f44..6d2c6d4 100644
      }
  
      /// Create a new linear memory instance with specified minimum and maximum number of wasm pages
-@@ -491,7 +516,7 @@ impl VMSharedMemory {
+@@ -491,7 +519,7 @@ impl VMSharedMemory {
          backing_file: std::path::PathBuf,
          memory_type: MmapType,
      ) -> Result<Self, MemoryError> {
@@ -236,7 +255,7 @@ index de28f44..6d2c6d4 100644
      }
  
      /// Create a new linear memory instance with specified minimum and maximum number of wasm pages.
-@@ -506,9 +531,7 @@ impl VMSharedMemory {
+@@ -506,9 +534,7 @@ impl VMSharedMemory {
          style: &MemoryStyle,
          vm_memory_location: NonNull<VMMemoryDefinition>,
      ) -> Result<Self, MemoryError> {
@@ -247,7 +266,7 @@ index de28f44..6d2c6d4 100644
      }
  
      /// Create a new linear memory instance with specified minimum and maximum number of wasm pages
-@@ -528,14 +551,14 @@ impl VMSharedMemory {
+@@ -528,14 +554,14 @@ impl VMSharedMemory {
          memory_type: MmapType,
      ) -> Result<Self, MemoryError> {
          unsafe {
@@ -264,7 +283,7 @@ index de28f44..6d2c6d4 100644
          }
      }
  
-@@ -919,3 +942,61 @@ where
+@@ -919,3 +945,61 @@ where
          None
      }
  }

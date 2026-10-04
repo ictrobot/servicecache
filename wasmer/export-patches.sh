@@ -12,5 +12,6 @@ source "$root/wasmer/lib.sh"
 checkout="${1:-$root/work/wasmer-dev}"
 
 while read -r from to set_dir; do
+  sc_wasmer_check_notices "$checkout" "$from" "$to"
   sc_wasmer_export_range "$checkout" "$from" "$to" "$root/$set_dir"
 done < <(sc_wasmer_dev_sets)
