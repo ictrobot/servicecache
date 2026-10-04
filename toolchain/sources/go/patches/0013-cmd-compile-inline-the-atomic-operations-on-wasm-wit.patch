@@ -1,0 +1,905 @@
+Subject: cmd/compile: inline the atomic operations on wasm with GOWASM=threads
+Last-Update: 2026-10-04
+
+The wasm backend had no atomic operations, so every call into
+internal/runtime/atomic and sync/atomic stayed a call to an assembly
+body, each with a frame, on the runtime's hottest paths. With
+GOWASM=threads the atomic intrinsics are registered for wasm with the
+builders the other 64-bit ports use, and the generic atomic ops lower
+to the threads proposal's load, store, exchange, add, and, or and
+compare-exchange instructions. A read-modify-write yields the old
+value, so a sum or a comparison is rewritten in on the way out of the
+tuple, as amd64 does. Address 0 does not trap in wasm, so each lowered
+op first checks its address and raises the nil dereference panic the
+compiler's own nil check raises; the ops therefore fault on nil as the
+other ports' do, and the explicit checks before them can go. Without
+the feature the calls stay, as a module for an engine without threads
+cannot carry the instructions.
+
+diff --git a/src/cmd/compile/internal/ssa/_gen/Wasm.rules b/src/cmd/compile/internal/ssa/_gen/Wasm.rules
+index 6028152..319a168 100644
+--- a/src/cmd/compile/internal/ssa/_gen/Wasm.rules
++++ b/src/cmd/compile/internal/ssa/_gen/Wasm.rules
+@@ -268,6 +268,41 @@
+ (Move [s] dst src mem) && logLargeCopy(v, s) =>
+ 	(LoweredMove [s] dst src mem)
+ 
++// Lowering atomics
++// Present only with GOWASM=threads, when the compiler inlines the
++// atomic operations: the threads proposal's instructions. A read-modify-write
++// returns the old value, so a sum or a comparison is rewritten in on the
++// way out of the tuple, as on amd64.
++(AtomicLoad8 ...) => (I64AtomicLoad8U ...)
++(AtomicLoad32 ...) => (I64AtomicLoad32U ...)
++(AtomicLoad64 ...) => (I64AtomicLoad ...)
++(AtomicLoadPtr ...) => (I64AtomicLoad ...)
++(AtomicStore8 ...) => (I64AtomicStore8 ...)
++(AtomicStore32 ...) => (I64AtomicStore32 ...)
++(AtomicStore64 ...) => (I64AtomicStore ...)
++(AtomicStorePtrNoWB ...) => (I64AtomicStore ...)
++(AtomicExchange8 ...) => (I64AtomicRmw8XchgU ...)
++(AtomicExchange32 ...) => (I64AtomicRmw32XchgU ...)
++(AtomicExchange64 ...) => (I64AtomicRmwXchg ...)
++(AtomicAdd32 ptr val mem) => (AddTupleFirst val (I64AtomicRmw32AddU ptr val mem))
++(AtomicAdd64 ptr val mem) => (AddTupleFirst val (I64AtomicRmwAdd ptr val mem))
++(Select0 <t> (AddTupleFirst val tuple)) => (I64Add val (Select0 <t> tuple))
++(Select1     (AddTupleFirst   _ tuple)) => (Select1 tuple)
++(AtomicCompareAndSwap32 ptr old new_ mem) => (EqTupleFirst32 old (I64AtomicRmw32CmpxchgU ptr old new_ mem))
++(AtomicCompareAndSwap64 ptr old new_ mem) => (EqTupleFirst64 old (I64AtomicRmwCmpxchg ptr old new_ mem))
++(Select0 <t> (EqTupleFirst32 old tuple)) => (I64Eq <t> (ZeroExt32to64 old) (Select0 <typ.UInt32> tuple))
++(Select1     (EqTupleFirst32   _ tuple)) => (Select1 tuple)
++(Select0 <t> (EqTupleFirst64 old tuple)) => (I64Eq <t> old (Select0 <typ.UInt64> tuple))
++(Select1     (EqTupleFirst64   _ tuple)) => (Select1 tuple)
++(AtomicAnd8  ptr val mem) => (Select1 (I64AtomicRmw8AndU  <types.NewTuple(typ.UInt8, types.TypeMem)> ptr val mem))
++(AtomicAnd32 ptr val mem) => (Select1 (I64AtomicRmw32AndU <types.NewTuple(typ.UInt32, types.TypeMem)> ptr val mem))
++(AtomicOr8   ptr val mem) => (Select1 (I64AtomicRmw8OrU   <types.NewTuple(typ.UInt8, types.TypeMem)> ptr val mem))
++(AtomicOr32  ptr val mem) => (Select1 (I64AtomicRmw32OrU  <types.NewTuple(typ.UInt32, types.TypeMem)> ptr val mem))
++(AtomicAnd32value ...) => (I64AtomicRmw32AndU ...)
++(AtomicAnd64value ...) => (I64AtomicRmwAnd ...)
++(AtomicOr32value  ...) => (I64AtomicRmw32OrU ...)
++(AtomicOr64value  ...) => (I64AtomicRmwOr ...)
++
+ // Lowering Zero instructions
+ (Zero [0] _ mem) => mem
+ (Zero [1] destptr mem) => (I64Store8 destptr (I64Const [0]) mem)
+diff --git a/src/cmd/compile/internal/ssa/_gen/WasmOps.go b/src/cmd/compile/internal/ssa/_gen/WasmOps.go
+index 8457f02..0dbfa85 100644
+--- a/src/cmd/compile/internal/ssa/_gen/WasmOps.go
++++ b/src/cmd/compile/internal/ssa/_gen/WasmOps.go
+@@ -117,6 +117,8 @@ func init() {
+ 		fp32store = regInfo{inputs: []regMask{gpspsb, fp32, 0}}
+ 		fp64load  = regInfo{inputs: []regMask{gpspsb, 0}, outputs: []regMask{fp64}}
+ 		fp64store = regInfo{inputs: []regMask{gpspsb, fp64, 0}}
++		gprmw     = regInfo{inputs: []regMask{gpspsb, gpsp, 0}, outputs: []regMask{gp}}
++		gpcas     = regInfo{inputs: []regMask{gpspsb, gpsp, gpsp, 0}, outputs: []regMask{gp}}
+ 	)
+ 
+ 	var WasmOps = []opData{
+@@ -148,6 +150,31 @@ func init() {
+ 
+ 		{name: "Select", asm: "Select", argLength: 3, reg: gp31}, // returns arg0 if arg2 != 0, otherwise returns arg1
+ 
++		// The threads proposal's atomic instructions, used with GOWASM=threads. Each accesses
++		// address arg0 with no offset and is sequentially consistent.
++		{name: "I64AtomicLoad8U", asm: "I64AtomicLoad8U", argLength: 2, reg: gpload, typ: "(UInt8,Mem)", faultOnNilArg0: true},                                     // atomic read of an unsigned 8-bit integer, arg1=mem, returns the value and mem
++		{name: "I64AtomicLoad32U", asm: "I64AtomicLoad32U", argLength: 2, reg: gpload, typ: "(UInt32,Mem)", faultOnNilArg0: true},                                  // atomic read of an unsigned 32-bit integer, arg1=mem, returns the value and mem
++		{name: "I64AtomicLoad", asm: "I64AtomicLoad", argLength: 2, reg: gpload, typ: "(UInt64,Mem)", faultOnNilArg0: true},                                        // atomic read of a 64-bit integer, arg1=mem, returns the value and mem
++		{name: "I64AtomicStore8", asm: "I64AtomicStore8", argLength: 3, reg: gpstore, typ: "Mem", faultOnNilArg0: true, hasSideEffects: true},                      // atomic store of the low 8 bits of arg1, arg2=mem, returns mem
++		{name: "I64AtomicStore32", asm: "I64AtomicStore32", argLength: 3, reg: gpstore, typ: "Mem", faultOnNilArg0: true, hasSideEffects: true},                    // atomic store of the low 32 bits of arg1, arg2=mem, returns mem
++		{name: "I64AtomicStore", asm: "I64AtomicStore", argLength: 3, reg: gpstore, typ: "Mem", faultOnNilArg0: true, hasSideEffects: true},                        // atomic store of arg1, arg2=mem, returns mem
++		{name: "I64AtomicRmw8XchgU", asm: "I64AtomicRmw8XchgU", argLength: 3, reg: gprmw, typ: "(UInt8,Mem)", faultOnNilArg0: true, hasSideEffects: true},          // store the low 8 bits of arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmw32XchgU", asm: "I64AtomicRmw32XchgU", argLength: 3, reg: gprmw, typ: "(UInt32,Mem)", faultOnNilArg0: true, hasSideEffects: true},       // store the low 32 bits of arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmwXchg", asm: "I64AtomicRmwXchg", argLength: 3, reg: gprmw, typ: "(UInt64,Mem)", faultOnNilArg0: true, hasSideEffects: true},             // store arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmw32AddU", asm: "I64AtomicRmw32AddU", argLength: 3, reg: gprmw, typ: "(UInt32,Mem)", faultOnNilArg0: true, hasSideEffects: true},         // *arg0 += low 32 bits of arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmwAdd", asm: "I64AtomicRmwAdd", argLength: 3, reg: gprmw, typ: "(UInt64,Mem)", faultOnNilArg0: true, hasSideEffects: true},               // *arg0 += arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmw8AndU", asm: "I64AtomicRmw8AndU", argLength: 3, reg: gprmw, typ: "(UInt8,Mem)", faultOnNilArg0: true, hasSideEffects: true},            // *arg0 &= low 8 bits of arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmw32AndU", asm: "I64AtomicRmw32AndU", argLength: 3, reg: gprmw, typ: "(UInt32,Mem)", faultOnNilArg0: true, hasSideEffects: true},         // *arg0 &= low 32 bits of arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmwAnd", asm: "I64AtomicRmwAnd", argLength: 3, reg: gprmw, typ: "(UInt64,Mem)", faultOnNilArg0: true, hasSideEffects: true},               // *arg0 &= arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmw8OrU", asm: "I64AtomicRmw8OrU", argLength: 3, reg: gprmw, typ: "(UInt8,Mem)", faultOnNilArg0: true, hasSideEffects: true},              // *arg0 |= low 8 bits of arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmw32OrU", asm: "I64AtomicRmw32OrU", argLength: 3, reg: gprmw, typ: "(UInt32,Mem)", faultOnNilArg0: true, hasSideEffects: true},           // *arg0 |= low 32 bits of arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmwOr", asm: "I64AtomicRmwOr", argLength: 3, reg: gprmw, typ: "(UInt64,Mem)", faultOnNilArg0: true, hasSideEffects: true},                 // *arg0 |= arg1, arg2=mem, returns the old value and mem
++		{name: "I64AtomicRmw32CmpxchgU", asm: "I64AtomicRmw32CmpxchgU", argLength: 4, reg: gpcas, typ: "(UInt32,Mem)", faultOnNilArg0: true, hasSideEffects: true}, // if the low 32 bits of *arg0 == arg1, store the low 32 bits of arg2; arg3=mem, returns the old value and mem
++		{name: "I64AtomicRmwCmpxchg", asm: "I64AtomicRmwCmpxchg", argLength: 4, reg: gpcas, typ: "(UInt64,Mem)", faultOnNilArg0: true, hasSideEffects: true},       // if *arg0 == arg1, store arg2; arg3=mem, returns the old value and mem
++		{name: "AddTupleFirst", argLength: 2},  // arg1=tuple <x,y>. Returns <x+arg0,y>. Rewritten away before codegen.
++		{name: "EqTupleFirst32", argLength: 2}, // arg1=tuple <x,y>. Returns <x==arg0 in 32 bits,y>. Rewritten away before codegen.
++		{name: "EqTupleFirst64", argLength: 2}, // arg1=tuple <x,y>. Returns <x==arg0,y>. Rewritten away before codegen.
++
+ 		{name: "I64Load8U", asm: "I64Load8U", argLength: 2, reg: gpload, aux: "Int64", typ: "UInt8", addrSinkArg0: true},    // read unsigned 8-bit integer from address arg0+aux, arg1=mem
+ 		{name: "I64Load8S", asm: "I64Load8S", argLength: 2, reg: gpload, aux: "Int64", typ: "Int8", addrSinkArg0: true},     // read signed 8-bit integer from address arg0+aux, arg1=mem
+ 		{name: "I64Load16U", asm: "I64Load16U", argLength: 2, reg: gpload, aux: "Int64", typ: "UInt16", addrSinkArg0: true}, // read unsigned 16-bit integer from address arg0+aux, arg1=mem
+diff --git a/src/cmd/compile/internal/ssa/opGen.go b/src/cmd/compile/internal/ssa/opGen.go
+index e54be43..4705d03 100644
+--- a/src/cmd/compile/internal/ssa/opGen.go
++++ b/src/cmd/compile/internal/ssa/opGen.go
+@@ -5617,6 +5617,28 @@ const (
+ 	OpWasmLoweredWB
+ 	OpWasmLoweredConvert
+ 	OpWasmSelect
++	OpWasmI64AtomicLoad8U
++	OpWasmI64AtomicLoad32U
++	OpWasmI64AtomicLoad
++	OpWasmI64AtomicStore8
++	OpWasmI64AtomicStore32
++	OpWasmI64AtomicStore
++	OpWasmI64AtomicRmw8XchgU
++	OpWasmI64AtomicRmw32XchgU
++	OpWasmI64AtomicRmwXchg
++	OpWasmI64AtomicRmw32AddU
++	OpWasmI64AtomicRmwAdd
++	OpWasmI64AtomicRmw8AndU
++	OpWasmI64AtomicRmw32AndU
++	OpWasmI64AtomicRmwAnd
++	OpWasmI64AtomicRmw8OrU
++	OpWasmI64AtomicRmw32OrU
++	OpWasmI64AtomicRmwOr
++	OpWasmI64AtomicRmw32CmpxchgU
++	OpWasmI64AtomicRmwCmpxchg
++	OpWasmAddTupleFirst
++	OpWasmEqTupleFirst32
++	OpWasmEqTupleFirst64
+ 	OpWasmI64Load8U
+ 	OpWasmI64Load8S
+ 	OpWasmI64Load16U
+@@ -85895,6 +85917,312 @@ var opcodeTable = [...]opInfo{
+ 			},
+ 		},
+ 	},
++	{
++		name:           "I64AtomicLoad8U",
++		argLen:         2,
++		faultOnNilArg0: true,
++		asm:            wasm.AI64AtomicLoad8U,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicLoad32U",
++		argLen:         2,
++		faultOnNilArg0: true,
++		asm:            wasm.AI64AtomicLoad32U,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicLoad",
++		argLen:         2,
++		faultOnNilArg0: true,
++		asm:            wasm.AI64AtomicLoad,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicStore8",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicStore8,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++		},
++	},
++	{
++		name:           "I64AtomicStore32",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicStore32,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++		},
++	},
++	{
++		name:           "I64AtomicStore",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicStore,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmw8XchgU",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmw8XchgU,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmw32XchgU",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmw32XchgU,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmwXchg",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmwXchg,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmw32AddU",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmw32AddU,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmwAdd",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmwAdd,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmw8AndU",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmw8AndU,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmw32AndU",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmw32AndU,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmwAnd",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmwAnd,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmw8OrU",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmw8OrU,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmw32OrU",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmw32OrU,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmwOr",
++		argLen:         3,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmwOr,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmw32CmpxchgU",
++		argLen:         4,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmw32CmpxchgU,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{2, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:           "I64AtomicRmwCmpxchg",
++		argLen:         4,
++		faultOnNilArg0: true,
++		hasSideEffects: true,
++		asm:            wasm.AI64AtomicRmwCmpxchg,
++		reg: regInfo{
++			inputs: []inputInfo{
++				{1, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{2, 281474976776191},  // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP
++				{0, 1407374883618815}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15 SP SB
++			},
++			outputs: []outputInfo{
++				{0, 65535}, // R0 R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11 R12 R13 R14 R15
++			},
++		},
++	},
++	{
++		name:   "AddTupleFirst",
++		argLen: 2,
++		reg:    regInfo{},
++	},
++	{
++		name:   "EqTupleFirst32",
++		argLen: 2,
++		reg:    regInfo{},
++	},
++	{
++		name:   "EqTupleFirst64",
++		argLen: 2,
++		reg:    regInfo{},
++	},
+ 	{
+ 		name:         "I64Load8U",
+ 		auxType:      auxInt64,
+diff --git a/src/cmd/compile/internal/ssa/rewriteWasm.go b/src/cmd/compile/internal/ssa/rewriteWasm.go
+index faba41b..14abddc 100644
+--- a/src/cmd/compile/internal/ssa/rewriteWasm.go
++++ b/src/cmd/compile/internal/ssa/rewriteWasm.go
+@@ -48,6 +48,67 @@ func rewriteValueWasm(v *Value) bool {
+ 	case OpAndB:
+ 		v.Op = OpWasmI64And
+ 		return true
++	case OpAtomicAdd32:
++		return rewriteValueWasm_OpAtomicAdd32(v)
++	case OpAtomicAdd64:
++		return rewriteValueWasm_OpAtomicAdd64(v)
++	case OpAtomicAnd32:
++		return rewriteValueWasm_OpAtomicAnd32(v)
++	case OpAtomicAnd32value:
++		v.Op = OpWasmI64AtomicRmw32AndU
++		return true
++	case OpAtomicAnd64value:
++		v.Op = OpWasmI64AtomicRmwAnd
++		return true
++	case OpAtomicAnd8:
++		return rewriteValueWasm_OpAtomicAnd8(v)
++	case OpAtomicCompareAndSwap32:
++		return rewriteValueWasm_OpAtomicCompareAndSwap32(v)
++	case OpAtomicCompareAndSwap64:
++		return rewriteValueWasm_OpAtomicCompareAndSwap64(v)
++	case OpAtomicExchange32:
++		v.Op = OpWasmI64AtomicRmw32XchgU
++		return true
++	case OpAtomicExchange64:
++		v.Op = OpWasmI64AtomicRmwXchg
++		return true
++	case OpAtomicExchange8:
++		v.Op = OpWasmI64AtomicRmw8XchgU
++		return true
++	case OpAtomicLoad32:
++		v.Op = OpWasmI64AtomicLoad32U
++		return true
++	case OpAtomicLoad64:
++		v.Op = OpWasmI64AtomicLoad
++		return true
++	case OpAtomicLoad8:
++		v.Op = OpWasmI64AtomicLoad8U
++		return true
++	case OpAtomicLoadPtr:
++		v.Op = OpWasmI64AtomicLoad
++		return true
++	case OpAtomicOr32:
++		return rewriteValueWasm_OpAtomicOr32(v)
++	case OpAtomicOr32value:
++		v.Op = OpWasmI64AtomicRmw32OrU
++		return true
++	case OpAtomicOr64value:
++		v.Op = OpWasmI64AtomicRmwOr
++		return true
++	case OpAtomicOr8:
++		return rewriteValueWasm_OpAtomicOr8(v)
++	case OpAtomicStore32:
++		v.Op = OpWasmI64AtomicStore32
++		return true
++	case OpAtomicStore64:
++		v.Op = OpWasmI64AtomicStore
++		return true
++	case OpAtomicStore8:
++		v.Op = OpWasmI64AtomicStore8
++		return true
++	case OpAtomicStorePtrNoWB:
++		v.Op = OpWasmI64AtomicStore
++		return true
+ 	case OpAvg64u:
+ 		return rewriteValueWasm_OpAvg64u(v)
+ 	case OpBitLen16:
+@@ -696,6 +757,162 @@ func rewriteValueWasm_OpAddr(v *Value) bool {
+ 		return true
+ 	}
+ }
++func rewriteValueWasm_OpAtomicAdd32(v *Value) bool {
++	v_2 := v.Args[2]
++	v_1 := v.Args[1]
++	v_0 := v.Args[0]
++	b := v.Block
++	typ := &b.Func.Config.Types
++	// match: (AtomicAdd32 ptr val mem)
++	// result: (AddTupleFirst val (I64AtomicRmw32AddU ptr val mem))
++	for {
++		ptr := v_0
++		val := v_1
++		mem := v_2
++		v.reset(OpWasmAddTupleFirst)
++		v0 := b.NewValue0(v.Pos, OpWasmI64AtomicRmw32AddU, types.NewTuple(typ.UInt32, types.TypeMem))
++		v0.AddArg3(ptr, val, mem)
++		v.AddArg2(val, v0)
++		return true
++	}
++}
++func rewriteValueWasm_OpAtomicAdd64(v *Value) bool {
++	v_2 := v.Args[2]
++	v_1 := v.Args[1]
++	v_0 := v.Args[0]
++	b := v.Block
++	typ := &b.Func.Config.Types
++	// match: (AtomicAdd64 ptr val mem)
++	// result: (AddTupleFirst val (I64AtomicRmwAdd ptr val mem))
++	for {
++		ptr := v_0
++		val := v_1
++		mem := v_2
++		v.reset(OpWasmAddTupleFirst)
++		v0 := b.NewValue0(v.Pos, OpWasmI64AtomicRmwAdd, types.NewTuple(typ.UInt64, types.TypeMem))
++		v0.AddArg3(ptr, val, mem)
++		v.AddArg2(val, v0)
++		return true
++	}
++}
++func rewriteValueWasm_OpAtomicAnd32(v *Value) bool {
++	v_2 := v.Args[2]
++	v_1 := v.Args[1]
++	v_0 := v.Args[0]
++	b := v.Block
++	typ := &b.Func.Config.Types
++	// match: (AtomicAnd32 ptr val mem)
++	// result: (Select1 (I64AtomicRmw32AndU <types.NewTuple(typ.UInt32, types.TypeMem)> ptr val mem))
++	for {
++		ptr := v_0
++		val := v_1
++		mem := v_2
++		v.reset(OpSelect1)
++		v0 := b.NewValue0(v.Pos, OpWasmI64AtomicRmw32AndU, types.NewTuple(typ.UInt32, types.TypeMem))
++		v0.AddArg3(ptr, val, mem)
++		v.AddArg(v0)
++		return true
++	}
++}
++func rewriteValueWasm_OpAtomicAnd8(v *Value) bool {
++	v_2 := v.Args[2]
++	v_1 := v.Args[1]
++	v_0 := v.Args[0]
++	b := v.Block
++	typ := &b.Func.Config.Types
++	// match: (AtomicAnd8 ptr val mem)
++	// result: (Select1 (I64AtomicRmw8AndU <types.NewTuple(typ.UInt8, types.TypeMem)> ptr val mem))
++	for {
++		ptr := v_0
++		val := v_1
++		mem := v_2
++		v.reset(OpSelect1)
++		v0 := b.NewValue0(v.Pos, OpWasmI64AtomicRmw8AndU, types.NewTuple(typ.UInt8, types.TypeMem))
++		v0.AddArg3(ptr, val, mem)
++		v.AddArg(v0)
++		return true
++	}
++}
++func rewriteValueWasm_OpAtomicCompareAndSwap32(v *Value) bool {
++	v_3 := v.Args[3]
++	v_2 := v.Args[2]
++	v_1 := v.Args[1]
++	v_0 := v.Args[0]
++	b := v.Block
++	typ := &b.Func.Config.Types
++	// match: (AtomicCompareAndSwap32 ptr old new_ mem)
++	// result: (EqTupleFirst32 old (I64AtomicRmw32CmpxchgU ptr old new_ mem))
++	for {
++		ptr := v_0
++		old := v_1
++		new_ := v_2
++		mem := v_3
++		v.reset(OpWasmEqTupleFirst32)
++		v0 := b.NewValue0(v.Pos, OpWasmI64AtomicRmw32CmpxchgU, types.NewTuple(typ.UInt32, types.TypeMem))
++		v0.AddArg4(ptr, old, new_, mem)
++		v.AddArg2(old, v0)
++		return true
++	}
++}
++func rewriteValueWasm_OpAtomicCompareAndSwap64(v *Value) bool {
++	v_3 := v.Args[3]
++	v_2 := v.Args[2]
++	v_1 := v.Args[1]
++	v_0 := v.Args[0]
++	b := v.Block
++	typ := &b.Func.Config.Types
++	// match: (AtomicCompareAndSwap64 ptr old new_ mem)
++	// result: (EqTupleFirst64 old (I64AtomicRmwCmpxchg ptr old new_ mem))
++	for {
++		ptr := v_0
++		old := v_1
++		new_ := v_2
++		mem := v_3
++		v.reset(OpWasmEqTupleFirst64)
++		v0 := b.NewValue0(v.Pos, OpWasmI64AtomicRmwCmpxchg, types.NewTuple(typ.UInt64, types.TypeMem))
++		v0.AddArg4(ptr, old, new_, mem)
++		v.AddArg2(old, v0)
++		return true
++	}
++}
++func rewriteValueWasm_OpAtomicOr32(v *Value) bool {
++	v_2 := v.Args[2]
++	v_1 := v.Args[1]
++	v_0 := v.Args[0]
++	b := v.Block
++	typ := &b.Func.Config.Types
++	// match: (AtomicOr32 ptr val mem)
++	// result: (Select1 (I64AtomicRmw32OrU <types.NewTuple(typ.UInt32, types.TypeMem)> ptr val mem))
++	for {
++		ptr := v_0
++		val := v_1
++		mem := v_2
++		v.reset(OpSelect1)
++		v0 := b.NewValue0(v.Pos, OpWasmI64AtomicRmw32OrU, types.NewTuple(typ.UInt32, types.TypeMem))
++		v0.AddArg3(ptr, val, mem)
++		v.AddArg(v0)
++		return true
++	}
++}
++func rewriteValueWasm_OpAtomicOr8(v *Value) bool {
++	v_2 := v.Args[2]
++	v_1 := v.Args[1]
++	v_0 := v.Args[0]
++	b := v.Block
++	typ := &b.Func.Config.Types
++	// match: (AtomicOr8 ptr val mem)
++	// result: (Select1 (I64AtomicRmw8OrU <types.NewTuple(typ.UInt8, types.TypeMem)> ptr val mem))
++	for {
++		ptr := v_0
++		val := v_1
++		mem := v_2
++		v.reset(OpSelect1)
++		v0 := b.NewValue0(v.Pos, OpWasmI64AtomicRmw8OrU, types.NewTuple(typ.UInt8, types.TypeMem))
++		v0.AddArg3(ptr, val, mem)
++		v.AddArg(v0)
++		return true
++	}
++}
+ func rewriteValueWasm_OpAvg64u(v *Value) bool {
+ 	v_1 := v.Args[1]
+ 	v_0 := v.Args[0]
+@@ -3344,6 +3561,8 @@ func rewriteValueWasm_OpRsh8x8(v *Value) bool {
+ }
+ func rewriteValueWasm_OpSelect0(v *Value) bool {
+ 	v_0 := v.Args[0]
++	b := v.Block
++	typ := &b.Func.Config.Types
+ 	// match: (Select0 <t> (Mul64uhilo x y))
+ 	// result: (Hmul64u <t> x y)
+ 	for {
+@@ -3358,6 +3577,55 @@ func rewriteValueWasm_OpSelect0(v *Value) bool {
+ 		v.AddArg2(x, y)
+ 		return true
+ 	}
++	// match: (Select0 <t> (AddTupleFirst val tuple))
++	// result: (I64Add val (Select0 <t> tuple))
++	for {
++		t := v.Type
++		if v_0.Op != OpWasmAddTupleFirst {
++			break
++		}
++		tuple := v_0.Args[1]
++		val := v_0.Args[0]
++		v.reset(OpWasmI64Add)
++		v0 := b.NewValue0(v.Pos, OpSelect0, t)
++		v0.AddArg(tuple)
++		v.AddArg2(val, v0)
++		return true
++	}
++	// match: (Select0 <t> (EqTupleFirst32 old tuple))
++	// result: (I64Eq <t> (ZeroExt32to64 old) (Select0 <typ.UInt32> tuple))
++	for {
++		t := v.Type
++		if v_0.Op != OpWasmEqTupleFirst32 {
++			break
++		}
++		tuple := v_0.Args[1]
++		old := v_0.Args[0]
++		v.reset(OpWasmI64Eq)
++		v.Type = t
++		v0 := b.NewValue0(v.Pos, OpZeroExt32to64, typ.UInt64)
++		v0.AddArg(old)
++		v1 := b.NewValue0(v.Pos, OpSelect0, typ.UInt32)
++		v1.AddArg(tuple)
++		v.AddArg2(v0, v1)
++		return true
++	}
++	// match: (Select0 <t> (EqTupleFirst64 old tuple))
++	// result: (I64Eq <t> old (Select0 <typ.UInt64> tuple))
++	for {
++		t := v.Type
++		if v_0.Op != OpWasmEqTupleFirst64 {
++			break
++		}
++		tuple := v_0.Args[1]
++		old := v_0.Args[0]
++		v.reset(OpWasmI64Eq)
++		v.Type = t
++		v0 := b.NewValue0(v.Pos, OpSelect0, typ.UInt64)
++		v0.AddArg(tuple)
++		v.AddArg2(old, v0)
++		return true
++	}
+ 	return false
+ }
+ func rewriteValueWasm_OpSelect1(v *Value) bool {
+@@ -3374,6 +3642,39 @@ func rewriteValueWasm_OpSelect1(v *Value) bool {
+ 		v.AddArg2(x, y)
+ 		return true
+ 	}
++	// match: (Select1 (AddTupleFirst _ tuple))
++	// result: (Select1 tuple)
++	for {
++		if v_0.Op != OpWasmAddTupleFirst {
++			break
++		}
++		tuple := v_0.Args[1]
++		v.reset(OpSelect1)
++		v.AddArg(tuple)
++		return true
++	}
++	// match: (Select1 (EqTupleFirst32 _ tuple))
++	// result: (Select1 tuple)
++	for {
++		if v_0.Op != OpWasmEqTupleFirst32 {
++			break
++		}
++		tuple := v_0.Args[1]
++		v.reset(OpSelect1)
++		v.AddArg(tuple)
++		return true
++	}
++	// match: (Select1 (EqTupleFirst64 _ tuple))
++	// result: (Select1 tuple)
++	for {
++		if v_0.Op != OpWasmEqTupleFirst64 {
++			break
++		}
++		tuple := v_0.Args[1]
++		v.reset(OpSelect1)
++		v.AddArg(tuple)
++		return true
++	}
+ 	return false
+ }
+ func rewriteValueWasm_OpSignExt16to32(v *Value) bool {
+diff --git a/src/cmd/compile/internal/ssagen/intrinsics.go b/src/cmd/compile/internal/ssagen/intrinsics.go
+index e2eebd7..66e6be8 100644
+--- a/src/cmd/compile/internal/ssagen/intrinsics.go
++++ b/src/cmd/compile/internal/ssagen/intrinsics.go
+@@ -41,6 +41,9 @@ type intrinsicBuildConfig struct {
+ 	gomips64  string
+ 	goppc64   int
+ 	goriscv64 int
++	// gowasmThreads: GOWASM has threads, so the wasm backend has the
++	// threads proposal's atomic instructions to lower the atomics to.
++	gowasmThreads bool
+ }
+ 
+ type intrinsicBuilders map[intrinsicKey]intrinsicBuilder
+@@ -103,6 +106,7 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 			gomips64:      buildcfg.GOMIPS64,
+ 			goppc64:       buildcfg.GOPPC64,
+ 			goriscv64:     buildcfg.GORISCV64,
++			gowasmThreads: buildcfg.GOWASM.Threads,
+ 		}
+ 	}
+ 	intrinsics = intrinsicBuilders{}
+@@ -697,6 +701,26 @@ func initIntrinsics(cfg *intrinsicBuildConfig) {
+ 		},
+ 		sys.AMD64, sys.Loong64)
+ 
++	// The wasm atomics, with GOWASM=threads
++	if cfg.gowasmThreads {
++		// The wasm backend lowers the generic atomic ops to the threads
++		// proposal's instructions, so the builders of another 64-bit port
++		// serve; without the feature the calls stay, as the instructions
++		// are not in the module's feature set.
++		for _, fn := range []string{
++			"Load", "Load8", "Load64", "Loadp",
++			"Store", "Store8", "Store64", "StorepNoWB",
++			"Xchg8", "Xchg", "Xchg64", "Xadd", "Xadd64", "Cas", "Cas64",
++			"And8", "Or8", "And", "Or", "And32", "And64", "Or32", "Or64",
++		} {
++			b := intrinsics.lookup(sys.ArchAMD64, "internal/runtime/atomic", fn)
++			if b == nil {
++				panic("no atomic intrinsic builder to lower on wasm: " + fn)
++			}
++			intrinsics.add(sys.ArchWasm, "internal/runtime/atomic", fn, b)
++		}
++	}
++
+ 	// Aliases for atomic load operations
+ 	alias("internal/runtime/atomic", "Loadint32", "internal/runtime/atomic", "Load", all...)
+ 	alias("internal/runtime/atomic", "Loadint64", "internal/runtime/atomic", "Load64", all...)
+diff --git a/src/cmd/compile/internal/wasm/ssa.go b/src/cmd/compile/internal/wasm/ssa.go
+index 1e3b318..1d482ee 100644
+--- a/src/cmd/compile/internal/wasm/ssa.go
++++ b/src/cmd/compile/internal/wasm/ssa.go
+@@ -283,6 +283,28 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
+ 		p := s.Prog(v.Op.Asm())
+ 		p.To = obj.Addr{Type: obj.TYPE_CONST, Offset: v.AuxInt}
+ 
++	case ssa.OpWasmI64AtomicLoad8U, ssa.OpWasmI64AtomicLoad32U, ssa.OpWasmI64AtomicLoad,
++		ssa.OpWasmI64AtomicStore8, ssa.OpWasmI64AtomicStore32, ssa.OpWasmI64AtomicStore,
++		ssa.OpWasmI64AtomicRmw8XchgU, ssa.OpWasmI64AtomicRmw32XchgU, ssa.OpWasmI64AtomicRmwXchg,
++		ssa.OpWasmI64AtomicRmw32AddU, ssa.OpWasmI64AtomicRmwAdd,
++		ssa.OpWasmI64AtomicRmw8AndU, ssa.OpWasmI64AtomicRmw32AndU, ssa.OpWasmI64AtomicRmwAnd,
++		ssa.OpWasmI64AtomicRmw8OrU, ssa.OpWasmI64AtomicRmw32OrU, ssa.OpWasmI64AtomicRmwOr,
++		ssa.OpWasmI64AtomicRmw32CmpxchgU, ssa.OpWasmI64AtomicRmwCmpxchg:
++		// The address, then the operands but the memory; an operation
++		// that yields a value leaves it for its register.
++		atomicAddress(s, v.Args[0])
++		for _, a := range v.Args[1 : len(v.Args)-1] {
++			getValue64(s, a)
++		}
++		p := s.Prog(v.Op.Asm())
++		p.From = obj.Addr{Type: obj.TYPE_CONST, Offset: 0}
++		if v.Type.IsTuple() {
++			setReg(s, v.Reg0())
++		}
++
++	case ssa.OpWasmAddTupleFirst, ssa.OpWasmEqTupleFirst32, ssa.OpWasmEqTupleFirst64:
++		v.Fatalf("%v should never make it to codegen", v.LongString())
++
+ 	case ssa.OpStoreReg:
+ 		getReg(s, wasm.REG_SP)
+ 		getValue64(s, v.Args[0])
+@@ -471,6 +493,27 @@ func isCmp(v *ssa.Value) bool {
+ 	}
+ }
+ 
++// atomicAddress pushes the 32-bit address an atomic operation takes,
++// raising the nil dereference panic first when it is zero: address 0
++// does not trap in wasm, so the atomic ops fault on nil by construction,
++// as the other ports' do by hardware, and the nil checks before them can
++// be elided. The address is consumed once and held in RET0 across the
++// check: a global no value is allocated to, which carries callRet's
++// argument from CALLFN to callRet in asm_wasm.s, with no compiled code
++// between.
++func atomicAddress(s *ssagen.State, addr *ssa.Value) {
++	getValue64(s, addr)
++	setReg(s, wasm.REG_RET0)
++	getReg(s, wasm.REG_RET0)
++	s.Prog(wasm.AI64Eqz)
++	s.Prog(wasm.AIf)
++	p := s.Prog(wasm.ACALLNORESUME)
++	p.To = obj.Addr{Type: obj.TYPE_MEM, Name: obj.NAME_EXTERN, Sym: ir.Syms.SigPanic}
++	s.Prog(wasm.AEnd)
++	getReg(s, wasm.REG_RET0)
++	s.Prog(wasm.AI32WrapI64)
++}
++
+ func getValue32(s *ssagen.State, v *ssa.Value) {
+ 	if v.OnWasmStack {
+ 		s.OnWasmStackSkipped--
