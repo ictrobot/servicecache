@@ -1,0 +1,157 @@
+Subject: virtual-fs, wasix: rename a symbolic link, and onto one, without
+ following it
+Last-Update: 2026-10-04
+
+path_rename resolved both of its paths through a final symbolic link,
+the host filesystem's rename asked whether its source exists by
+following it, and the memory filesystem's did not find a link under its
+name at all. Renaming a link whose target does not exist failed with
+ENOENT, and one in a cycle with ELOOP, though rename(2) moves the link
+itself; a link moved to another host directory was moved as a copy of
+what it points at. A target name the runtime already knew kept its old
+entry in the parent directory, so after a file was renamed onto a
+symbolic link the name still resolved as the link, and a later open
+followed it to wherever it used to point. The call then looked the
+target up again, through that stale link, to set its name and size;
+where the link pointed at nothing the lookup failed and the runtime
+panicked.
+
+The source is now looked up without following a final link, the moved
+inode replaces the target's entry and takes its name, and nothing is
+looked up after the rename. The host filesystem renames a link with
+rename(2) in every case and leaves the times of what it points at
+alone, and the memory filesystem finds a link as it finds a file, which
+also has it refuse a directory created over one.
+
+diff --git a/lib/virtual-fs/src/host_fs.rs b/lib/virtual-fs/src/host_fs.rs
+index 701eb40..959220c 100644
+--- a/lib/virtual-fs/src/host_fs.rs
++++ b/lib/virtual-fs/src/host_fs.rs
+@@ -204,9 +204,11 @@ impl crate::FileSystem for FileSystem {
+             let from = self.prepare_path(from)?;
+             let to = self.prepare_path(to)?;
+ 
+-            if !from.exists() {
++            // A symbolic link is renamed as itself, whatever it points at.
++            let Ok(from_metadata) = from.symlink_metadata() else {
+                 return Err(FsError::EntryNotFound);
+-            }
++            };
++            let from_is_symlink = from_metadata.file_type().is_symlink();
+             let from_parent = from.parent().unwrap();
+             let to_parent = to.parent().unwrap();
+             if !from_parent.exists() {
+@@ -215,7 +217,7 @@ impl crate::FileSystem for FileSystem {
+             if !to_parent.exists() {
+                 return Err(FsError::EntryNotFound);
+             }
+-            let result = if from_parent != to_parent {
++            let result = if from_parent != to_parent && !from_is_symlink {
+                 let _ = std::fs::create_dir_all(to_parent);
+                 if from.is_dir() {
+                     fs_extra::move_items(
+@@ -237,7 +239,9 @@ impl crate::FileSystem for FileSystem {
+             } else {
+                 fs::rename(&from, &to).map_err(Into::into)
+             };
+-            let _ = set_file_mtime(&to, FileTime::now()).map(|_| ());
++            if !from_is_symlink {
++                let _ = set_file_mtime(&to, FileTime::now()).map(|_| ());
++            }
+             result
+         })
+     }
+diff --git a/lib/virtual-fs/src/mem_fs/filesystem.rs b/lib/virtual-fs/src/mem_fs/filesystem.rs
+index d8bfdfd..57a7282 100644
+--- a/lib/virtual-fs/src/mem_fs/filesystem.rs
++++ b/lib/virtual-fs/src/mem_fs/filesystem.rs
+@@ -932,6 +932,7 @@ impl FileSystemInner {
+                     | Node::ReadOnlyFile(ReadOnlyFileNode { inode, name, .. })
+                     | Node::CustomFile(CustomFileNode { inode, name, .. })
+                     | Node::ArcFile(ArcFileNode { inode, name, .. })
++                    | Node::Symlink(SymlinkNode { inode, name, .. })
+                         if name.as_os_str() == name_of =>
+                     {
+                         Some(Some((nth, InodeResolution::Found(*inode))))
+diff --git a/lib/wasix/src/syscalls/wasi/path_rename.rs b/lib/wasix/src/syscalls/wasi/path_rename.rs
+index f6517c3..0c8dee1 100644
+--- a/lib/wasix/src/syscalls/wasi/path_rename.rs
++++ b/lib/wasix/src/syscalls/wasi/path_rename.rs
+@@ -79,16 +79,14 @@ pub fn path_rename_internal(
+     }
+ 
+     // this is to be sure the source file is fetched from the filesystem if needed
++    //
++    // rename(2) moves a symbolic link and replaces one; it follows neither.
+     let source_inode = wasi_try_ok!(state.fs.get_inode_at_path(
+         inodes,
+         source_fd,
+         source_path,
+-        true
++        false
+     ));
+-    // Create the destination inode if the file exists.
+-    let _ = state
+-        .fs
+-        .get_inode_at_path(inodes, target_fd, target_path, true);
+     let (source_parent_inode, source_entry_name) = wasi_try_ok!(state.fs.get_parent_inode_at_path(
+         inodes,
+         source_fd,
+@@ -120,18 +118,12 @@ pub fn path_rename_internal(
+             }
+         }
+     };
+-    let mut need_create = true;
+     let target_guest_path = {
+         let guard = target_parent_inode.read();
+         match guard.deref() {
+-            Kind::Dir { entries, path, .. } => {
+-                if entries.contains_key(&target_entry_name) {
+-                    need_create = false;
+-                }
+-                crate::fs::PosixPath::from_path(path)
+-                    .join(&crate::fs::PosixPath::new(&target_entry_name))
+-                    .into_path_buf()
+-            }
++            Kind::Dir { path, .. } => crate::fs::PosixPath::from_path(path)
++                .join(&crate::fs::PosixPath::new(&target_entry_name))
++                .into_path_buf(),
+             Kind::Root { .. } => return Ok(Errno::Notcapable),
+             Kind::Socket { .. }
+             | Kind::PipeTx { .. }
+@@ -284,27 +276,19 @@ pub fn path_rename_internal(
+         }
+     }
+ 
+-    let source_size = source_entry.stat.read().unwrap().st_size;
+-
+-    if need_create {
++    // The moved inode is the target's entry from here on, in place of
++    // whatever the name held: keeping a replaced entry left the name
++    // resolving as what it used to be, a replaced symbolic link among them,
++    // and looking the name up again through such a link could fail when it
++    // was too late to.
++    *source_entry.name.write().unwrap() = target_entry_name.clone().into();
++    {
+         let mut guard = target_parent_inode.write();
+         if let Kind::Dir { entries, .. } = guard.deref_mut() {
+-            let result = entries.insert(target_entry_name.clone(), source_entry);
+-            assert!(
+-                result.is_none(),
+-                "fatal error: race condition on filesystem detected or internal logic error"
+-            );
++            entries.insert(target_entry_name, source_entry);
+         }
+     }
+ 
+-    // The target entry is created, one way or the other
+-    let target_inode = state
+-        .fs
+-        .get_inode_at_path(inodes, target_fd, target_path, true)
+-        .expect("Expected target inode to exist, and it's too late to safely fail");
+-    *target_inode.name.write().unwrap() = target_entry_name.into();
+-    target_inode.stat.write().unwrap().st_size = source_size;
+-
+     // If the rename replaced an existing destination entry, clear any stale
+     // ephemeral symlink mapping for that path.
+     if !moved_ephemeral_symlink {

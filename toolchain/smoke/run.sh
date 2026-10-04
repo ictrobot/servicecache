@@ -87,6 +87,7 @@ expect_fixes poll-zero-timeout.wasm "WASIX answers a poll with a zero timeout at
 expect_fixes root-create.wasm "WASIX creates and removes entries at the root through its pre-open"
 expect_fixes dir-fsync.wasm "WASIX syncs a directory"
 expect_fixes unlink-directory.wasm "WASIX refuses to unlink a directory and leaves it intact"
+expect_fixes rename-symlink.wasm "WASIX renames a symbolic link, and onto one, without following it"
 expect_fixes memfs-race.wasm "WASIX threads create, rename and unlink in one memory directory" 30s
 expect_fixes flush-while-writing.wasm "WASIX closes and syncs a file while other threads write it" 20s
 expect_fixes create-race.wasm "WASIX threads racing to create one name get what open gives them" 20s
