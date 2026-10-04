@@ -1,0 +1,93 @@
+Subject: cmd/link, runtime: build no findfunctab on wasm
+Last-Update: 2026-10-04
+
+findfunctab maps a PC to its ftab entry through one bucket per 4096
+bytes of program counter. A wasm PC is the function index shifted left
+by 16, so every function owned sixteen buckets whether it had one
+instruction or a thousand, and the table grew with the number of
+functions to a large share of a program's data, most of it zero and all
+of it written into memory at start. On wasm the index of a function's
+ftab entry is the function's index within the text for every function
+with an entry of its own, so findfunc now indexes ftab directly and
+falls back to a binary search over the sorted entries where a container
+symbol has shifted them; the linker emits an empty table.
+
+diff --git a/src/cmd/link/internal/ld/pcln.go b/src/cmd/link/internal/ld/pcln.go
+index 08c4d4d..5998c3f 100644
+--- a/src/cmd/link/internal/ld/pcln.go
++++ b/src/cmd/link/internal/ld/pcln.go
+@@ -1086,6 +1086,14 @@ func (ctxt *Link) findfunctab(state *pclntab, container loader.Bitmap) {
+ 		}
+ 	}
+ 
++	if ctxt.IsWasm() {
++		// A wasm PC is the function index shifted left by 16, so the
++		// runtime finds a function's ftab entry by its index, as
++		// findfuncWasm in runtime/symtab.go does, and the table, sixteen
++		// buckets per function, would be a large share of the data for
++		// nothing.
++		size, writeFindFuncTab = 0, func(*Link, loader.Sym) {}
++	}
+ 	state.findfunctab = ctxt.createGeneratorSymbol("runtime.findfunctab", 0, sym.SPCLNTAB, size, writeFindFuncTab)
+ 	ldr.SetSymAlign(state.findfunctab, 4)
+ 	ldr.SetAttrReachable(state.findfunctab, true)
+diff --git a/src/runtime/symtab.go b/src/runtime/symtab.go
+index 0581655..9153581 100644
+--- a/src/runtime/symtab.go
++++ b/src/runtime/symtab.go
+@@ -932,12 +932,11 @@ func findfunc(pc uintptr) funcInfo {
+ 		return funcInfo{}
+ 	}
+ 
+-	x := uintptr(pcOff) + datap.text - datap.minpc // TODO: are datap.text and datap.minpc always equal?
+ 	if GOARCH == "wasm" {
+-		// On Wasm, pcOff is the function index, whereas
+-		// the "PC" is function index << 16 + block index.
+-		x = uintptr(pcOff)<<16 + datap.text - datap.minpc
++		return findfuncWasm(datap, pcOff)
+ 	}
++
++	x := uintptr(pcOff) + datap.text - datap.minpc // TODO: are datap.text and datap.minpc always equal?
+ 	b := x / abi.FuncTabBucketSize
+ 	i := x % abi.FuncTabBucketSize / (abi.FuncTabBucketSize / nsub)
+ 
+@@ -953,6 +952,39 @@ func findfunc(pc uintptr) funcInfo {
+ 	return funcInfo{(*_func)(unsafe.Pointer(&datap.pclntable[funcoff])), datap}
+ }
+ 
++// findfuncWasm finds the ftab entry for a PC on wasm, where the linker
++// builds no findfunctab. A wasm PC is the function index shifted left by
++// 16 with the block index below, so pcOff is the function's index within
++// the text, and since every function's entry is its own index, the ftab
++// entry for a function with one is at that index. The functions without
++// an entry of their own, the containers of sub-symbols, shift the entries
++// after them down, and a binary search over the sorted entries covers
++// those.
++//
++//go:nosplit
++func findfuncWasm(datap *moduledata, pcOff uint32) funcInfo {
++	ftab := datap.ftab
++	n := len(ftab) - 1 // the last entry marks the end of the text
++	idx := int(pcOff)
++	if idx >= n || ftab[idx].entryoff > pcOff || ftab[idx+1].entryoff <= pcOff {
++		lo, hi := 0, n
++		for lo < hi {
++			mid := int(uint(lo+hi) >> 1)
++			if ftab[mid+1].entryoff <= pcOff {
++				lo = mid + 1
++			} else {
++				hi = mid
++			}
++		}
++		idx = lo
++		if idx >= n || ftab[idx].entryoff > pcOff {
++			return funcInfo{}
++		}
++	}
++	funcoff := ftab[idx].funcoff
++	return funcInfo{(*_func)(unsafe.Pointer(&datap.pclntable[funcoff])), datap}
++}
++
+ // A srcFunc represents a logical function in the source code. This may
+ // correspond to an actual symbol in the binary text, or it may correspond to a
+ // source function that has been inlined.
