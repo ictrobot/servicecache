@@ -1,0 +1,71 @@
+Subject: cmd/internal/obj/wasm: keep the large-frame stack check from wrapping
+Last-Update: 2026-10-04
+
+A function with a frame larger than StackSmall compared SP against
+stackguard0 plus the frame's excess. A stackguard0 of stackPreempt, the
+largest address, wraps when anything is added, so the comparison found
+the stack ample and a preemption request or an overflow went unseen. On
+one thread the request is set and consumed by the same code path and
+the window never shows; with a request set from another thread it is a
+crash on the first large frame. The excess is now subtracted from SP
+instead, as the other ports do, and a frame above StackBig, the one
+size for which that subtraction can itself wrap, first checks that SP
+is larger than the excess, as the other ports do too.
+
+diff --git a/src/cmd/internal/obj/wasm/wasmobj.go b/src/cmd/internal/obj/wasm/wasmobj.go
+index 0112945..9b940d3 100644
+--- a/src/cmd/internal/obj/wasm/wasmobj.go
++++ b/src/cmd/internal/obj/wasm/wasmobj.go
+@@ -340,25 +340,43 @@ func preprocess(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
+ 			p = appendp(p, AI32Load, constAddr(2*int64(ctxt.Arch.PtrSize))) // G.stackguard0
+ 			p = appendp(p, AI32LeU)
+ 		} else {
+-			// large stack: SP-framesize <= stackguard-StackSmall
+-			//              SP <= stackguard+(framesize-StackSmall)
++			// large stack: SP-(framesize-StackSmall) <= stackguard
+ 			// Get SP
++			// I32Const $(framesize-StackSmall)
++			// I32Sub
+ 			// Get g
+ 			// I32WrapI64
+ 			// I32Load $stackguard0
+-			// I32Const $(framesize-StackSmall)
+-			// I32Add
+-			// I32GtU
+-
++			// I32LeU
++			//
++			// The subtraction is on the SP side so that a stackguard0 of
++			// stackPreempt, which another thread sets to ask for a
++			// preemption, compares as the huge value it is instead of
++			// wrapping around when the frame size is added to it. The
++			// subtraction itself wraps when the frame is larger than
++			// the address in SP, which only a frame above StackBig can
++			// be; such a frame also checks SP against the frame first,
++			// as the other ports do.
++
++			if framesize > abi.StackBig {
++				// Get SP
++				// I32Const $(framesize-StackSmall)
++				// I32LeU
++				p = appendp(p, AGet, regAddr(REG_SP))
++				p = appendp(p, AI32Const, constAddr(framesize-abi.StackSmall))
++				p = appendp(p, AI32LeU)
++			}
+ 			p = appendp(p, AGet, regAddr(REG_SP))
++			p = appendp(p, AI32Const, constAddr(framesize-abi.StackSmall))
++			p = appendp(p, AI32Sub)
+ 			p = appendp(p, AGet, regAddr(REGG))
+ 			p = appendp(p, AI32WrapI64)
+ 			p = appendp(p, AI32Load, constAddr(2*int64(ctxt.Arch.PtrSize))) // G.stackguard0
+-			p = appendp(p, AI32Const, constAddr(framesize-abi.StackSmall))
+-			p = appendp(p, AI32Add)
+ 			p = appendp(p, AI32LeU)
++			if framesize > abi.StackBig {
++				p = appendp(p, AI32Or)
++			}
+ 		}
+-		// TODO(neelance): handle wraparound case
+ 
+ 		p = appendp(p, AIf)
+ 		// This CALL does *not* have a resume point after it

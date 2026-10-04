@@ -1,0 +1,51 @@
+Subject: internal/buildcfg: add a threads feature to GOWASM
+Last-Update: 2026-10-04
+
+GOWASM=threads says the target engine has the threads proposal: shared
+memory, the atomic instructions and their wait and notify. It sets the
+wasm.threads build tag, as GOAMD64 sets amd64.v3, so that files can
+select on it, and a tool that reads buildcfg can consult it. Without it
+a module keeps to the wasm 1.0 instruction set and runs on any engine.
+
+diff --git a/src/internal/buildcfg/cfg.go b/src/internal/buildcfg/cfg.go
+index 89fd74e..5f1de45 100644
+--- a/src/internal/buildcfg/cfg.go
++++ b/src/internal/buildcfg/cfg.go
+@@ -334,10 +334,18 @@ type gowasmFeatures struct {
+ 	// Legacy features, now always enabled
+ 	//SatConv bool
+ 	//SignExt bool
++
++	// Threads: the target engine has the threads proposal, so shared
++	// memory, the atomic instructions and their wait and notify may be
++	// used. It sets the wasm.threads build tag.
++	Threads bool
+ }
+ 
+ func (f gowasmFeatures) String() string {
+ 	var flags []string
++	if f.Threads {
++		flags = append(flags, "threads")
++	}
+ 	return strings.Join(flags, ",")
+ }
+ 
+@@ -348,6 +356,8 @@ func gowasm() (f gowasmFeatures) {
+ 			// ignore, always enabled
+ 		case "signext":
+ 			// ignore, always enabled
++		case "threads":
++			f.Threads = true
+ 		case "":
+ 			// ignore
+ 		default:
+@@ -461,6 +471,9 @@ func gogoarchTags() []string {
+ 		list = append(list, GOARCH+".satconv")
+ 		// SignExt is always enabled
+ 		list = append(list, GOARCH+".signext")
++		if GOWASM.Threads {
++			list = append(list, GOARCH+".threads")
++		}
+ 		return list
+ 	}
+ 	return nil

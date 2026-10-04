@@ -1,6 +1,7 @@
-These patches modify the Go release pinned in ../default.nix for WASIX: a
-fix to the wasip1 runtime, and sockets and name resolution behind the wasix
-build tag. They are licensed under the BSD-3-Clause License (see LICENSE),
-the same terms as upstream. Context lines, and the files the series moves
-or copies, are from upstream and remain the copyright of their authors
-under that licence.
+These patches modify the Go release pinned in ../default.nix for WASIX:
+fixes to the wasip1 runtime and the wasm assembler; sockets, name
+resolution and an epoll poller behind the wasix build tag; and WASIX
+threads behind GOWASM=threads. They are licensed under the BSD-3-Clause
+License (see LICENSE), the same terms as upstream. Context lines, and the
+files the series moves or copies, are from upstream and remain the
+copyright of their authors under that licence.

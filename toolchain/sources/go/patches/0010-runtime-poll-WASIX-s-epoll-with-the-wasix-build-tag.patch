@@ -1,0 +1,282 @@
+Subject: runtime: poll WASIX's epoll with the wasix build tag
+Last-Update: 2026-10-04
+
+The wasip1 port polls with WASI preview 1's poll_oneoff, which takes its
+whole subscription list on every call and cannot be woken by another
+thread. With the wasix tag the poller is WASIX's epoll, which is
+Linux's: an interest list the runtime keeps, so that a descriptor
+registered by one thread is watched by the poll another thread is
+blocked in, and an event descriptor netpollBreak writes to wake that
+poll. Sockets are registered edge-triggered as on Linux; netpollarm has
+nothing to arm and netpoll.go is unchanged.
+
+The wakeup descriptor is written once per netpollBreak, and the flag
+netpollWakeSig skips further breaks until a blocking netpoll reads it.
+Linux reports a level-triggered descriptor to every wait while it stays
+readable; WASIX's epoll reports an event descriptor once per write, so
+a nonblocking netpoll(0) running while a wakeup was pending would take
+the only report, the blocking poll would never see it, the flag would
+stay set, and every timer in the program would stop once all Ms were
+idle. A nonblocking poll that takes the report writes the descriptor
+again, and the descriptor is non-blocking as Linux's is, so a read that
+finds the count already drained fails instead of sleeping outside the
+poll.
+
+diff --git a/src/net/socket_wasix.go b/src/net/socket_wasix.go
+index f51baf5..1185006 100644
+--- a/src/net/socket_wasix.go
++++ b/src/net/socket_wasix.go
+@@ -11,8 +11,8 @@ import (
+ 
+ // Sockets over the WASIX extension: a listen binds and listens a socket
+ // the runtime opens, a dial connects one, and the descriptor is then
+-// served by the same non-blocking reads, writes and poll_oneoff waits
+-// an inherited socket gets on wasip1.
++// served by the same non-blocking reads and writes an inherited socket
++// gets on wasip1, with the waits on WASIX's epoll.
+ 
+ func sysSocket(family, sotype, proto int) (int, error) {
+ 	s, err := syscall.Socket(family, sotype, proto)
+diff --git a/src/runtime/netpoll_wasip1.go b/src/runtime/netpoll_wasip1.go
+index c7e66a6..41ffb8d 100644
+--- a/src/runtime/netpoll_wasip1.go
++++ b/src/runtime/netpoll_wasip1.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build wasip1
++//go:build wasip1 && !wasix
+ 
+ package runtime
+ 
+diff --git a/src/runtime/netpoll_wasix.go b/src/runtime/netpoll_wasix.go
+new file mode 100644
+index 0000000..26e1924
+--- /dev/null
++++ b/src/runtime/netpoll_wasix.go
+@@ -0,0 +1,224 @@
++//go:build wasip1 && wasix
++
++package runtime
++
++import (
++	"internal/runtime/atomic"
++	"unsafe"
++)
++
++//go:wasmimport wasix_32v1 fd_event
++//go:noescape
++func fd_event(initial uint64, flags int32, fd unsafe.Pointer) errno
++
++//go:wasmimport wasi_snapshot_preview1 fd_read
++//go:noescape
++func fd_read(fd int32, iovs unsafe.Pointer, iovsLen size, nread unsafe.Pointer) errno
++
++// WASIX's fd_event flag that makes the descriptor non-blocking, as
++// Linux's EFD_NONBLOCK does.
++const wasixEventFDNonblock = 1 << 2
++
++// wasixEventSignal makes fd readable.
++func wasixEventSignal(fd int32) {
++	var one uint64 = 1
++	iov := iovec{buf: uintptr32(uintptr(unsafe.Pointer(&one))), bufLen: 8}
++	var n size
++	fd_write(fd, unsafe.Pointer(&iov), 1, &n)
++}
++
++// The network poller over WASIX's epoll, which is Linux's: an interest
++// list the runtime keeps, so that a descriptor registered by one thread
++// is watched by the poll another thread is blocked in, and an event
++// descriptor netpollBreak writes to wake that poll. WASI preview 1's
++// poll_oneoff, which the port uses on one thread, takes its whole
++// subscription list on every call and cannot be woken.
++
++//go:wasmimport wasix_32v1 epoll_create
++//go:noescape
++func epoll_create(fd unsafe.Pointer) errno
++
++//go:wasmimport wasix_32v1 epoll_ctl
++//go:noescape
++func epoll_ctl(epfd int32, op int32, fd int32, event unsafe.Pointer) errno
++
++//go:wasmimport wasix_32v1 epoll_wait
++//go:noescape
++func epoll_wait(epfd int32, events unsafe.Pointer, maxevents int32, timeout uint64, nevents unsafe.Pointer) errno
++
++// WASIX's epoll flags and control operations.
++const (
++	wasixEpollIn    = 1 << 0
++	wasixEpollOut   = 1 << 1
++	wasixEpollRdHup = 1 << 2
++	wasixEpollErr   = 1 << 4
++	wasixEpollHup   = 1 << 5
++	wasixEpollET    = 1 << 6
++
++	wasixEpollCtlAdd = 0
++	wasixEpollCtlDel = 2
++
++	// The epoll_wait timeout that means no deadline.
++	wasixEpollForever = ^uint64(0)
++
++	_EINTR = 27
++)
++
++// wasixEpollEvent is WASIX's epoll_event: the events, then, aligned to
++// its 64-bit member, the data the registration carried, of which data2
++// holds the runtime's tagged pollDesc pointer.
++type wasixEpollEvent struct {
++	events uint32
++	_      uint32
++	ptr    uint32
++	fd     int32
++	data1  uint32
++	_      uint32
++	data2  uint64
++}
++
++var (
++	epfd           int32         = -1 // epoll descriptor
++	netpollEventFd int32         = -1 // event descriptor for netpollBreak
++	netpollWakeSig atomic.Uint32      // used to avoid duplicate calls of netpollBreak
++)
++
++// netpollBreakData marks the break descriptor's registration; a tagged
++// pollDesc pointer is never this value.
++const netpollBreakData = 1
++
++func netpollinit() {
++	if e := epoll_create(unsafe.Pointer(&epfd)); e != 0 {
++		println("runtime: epoll_create failed with", e)
++		throw("runtime: netpollinit failed")
++	}
++	// The event descriptor the poller subscribes to beside its sockets, so
++	// that netpollBreak can wake a poll from another thread. It is
++	// non-blocking, as Linux's is, because netpoll can be handed a write
++	// whose count an earlier drain has already read: the read then fails
++	// rather than sleeping outside the poll.
++	if e := fd_event(0, wasixEventFDNonblock, unsafe.Pointer(&netpollEventFd)); e != 0 {
++		print("runtime: fd_event failed with errno ", e, "\n")
++		throw("netpollinit")
++	}
++	ev := wasixEpollEvent{events: wasixEpollIn, fd: netpollEventFd, data2: netpollBreakData}
++	if e := epoll_ctl(epfd, wasixEpollCtlAdd, netpollEventFd, unsafe.Pointer(&ev)); e != 0 {
++		println("runtime: epoll_ctl failed with", e)
++		throw("runtime: epoll_ctl failed")
++	}
++}
++
++func netpollIsPollDescriptor(fd uintptr) bool {
++	return fd == uintptr(epfd) || fd == uintptr(netpollEventFd)
++}
++
++func netpollopen(fd uintptr, pd *pollDesc) int32 {
++	tp := taggedPointerPack(unsafe.Pointer(pd), pd.fdseq.Load())
++	ev := wasixEpollEvent{
++		events: wasixEpollIn | wasixEpollOut | wasixEpollRdHup | wasixEpollET,
++		fd:     int32(fd),
++		data2:  uint64(tp),
++	}
++	return int32(epoll_ctl(epfd, wasixEpollCtlAdd, int32(fd), unsafe.Pointer(&ev)))
++}
++
++func netpollclose(fd uintptr) int32 {
++	var ev wasixEpollEvent
++	return int32(epoll_ctl(epfd, wasixEpollCtlDel, int32(fd), unsafe.Pointer(&ev)))
++}
++
++// netpollarm is what the level-triggered poll_oneoff poller needs before a
++// wait; epoll keeps the interest, so there is nothing to arm.
++func netpollarm(pd *pollDesc, mode int) {
++}
++
++// netpollBreak interrupts an epoll_wait.
++func netpollBreak() {
++	// Failing to cas indicates there is an in-flight wakeup, so we're done here.
++	if !netpollWakeSig.CompareAndSwap(0, 1) {
++		return
++	}
++	wasixEventSignal(netpollEventFd)
++}
++
++// netpoll checks for ready network connections.
++// Returns a list of goroutines that become runnable,
++// and a delta to add to netpollWaiters.
++// This must never return an empty list with a non-zero delta.
++//
++// delay < 0: blocks indefinitely
++// delay == 0: does not block, just polls
++// delay > 0: block for up to that many nanoseconds
++func netpoll(delay int64) (gList, int32) {
++	if epfd == -1 {
++		return gList{}, 0
++	}
++	timeout := wasixEpollForever
++	if delay >= 0 {
++		timeout = uint64(delay)
++	}
++	var events [128]wasixEpollEvent
++retry:
++	var n uint32
++	e := epoll_wait(epfd, unsafe.Pointer(&events[0]), int32(len(events)), timeout, unsafe.Pointer(&n))
++	if e != 0 {
++		if e != _EINTR {
++			println("runtime: epoll_wait on fd", epfd, "failed with", e)
++			throw("runtime: netpoll failed")
++		}
++		// If a timed sleep was interrupted, just return to
++		// recalculate how long we should sleep now.
++		if delay > 0 {
++			return gList{}, 0
++		}
++		goto retry
++	}
++	var toRun gList
++	delta := int32(0)
++	for i := uint32(0); i < n; i++ {
++		ev := &events[i]
++		if ev.events == 0 {
++			continue
++		}
++		if ev.data2 == netpollBreakData {
++			if delay != 0 {
++				// netpollBreak could be picked up by a
++				// nonblocking poll. Only read the 8-byte
++				// integer if blocking.
++				var value uint64
++				iov := iovec{buf: uintptr32(uintptr(unsafe.Pointer(&value))), bufLen: 8}
++				var n size
++				fd_read(netpollEventFd, unsafe.Pointer(&iov), 1, unsafe.Pointer(&n))
++				netpollWakeSig.Store(0)
++			} else {
++				// Linux reports the descriptor to every poll
++				// while it stays readable, so the blocking poll
++				// this wakeup is for still sees it. WASIX
++				// reports it once per write, and this poll has
++				// just taken that report: write again, or the
++				// blocking poll sleeps through the wakeup and,
++				// with netpollWakeSig left set, no later
++				// netpollBreak writes at all.
++				wasixEventSignal(netpollEventFd)
++			}
++			continue
++		}
++		var mode int32
++		if ev.events&(wasixEpollIn|wasixEpollRdHup|wasixEpollHup|wasixEpollErr) != 0 {
++			mode += 'r'
++		}
++		if ev.events&(wasixEpollOut|wasixEpollHup|wasixEpollErr) != 0 {
++			mode += 'w'
++		}
++		if mode != 0 {
++			tp := taggedPointer(ev.data2)
++			pd := (*pollDesc)(tp.pointer())
++			tag := tp.tag()
++			if pd.fdseq.Load() == tag {
++				pd.setEventErr(ev.events == wasixEpollErr, tag)
++				delta += netpollready(&toRun, pd, mode)
++			}
++		}
++	}
++	return toRun, delta
++}

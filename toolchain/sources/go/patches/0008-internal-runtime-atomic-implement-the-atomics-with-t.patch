@@ -1,0 +1,437 @@
+Subject: internal/runtime/atomic: implement the atomics with the threads
+ proposal's instructions
+Last-Update: 2026-10-04
+
+The wasm port's atomic operations were plain loads and stores, correct
+on one thread only. With GOWASM=threads the package implements them
+with the threads proposal's atomic instructions, sequentially
+consistent as the proposal defines them, so that the runtime and
+sync/atomic are correct with several threads over a shared memory.
+Address 0 does not trap in wasm, so each body first checks its pointer
+and raises the nil dereference panic on nil, as the compiler's check
+does for the pure Go version. A function that differs from another only
+in its Go types jumps to that body, as on the other ports. Without the
+feature the single-threaded implementation stays.
+
+diff --git a/src/internal/runtime/atomic/atomic_wasm.go b/src/internal/runtime/atomic/atomic_wasm.go
+index 3f14da1..1ec1ffa 100644
+--- a/src/internal/runtime/atomic/atomic_wasm.go
++++ b/src/internal/runtime/atomic/atomic_wasm.go
+@@ -2,8 +2,12 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
++//go:build wasm && !wasm.threads
++
+ // TODO(neelance): implement with actual atomic operations as soon as threads are available
+ // See https://github.com/WebAssembly/design/issues/1073
++// With GOWASM=threads the program may run on several threads and
++// atomic_wasm_threads.s provides them.
+ 
+ // Export some functions via linkname to assembly in sync/atomic.
+ //
+diff --git a/src/internal/runtime/atomic/atomic_wasm.s b/src/internal/runtime/atomic/atomic_wasm.s
+index 1c2d1ce..3ffbbd7 100644
+--- a/src/internal/runtime/atomic/atomic_wasm.s
++++ b/src/internal/runtime/atomic/atomic_wasm.s
+@@ -2,6 +2,8 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
++//go:build wasm && !wasm.threads
++
+ #include "textflag.h"
+ 
+ TEXT ·StorepNoWB(SB), NOSPLIT, $0-16
+diff --git a/src/internal/runtime/atomic/atomic_wasm_threads.go b/src/internal/runtime/atomic/atomic_wasm_threads.go
+new file mode 100644
+index 0000000..9da3e2d
+--- /dev/null
++++ b/src/internal/runtime/atomic/atomic_wasm_threads.go
+@@ -0,0 +1,106 @@
++// Copyright 2018 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build wasm && wasm.threads
++
++// With GOWASM=threads the program may run on several threads, so the
++// atomics are the threads proposal's atomic instructions, in
++// atomic_wasm_threads.s. The functions every port implements in
++// assembly are declared in stubs.go.
++
++package atomic
++
++import "unsafe"
++
++//go:noescape
++func Load(ptr *uint32) uint32
++
++// NO go:noescape annotation; *ptr escapes if result escapes (#31525)
++func Loadp(ptr unsafe.Pointer) unsafe.Pointer
++
++//go:noescape
++func LoadAcq(ptr *uint32) uint32
++
++//go:noescape
++func LoadAcq64(ptr *uint64) uint64
++
++//go:noescape
++func LoadAcquintptr(ptr *uintptr) uintptr
++
++//go:noescape
++func Load8(ptr *uint8) uint8
++
++//go:noescape
++func Load64(ptr *uint64) uint64
++
++//go:noescape
++func Xadd(ptr *uint32, delta int32) uint32
++
++//go:noescape
++func Xadd64(ptr *uint64, delta int64) uint64
++
++//go:noescape
++func Xadduintptr(ptr *uintptr, delta uintptr) uintptr
++
++//go:noescape
++func Xchg(ptr *uint32, new uint32) uint32
++
++//go:noescape
++func Xchg8(addr *uint8, v uint8) uint8
++
++//go:noescape
++func Xchg64(ptr *uint64, new uint64) uint64
++
++//go:noescape
++func Xchguintptr(ptr *uintptr, new uintptr) uintptr
++
++//go:noescape
++func And8(ptr *uint8, val uint8)
++
++//go:noescape
++func Or8(ptr *uint8, val uint8)
++
++//go:noescape
++func And(ptr *uint32, val uint32)
++
++//go:noescape
++func Or(ptr *uint32, val uint32)
++
++//go:noescape
++func Cas64(ptr *uint64, old, new uint64) bool
++
++//go:noescape
++func CasRel(ptr *uint32, old, new uint32) bool
++
++//go:noescape
++func Store(ptr *uint32, val uint32)
++
++//go:noescape
++func StoreRel(ptr *uint32, val uint32)
++
++//go:noescape
++func StoreRel64(ptr *uint64, val uint64)
++
++//go:noescape
++func StoreReluintptr(ptr *uintptr, val uintptr)
++
++//go:noescape
++func Store8(ptr *uint8, val uint8)
++
++//go:noescape
++func Store64(ptr *uint64, val uint64)
++
++// StorepNoWB performs *ptr = val atomically and without a write
++// barrier.
++//
++// NO go:noescape annotation; see atomic_pointer.go.
++func StorepNoWB(ptr unsafe.Pointer, val unsafe.Pointer)
++
++// panicNil raises the nil dereference panic for an atomic operation on a
++// nil pointer. The assembly bodies jump to it, since address 0 does not
++// trap in wasm; the store below is the compiler's own nil check.
++func panicNil() {
++	var p *uint32
++	*p = 0
++}
+diff --git a/src/internal/runtime/atomic/atomic_wasm_threads.s b/src/internal/runtime/atomic/atomic_wasm_threads.s
+new file mode 100644
+index 0000000..784f3da
+--- /dev/null
++++ b/src/internal/runtime/atomic/atomic_wasm_threads.s
+@@ -0,0 +1,261 @@
++//go:build wasm && wasm.threads
++
++#include "textflag.h"
++
++// The threads proposal's atomic instructions take the address as an i32
++// on the operand stack, then the operands, and an immediate offset,
++// here always 0; a read-modify-write returns the old value. The Go
++// arguments are read from the frame; a result is stored back through
++// the SP pushed first. Address 0 does not trap in wasm, so each body
++// first checks the pointer and, when it is nil, jumps to panicNil, which
++// raises the nil dereference panic; a jump, since only a call without a
++// resume point may be made inside a block, and it may not unwind. A
++// function that differs from another only in its Go types jumps to that
++// body, as the other ports' do.
++
++#define NILCHECK(p) I64Load p+0(FP); I64Eqz; If; JMP ·panicNil(SB); End
++
++TEXT ·Load(SB), NOSPLIT, $0-12
++	NILCHECK(ptr)
++	Get SP
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32AtomicLoad $0
++	I32Store ret+8(FP)
++	RET
++
++TEXT ·LoadAcq(SB), NOSPLIT, $0-12
++	JMP ·Load(SB)
++
++TEXT ·Loadint32(SB), NOSPLIT, $0-12
++	JMP ·Load(SB)
++
++TEXT ·Load8(SB), NOSPLIT, $0-9
++	NILCHECK(ptr)
++	Get SP
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32AtomicLoad8U $0
++	I32Store8 ret+8(FP)
++	RET
++
++TEXT ·Load64(SB), NOSPLIT, $0-16
++	NILCHECK(ptr)
++	Get SP
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I64AtomicLoad $0
++	I64Store ret+8(FP)
++	RET
++
++TEXT ·LoadAcq64(SB), NOSPLIT, $0-16
++	JMP ·Load64(SB)
++
++TEXT ·Loadint64(SB), NOSPLIT, $0-16
++	JMP ·Load64(SB)
++
++TEXT ·Loaduintptr(SB), NOSPLIT, $0-16
++	JMP ·Load64(SB)
++
++TEXT ·LoadAcquintptr(SB), NOSPLIT, $0-16
++	JMP ·Load64(SB)
++
++TEXT ·Loaduint(SB), NOSPLIT, $0-16
++	JMP ·Load64(SB)
++
++TEXT ·Loadp(SB), NOSPLIT, $0-16
++	JMP ·Load64(SB)
++
++TEXT ·Store(SB), NOSPLIT, $0-12
++	NILCHECK(ptr)
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32Load val+8(FP)
++	I32AtomicStore $0
++	RET
++
++TEXT ·StoreRel(SB), NOSPLIT, $0-12
++	JMP ·Store(SB)
++
++TEXT ·Storeint32(SB), NOSPLIT, $0-12
++	JMP ·Store(SB)
++
++TEXT ·Store8(SB), NOSPLIT, $0-9
++	NILCHECK(ptr)
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32Load8U val+8(FP)
++	I32AtomicStore8 $0
++	RET
++
++TEXT ·Store64(SB), NOSPLIT, $0-16
++	NILCHECK(ptr)
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I64Load val+8(FP)
++	I64AtomicStore $0
++	RET
++
++TEXT ·StoreRel64(SB), NOSPLIT, $0-16
++	JMP ·Store64(SB)
++
++TEXT ·StoreReluintptr(SB), NOSPLIT, $0-16
++	JMP ·Store64(SB)
++
++TEXT ·Storeint64(SB), NOSPLIT, $0-16
++	JMP ·Store64(SB)
++
++TEXT ·Storeuintptr(SB), NOSPLIT, $0-16
++	JMP ·Store64(SB)
++
++TEXT ·StorepNoWB(SB), NOSPLIT, $0-16
++	JMP ·Store64(SB)
++
++TEXT ·Xadd(SB), NOSPLIT, $0-20
++	NILCHECK(ptr)
++	Get SP
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32Load delta+8(FP)
++	I32AtomicRmwAdd $0
++	I32Load delta+8(FP)
++	I32Add
++	I32Store ret+16(FP)
++	RET
++
++TEXT ·Xaddint32(SB), NOSPLIT, $0-20
++	JMP ·Xadd(SB)
++
++TEXT ·Xadd64(SB), NOSPLIT, $0-24
++	NILCHECK(ptr)
++	Get SP
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I64Load delta+8(FP)
++	I64AtomicRmwAdd $0
++	I64Load delta+8(FP)
++	I64Add
++	I64Store ret+16(FP)
++	RET
++
++TEXT ·Xaddint64(SB), NOSPLIT, $0-24
++	JMP ·Xadd64(SB)
++
++TEXT ·Xadduintptr(SB), NOSPLIT, $0-24
++	JMP ·Xadd64(SB)
++
++TEXT ·Xchg(SB), NOSPLIT, $0-20
++	NILCHECK(ptr)
++	Get SP
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32Load new+8(FP)
++	I32AtomicRmwXchg $0
++	I32Store ret+16(FP)
++	RET
++
++TEXT ·Xchgint32(SB), NOSPLIT, $0-20
++	JMP ·Xchg(SB)
++
++TEXT ·Xchg8(SB), NOSPLIT, $0-17
++	NILCHECK(addr)
++	Get SP
++	I64Load addr+0(FP)
++	I32WrapI64
++	I32Load8U v+8(FP)
++	I32AtomicRmw8XchgU $0
++	I32Store8 ret+16(FP)
++	RET
++
++TEXT ·Xchg64(SB), NOSPLIT, $0-24
++	NILCHECK(ptr)
++	Get SP
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I64Load new+8(FP)
++	I64AtomicRmwXchg $0
++	I64Store ret+16(FP)
++	RET
++
++TEXT ·Xchgint64(SB), NOSPLIT, $0-24
++	JMP ·Xchg64(SB)
++
++TEXT ·Xchguintptr(SB), NOSPLIT, $0-24
++	JMP ·Xchg64(SB)
++
++TEXT ·And8(SB), NOSPLIT, $0-9
++	NILCHECK(ptr)
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32Load8U val+8(FP)
++	I32AtomicRmw8AndU $0
++	Drop
++	RET
++
++TEXT ·Or8(SB), NOSPLIT, $0-9
++	NILCHECK(ptr)
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32Load8U val+8(FP)
++	I32AtomicRmw8OrU $0
++	Drop
++	RET
++
++TEXT ·And(SB), NOSPLIT, $0-12
++	NILCHECK(ptr)
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32Load val+8(FP)
++	I32AtomicRmwAnd $0
++	Drop
++	RET
++
++TEXT ·Or(SB), NOSPLIT, $0-12
++	NILCHECK(ptr)
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32Load val+8(FP)
++	I32AtomicRmwOr $0
++	Drop
++	RET
++
++TEXT ·Cas(SB), NOSPLIT, $0-17
++	NILCHECK(ptr)
++	Get SP
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I32Load old+8(FP)
++	I32Load new+12(FP)
++	I32AtomicRmwCmpxchg $0
++	I32Load old+8(FP)
++	I32Eq
++	I32Store8 ret+16(FP)
++	RET
++
++TEXT ·CasRel(SB), NOSPLIT, $0-17
++	JMP ·Cas(SB)
++
++TEXT ·Casint32(SB), NOSPLIT, $0-17
++	JMP ·Cas(SB)
++
++TEXT ·Cas64(SB), NOSPLIT, $0-25
++	NILCHECK(ptr)
++	Get SP
++	I64Load ptr+0(FP)
++	I32WrapI64
++	I64Load old+8(FP)
++	I64Load new+16(FP)
++	I64AtomicRmwCmpxchg $0
++	I64Load old+8(FP)
++	I64Eq
++	I32Store8 ret+24(FP)
++	RET
++
++TEXT ·Casint64(SB), NOSPLIT, $0-25
++	JMP ·Cas64(SB)
++
++TEXT ·Casuintptr(SB), NOSPLIT, $0-25
++	JMP ·Cas64(SB)
++
++TEXT ·Casp1(SB), NOSPLIT, $0-25
++	JMP ·Cas64(SB)
+diff --git a/src/internal/runtime/atomic/stubs.go b/src/internal/runtime/atomic/stubs.go
+index 7df8d9c..a8aca2d 100644
+--- a/src/internal/runtime/atomic/stubs.go
++++ b/src/internal/runtime/atomic/stubs.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !wasm
++//go:build !wasm || wasm.threads
+ 
+ package atomic
+ 

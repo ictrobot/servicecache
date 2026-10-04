@@ -1,0 +1,441 @@
+Subject: syscall, net: treat the host calls that can wait as system calls on
+ OS threads
+Last-Update: 2026-10-04
+
+On Linux a system call is bracketed by the runtime's entersyscall and
+exitsyscall: the goroutine's P is marked, so that sysmon can hand it to
+another thread if the call is long and a stop-the-world can take it at
+once, since the goroutine touches no Go memory until the call returns.
+The wasip1 port makes its WASI preview 1 calls bare, which costs nothing
+on one thread, where there is no other thread to hand a P to and no
+collection runs concurrently.
+
+With OS threads a thread blocked in a host call held its P: the
+collector's stop-the-world waited for the call to return, and every
+other thread with it, so a program with one goroutine in a read of a
+pipe stopped at its first collection. With GOWASM=threads the calls that
+can wait are bracketed as on Linux: the file layer's, the socket calls
+that wait for a peer (accept, connect, receive and send) and the
+resolver's. Their arguments are evaluated before the bracket, since no
+Go call may fall inside it. The single-threaded builds keep the bare
+calls, through empty hooks. The port's nanotime1 is nosplit, as every
+other port's clock is: casgstatus reads the clock while a goroutine
+leaves the syscall state, where a stack split is not allowed.
+
+diff --git a/src/net/cgo_wasix.go b/src/net/cgo_wasix.go
+index 8059740..3576ace 100644
+--- a/src/net/cgo_wasix.go
++++ b/src/net/cgo_wasix.go
+@@ -19,6 +19,16 @@ const cgoAvailable = true
+ //go:noescape
+ func wasix_resolve(host unsafe.Pointer, hostLen uint32, port int32, addrs unsafe.Pointer, naddrs uint32, ret unsafe.Pointer) syscall.Errno
+ 
++// A lookup waits on the system's resolver, so the call is a system call
++// to the scheduler, as a cgo lookup is on Linux: with OS threads the P
++// is handed on or taken by a stop-the-world meanwhile.
++//
++//go:linkname runtime_entersyscall runtime.entersyscall
++func runtime_entersyscall()
++
++//go:linkname runtime_exitsyscall runtime.exitsyscall
++func runtime_exitsyscall()
++
+ // wasixAddrOf is WASIX's addr: the family tag, a padding byte and the
+ // address octets.
+ type wasixAddrOf struct {
+@@ -34,7 +44,10 @@ func wasixLookupIP(name string) ([]IPAddr, error) {
+ 	var addrs [32]wasixAddrOf
+ 	var n uint32
+ 	host := []byte(name)
+-	errno := wasix_resolve(unsafe.Pointer(&host[0]), uint32(len(host)), 0, unsafe.Pointer(&addrs[0]), uint32(len(addrs)), unsafe.Pointer(&n))
++	hostPtr := unsafe.Pointer(&host[0])
++	runtime_entersyscall()
++	errno := wasix_resolve(hostPtr, uint32(len(host)), 0, unsafe.Pointer(&addrs[0]), uint32(len(addrs)), unsafe.Pointer(&n))
++	runtime_exitsyscall()
+ 	if errno != 0 {
+ 		return nil, &DNSError{Err: errno.Error(), Name: name, IsNotFound: errno == syscall.ENOENT}
+ 	}
+diff --git a/src/runtime/os_wasip1.go b/src/runtime/os_wasip1.go
+index ed4f646..dce0cc7 100644
+--- a/src/runtime/os_wasip1.go
++++ b/src/runtime/os_wasip1.go
+@@ -259,6 +259,11 @@ func walltime1() (sec int64, nsec int32) {
+ 	return int64(time / 1000000000), int32(time % 1000000000)
+ }
+ 
++// nanotime1 is nosplit, as the other ports' clocks are: casgstatus
++// reads the clock while a goroutine is leaving the syscall state, when
++// a stack split is not allowed.
++//
++//go:nosplit
+ func nanotime1() int64 {
+ 	var time timestamp
+ 	if clock_time_get(clockMonotonic, 0, &time) != 0 {
+diff --git a/src/syscall/fs_wasip1.go b/src/syscall/fs_wasip1.go
+index 0eff07e..214e050 100644
+--- a/src/syscall/fs_wasip1.go
++++ b/src/syscall/fs_wasip1.go
+@@ -576,6 +576,7 @@ func openat(dirFd int32, pathPtr *byte, pathLen size, openmode int, perm uint32)
+ 	}
+ 
+ 	var fd int32
++	runtime_entersyscall()
+ 	errno := path_open(
+ 		dirFd,
+ 		lflags,
+@@ -587,6 +588,7 @@ func openat(dirFd int32, pathPtr *byte, pathLen size, openmode int, perm uint32)
+ 		fdflags,
+ 		&fd,
+ 	)
++	runtime_exitsyscall()
+ 	if errno == EISDIR && oflags == 0 && fdflags == 0 && ((rights & writeRights) == 0) {
+ 		// wasmtime and wasmedge will error if attempting to open a directory
+ 		// because we are asking for too many rights. However, we cannot
+@@ -597,6 +599,7 @@ func openat(dirFd int32, pathPtr *byte, pathLen size, openmode int, perm uint32)
+ 		// This approach is subject to a race if the file system is modified
+ 		// concurrently, so we also inject OFLAG_DIRECTORY to ensure that we do
+ 		// not accidentally open a file which is not a directory.
++		runtime_entersyscall()
+ 		errno = path_open(
+ 			dirFd,
+ 			LOOKUP_SYMLINK_FOLLOW,
+@@ -608,12 +611,15 @@ func openat(dirFd int32, pathPtr *byte, pathLen size, openmode int, perm uint32)
+ 			fdflags,
+ 			&fd,
+ 		)
++		runtime_exitsyscall()
+ 	}
+ 	return int(fd), errnoErr(errno)
+ }
+ 
+ func Close(fd int) error {
++	runtime_entersyscall()
+ 	errno := fd_close(int32(fd))
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+@@ -626,13 +632,18 @@ func Mkdir(path string, perm uint32) error {
+ 		return EINVAL
+ 	}
+ 	dirFd, pathPtr, pathLen := preparePath(path)
++	runtime_entersyscall()
+ 	errno := path_create_directory(dirFd, pathPtr, pathLen)
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+ func ReadDir(fd int, buf []byte, cookie dircookie) (int, error) {
+ 	var nwritten size
+-	errno := fd_readdir(int32(fd), &buf[0], size(len(buf)), cookie, &nwritten)
++	buf0 := &buf[0]
++	runtime_entersyscall()
++	errno := fd_readdir(int32(fd), buf0, size(len(buf)), cookie, &nwritten)
++	runtime_exitsyscall()
+ 	return int(nwritten), errnoErr(errno)
+ }
+ 
+@@ -658,7 +669,9 @@ func Stat(path string, st *Stat_t) error {
+ 		return EINVAL
+ 	}
+ 	dirFd, pathPtr, pathLen := preparePath(path)
++	runtime_entersyscall()
+ 	errno := path_filestat_get(dirFd, LOOKUP_SYMLINK_FOLLOW, pathPtr, pathLen, unsafe.Pointer(st))
++	runtime_exitsyscall()
+ 	setDefaultMode(st)
+ 	return errnoErr(errno)
+ }
+@@ -668,13 +681,17 @@ func Lstat(path string, st *Stat_t) error {
+ 		return EINVAL
+ 	}
+ 	dirFd, pathPtr, pathLen := preparePath(path)
++	runtime_entersyscall()
+ 	errno := path_filestat_get(dirFd, 0, pathPtr, pathLen, unsafe.Pointer(st))
++	runtime_exitsyscall()
+ 	setDefaultMode(st)
+ 	return errnoErr(errno)
+ }
+ 
+ func Fstat(fd int, st *Stat_t) error {
++	runtime_entersyscall()
+ 	errno := fd_filestat_get(int32(fd), unsafe.Pointer(st))
++	runtime_exitsyscall()
+ 	setDefaultMode(st)
+ 	return errnoErr(errno)
+ }
+@@ -695,7 +712,9 @@ func Unlink(path string) error {
+ 		return EINVAL
+ 	}
+ 	dirFd, pathPtr, pathLen := preparePath(path)
++	runtime_entersyscall()
+ 	errno := path_unlink_file(dirFd, pathPtr, pathLen)
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+@@ -704,7 +723,9 @@ func Rmdir(path string) error {
+ 		return EINVAL
+ 	}
+ 	dirFd, pathPtr, pathLen := preparePath(path)
++	runtime_entersyscall()
+ 	errno := path_remove_directory(dirFd, pathPtr, pathLen)
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+@@ -751,6 +772,7 @@ func UtimesNano(path string, ts []Timespec) error {
+ 			mtime = int64(st.Mtime)
+ 		}
+ 	}
++	runtime_entersyscall()
+ 	errno := path_filestat_set_times(
+ 		dirFd,
+ 		LOOKUP_SYMLINK_FOLLOW,
+@@ -760,6 +782,7 @@ func UtimesNano(path string, ts []Timespec) error {
+ 		timestamp(mtime),
+ 		FILESTAT_SET_ATIM|FILESTAT_SET_MTIM,
+ 	)
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+@@ -769,6 +792,7 @@ func Rename(from, to string) error {
+ 	}
+ 	oldDirFd, oldPathPtr, oldPathLen := preparePath(from)
+ 	newDirFd, newPathPtr, newPathLen := preparePath(to)
++	runtime_entersyscall()
+ 	errno := path_rename(
+ 		oldDirFd,
+ 		oldPathPtr,
+@@ -777,6 +801,7 @@ func Rename(from, to string) error {
+ 		newPathPtr,
+ 		newPathLen,
+ 	)
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+@@ -793,7 +818,9 @@ func Truncate(path string, length int64) error {
+ }
+ 
+ func Ftruncate(fd int, length int64) error {
++	runtime_entersyscall()
+ 	errno := fd_filestat_set_size(int32(fd), filesize(length))
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+@@ -816,7 +843,9 @@ func Chdir(path string) error {
+ 
+ 	var stat Stat_t
+ 	dirFd, pathPtr, pathLen := preparePath(path)
++	runtime_entersyscall()
+ 	errno := path_filestat_get(dirFd, LOOKUP_SYMLINK_FOLLOW, pathPtr, pathLen, unsafe.Pointer(&stat))
++	runtime_exitsyscall()
+ 	if errno != 0 {
+ 		return errnoErr(errno)
+ 	}
+@@ -836,14 +865,17 @@ func Readlink(path string, buf []byte) (n int, err error) {
+ 	}
+ 	dirFd, pathPtr, pathLen := preparePath(path)
+ 	var nwritten size
++	buf0 := &buf[0]
++	runtime_entersyscall()
+ 	errno := path_readlink(
+ 		dirFd,
+ 		pathPtr,
+ 		pathLen,
+-		&buf[0],
++		buf0,
+ 		size(len(buf)),
+ 		&nwritten,
+ 	)
++	runtime_exitsyscall()
+ 	// For some reason wasmtime returns ERANGE when the output buffer is
+ 	// shorter than the symbolic link value. os.Readlink expects a nil
+ 	// error and uses the fact that n is greater or equal to the buffer
+@@ -858,6 +890,7 @@ func Link(path, link string) error {
+ 	}
+ 	oldDirFd, oldPathPtr, oldPathLen := preparePath(path)
+ 	newDirFd, newPathPtr, newPathLen := preparePath(link)
++	runtime_entersyscall()
+ 	errno := path_link(
+ 		oldDirFd,
+ 		0,
+@@ -867,6 +900,7 @@ func Link(path, link string) error {
+ 		newPathPtr,
+ 		newPathLen,
+ 	)
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+@@ -875,6 +909,7 @@ func Symlink(path, link string) error {
+ 		return EINVAL
+ 	}
+ 	dirFd, pathPtr, pathlen := preparePath(link)
++	runtime_entersyscall()
+ 	errno := path_symlink(
+ 		unsafe.StringData(path),
+ 		size(len(path)),
+@@ -882,11 +917,14 @@ func Symlink(path, link string) error {
+ 		pathPtr,
+ 		pathlen,
+ 	)
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+ func Fsync(fd int) error {
++	runtime_entersyscall()
+ 	errno := fd_sync(int32(fd))
++	runtime_exitsyscall()
+ 	return errnoErr(errno)
+ }
+ 
+@@ -899,35 +937,49 @@ func makeIOVec(b []byte) *iovec {
+ 
+ func Read(fd int, b []byte) (int, error) {
+ 	var nread size
+-	errno := fd_read(int32(fd), makeIOVec(b), 1, &nread)
++	iov := makeIOVec(b)
++	runtime_entersyscall()
++	errno := fd_read(int32(fd), iov, 1, &nread)
++	runtime_exitsyscall()
+ 	runtime.KeepAlive(b)
+ 	return int(nread), errnoErr(errno)
+ }
+ 
+ func Write(fd int, b []byte) (int, error) {
+ 	var nwritten size
+-	errno := fd_write(int32(fd), makeIOVec(b), 1, &nwritten)
++	iov := makeIOVec(b)
++	runtime_entersyscall()
++	errno := fd_write(int32(fd), iov, 1, &nwritten)
++	runtime_exitsyscall()
+ 	runtime.KeepAlive(b)
+ 	return int(nwritten), errnoErr(errno)
+ }
+ 
+ func Pread(fd int, b []byte, offset int64) (int, error) {
+ 	var nread size
+-	errno := fd_pread(int32(fd), makeIOVec(b), 1, filesize(offset), &nread)
++	iov := makeIOVec(b)
++	runtime_entersyscall()
++	errno := fd_pread(int32(fd), iov, 1, filesize(offset), &nread)
++	runtime_exitsyscall()
+ 	runtime.KeepAlive(b)
+ 	return int(nread), errnoErr(errno)
+ }
+ 
+ func Pwrite(fd int, b []byte, offset int64) (int, error) {
+ 	var nwritten size
+-	errno := fd_pwrite(int32(fd), makeIOVec(b), 1, filesize(offset), &nwritten)
++	iov := makeIOVec(b)
++	runtime_entersyscall()
++	errno := fd_pwrite(int32(fd), iov, 1, filesize(offset), &nwritten)
++	runtime_exitsyscall()
+ 	runtime.KeepAlive(b)
+ 	return int(nwritten), errnoErr(errno)
+ }
+ 
+ func Seek(fd int, offset int64, whence int) (int64, error) {
+ 	var newoffset filesize
++	runtime_entersyscall()
+ 	errno := fd_seek(int32(fd), filedelta(offset), uint32(whence), &newoffset)
++	runtime_exitsyscall()
+ 	return int64(newoffset), errnoErr(errno)
+ }
+ 
+diff --git a/src/syscall/net_wasix.go b/src/syscall/net_wasix.go
+index 562df0b..247ef45 100644
+--- a/src/syscall/net_wasix.go
++++ b/src/syscall/net_wasix.go
+@@ -245,7 +245,10 @@ func Listen(fd int, backlog int) error {
+ func Accept(fd int) (int, Sockaddr, error) {
+ 	var newfd int32
+ 	var addr wasixAddrPort
+-	if errno := sock_accept_addr(int32(fd), 0, unsafe.Pointer(&newfd), unsafe.Pointer(&addr)); errno != 0 {
++	runtime_entersyscall()
++	errno := sock_accept_addr(int32(fd), 0, unsafe.Pointer(&newfd), unsafe.Pointer(&addr))
++	runtime_exitsyscall()
++	if errno != 0 {
+ 		return -1, nil, errnoErr(errno)
+ 	}
+ 	return int(newfd), addr.sockaddr(), nil
+@@ -259,7 +262,10 @@ func Connect(fd int, sa Sockaddr) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	return errnoErr(sock_connect(int32(fd), unsafe.Pointer(&addr)))
++	runtime_entersyscall()
++	errno := sock_connect(int32(fd), unsafe.Pointer(&addr))
++	runtime_exitsyscall()
++	return errnoErr(errno)
+ }
+ 
+ func Getsockname(fd int) (Sockaddr, error) {
+@@ -343,7 +349,10 @@ func Recvfrom(fd int, p []byte, flags int) (n int, from Sockaddr, err error) {
+ 	var nread size
+ 	var roFlags uint16
+ 	var addr wasixAddrPort
+-	errno := sock_recv_from(int32(fd), unsafe.Pointer(makeIOVec(p)), 1, int32(flags), unsafe.Pointer(&nread), unsafe.Pointer(&roFlags), unsafe.Pointer(&addr))
++	iov := unsafe.Pointer(makeIOVec(p))
++	runtime_entersyscall()
++	errno := sock_recv_from(int32(fd), iov, 1, int32(flags), unsafe.Pointer(&nread), unsafe.Pointer(&roFlags), unsafe.Pointer(&addr))
++	runtime_exitsyscall()
+ 	if errno != 0 {
+ 		return 0, nil, errnoErr(errno)
+ 	}
+@@ -362,7 +371,11 @@ func Sendto(fd int, p []byte, flags int, to Sockaddr) error {
+ 		return err
+ 	}
+ 	var nwritten size
+-	return errnoErr(sock_send_to(int32(fd), unsafe.Pointer(makeIOVec(p)), 1, int32(flags), unsafe.Pointer(&addr), unsafe.Pointer(&nwritten)))
++	iov := unsafe.Pointer(makeIOVec(p))
++	runtime_entersyscall()
++	errno := sock_send_to(int32(fd), iov, 1, int32(flags), unsafe.Pointer(&addr), unsafe.Pointer(&nwritten))
++	runtime_exitsyscall()
++	return errnoErr(errno)
+ }
+ 
+ func Recvmsg(fd int, p, oob []byte, flags int) (n, oobn, recvflags int, from Sockaddr, err error) {
+diff --git a/src/syscall/syscall_wasip1_nothreads.go b/src/syscall/syscall_wasip1_nothreads.go
+new file mode 100644
+index 0000000..5301075
+--- /dev/null
++++ b/src/syscall/syscall_wasip1_nothreads.go
+@@ -0,0 +1,10 @@
++//go:build wasip1 && !(wasix && wasm.threads)
++
++package syscall
++
++// On one thread there is no other thread to hand a P to, so the host
++// calls are made bare.
++
++func runtime_entersyscall() {}
++
++func runtime_exitsyscall() {}
+diff --git a/src/syscall/syscall_wasix_threads.go b/src/syscall/syscall_wasix_threads.go
+new file mode 100644
+index 0000000..148e0c6
+--- /dev/null
++++ b/src/syscall/syscall_wasix_threads.go
+@@ -0,0 +1,17 @@
++//go:build wasip1 && wasix && wasm.threads
++
++package syscall
++
++import _ "unsafe" // for go:linkname
++
++// With OS threads a host call that waits must not hold its P: the calls
++// that can wait are bracketed by the runtime's entersyscall and
++// exitsyscall, as system calls are on Linux, so that the scheduler can
++// hand the P to another thread and a stop-the-world can take it without
++// waiting for the call to return.
++
++//go:linkname runtime_entersyscall runtime.entersyscall
++func runtime_entersyscall()
++
++//go:linkname runtime_exitsyscall runtime.exitsyscall
++func runtime_exitsyscall()

@@ -1,0 +1,274 @@
+Subject: cmd/internal/obj/wasm: add the threads proposal's instructions
+Last-Update: 2026-10-04
+
+The assembler gains the threads proposal's instructions: memory.atomic
+wait and notify, atomic.fence, and the atomic loads, stores,
+read-modify-writes and compare-exchanges of every width, encoded with
+the 0xFE prefix, the natural alignment of the access and the constant
+offset the instruction was given. Assembly files built for an engine
+that has them can use them. wasi_thread_start joins the entry functions
+assembled without the Go prologue and without the PC_B parameter, since
+the WASIX runtime calls it with its own two arguments.
+
+diff --git a/src/cmd/internal/obj/wasm/a.out.go b/src/cmd/internal/obj/wasm/a.out.go
+index 0262630..0f154e2 100644
+--- a/src/cmd/internal/obj/wasm/a.out.go
++++ b/src/cmd/internal/obj/wasm/a.out.go
+@@ -241,6 +241,90 @@ const (
+ 	ATableSize
+ 	ATableFill
+ 
++	// The threads proposal's atomic instructions, prefix 0xFE. The
++	// numbering has a gap between the fence and the loads, which the
++	// unused names keep so that the opcode is the distance from
++	// AAtomicNotify.
++	AAtomicNotify // opcode 0xFE 0x00
++	AI32AtomicWait
++	AI64AtomicWait
++	AAtomicFence
++	AAtomicUnused04
++	AAtomicUnused05
++	AAtomicUnused06
++	AAtomicUnused07
++	AAtomicUnused08
++	AAtomicUnused09
++	AAtomicUnused0A
++	AAtomicUnused0B
++	AAtomicUnused0C
++	AAtomicUnused0D
++	AAtomicUnused0E
++	AAtomicUnused0F
++	AI32AtomicLoad // opcode 0xFE 0x10
++	AI64AtomicLoad
++	AI32AtomicLoad8U
++	AI32AtomicLoad16U
++	AI64AtomicLoad8U
++	AI64AtomicLoad16U
++	AI64AtomicLoad32U
++	AI32AtomicStore // opcode 0xFE 0x17
++	AI64AtomicStore
++	AI32AtomicStore8
++	AI32AtomicStore16
++	AI64AtomicStore8
++	AI64AtomicStore16
++	AI64AtomicStore32
++	AI32AtomicRmwAdd // opcode 0xFE 0x1E
++	AI64AtomicRmwAdd
++	AI32AtomicRmw8AddU
++	AI32AtomicRmw16AddU
++	AI64AtomicRmw8AddU
++	AI64AtomicRmw16AddU
++	AI64AtomicRmw32AddU
++	AI32AtomicRmwSub // opcode 0xFE 0x25
++	AI64AtomicRmwSub
++	AI32AtomicRmw8SubU
++	AI32AtomicRmw16SubU
++	AI64AtomicRmw8SubU
++	AI64AtomicRmw16SubU
++	AI64AtomicRmw32SubU
++	AI32AtomicRmwAnd // opcode 0xFE 0x2C
++	AI64AtomicRmwAnd
++	AI32AtomicRmw8AndU
++	AI32AtomicRmw16AndU
++	AI64AtomicRmw8AndU
++	AI64AtomicRmw16AndU
++	AI64AtomicRmw32AndU
++	AI32AtomicRmwOr // opcode 0xFE 0x33
++	AI64AtomicRmwOr
++	AI32AtomicRmw8OrU
++	AI32AtomicRmw16OrU
++	AI64AtomicRmw8OrU
++	AI64AtomicRmw16OrU
++	AI64AtomicRmw32OrU
++	AI32AtomicRmwXor // opcode 0xFE 0x3A
++	AI64AtomicRmwXor
++	AI32AtomicRmw8XorU
++	AI32AtomicRmw16XorU
++	AI64AtomicRmw8XorU
++	AI64AtomicRmw16XorU
++	AI64AtomicRmw32XorU
++	AI32AtomicRmwXchg // opcode 0xFE 0x41
++	AI64AtomicRmwXchg
++	AI32AtomicRmw8XchgU
++	AI32AtomicRmw16XchgU
++	AI64AtomicRmw8XchgU
++	AI64AtomicRmw16XchgU
++	AI64AtomicRmw32XchgU
++	AI32AtomicRmwCmpxchg // opcode 0xFE 0x48
++	AI64AtomicRmwCmpxchg
++	AI32AtomicRmw8CmpxchgU
++	AI32AtomicRmw16CmpxchgU
++	AI64AtomicRmw8CmpxchgU
++	AI64AtomicRmw16CmpxchgU
++	AI64AtomicRmw32CmpxchgU
++
+ 	ALast // Sentinel: End of low-level WebAssembly instructions.
+ 
+ 	ARESUMEPOINT
+diff --git a/src/cmd/internal/obj/wasm/anames.go b/src/cmd/internal/obj/wasm/anames.go
+index 6f1a662..ad11184 100644
+--- a/src/cmd/internal/obj/wasm/anames.go
++++ b/src/cmd/internal/obj/wasm/anames.go
+@@ -204,6 +204,85 @@ var Anames = []string{
+ 	"TableGrow",
+ 	"TableSize",
+ 	"TableFill",
++	"AtomicNotify",
++	"I32AtomicWait",
++	"I64AtomicWait",
++	"AtomicFence",
++	"AtomicUnused04",
++	"AtomicUnused05",
++	"AtomicUnused06",
++	"AtomicUnused07",
++	"AtomicUnused08",
++	"AtomicUnused09",
++	"AtomicUnused0A",
++	"AtomicUnused0B",
++	"AtomicUnused0C",
++	"AtomicUnused0D",
++	"AtomicUnused0E",
++	"AtomicUnused0F",
++	"I32AtomicLoad",
++	"I64AtomicLoad",
++	"I32AtomicLoad8U",
++	"I32AtomicLoad16U",
++	"I64AtomicLoad8U",
++	"I64AtomicLoad16U",
++	"I64AtomicLoad32U",
++	"I32AtomicStore",
++	"I64AtomicStore",
++	"I32AtomicStore8",
++	"I32AtomicStore16",
++	"I64AtomicStore8",
++	"I64AtomicStore16",
++	"I64AtomicStore32",
++	"I32AtomicRmwAdd",
++	"I64AtomicRmwAdd",
++	"I32AtomicRmw8AddU",
++	"I32AtomicRmw16AddU",
++	"I64AtomicRmw8AddU",
++	"I64AtomicRmw16AddU",
++	"I64AtomicRmw32AddU",
++	"I32AtomicRmwSub",
++	"I64AtomicRmwSub",
++	"I32AtomicRmw8SubU",
++	"I32AtomicRmw16SubU",
++	"I64AtomicRmw8SubU",
++	"I64AtomicRmw16SubU",
++	"I64AtomicRmw32SubU",
++	"I32AtomicRmwAnd",
++	"I64AtomicRmwAnd",
++	"I32AtomicRmw8AndU",
++	"I32AtomicRmw16AndU",
++	"I64AtomicRmw8AndU",
++	"I64AtomicRmw16AndU",
++	"I64AtomicRmw32AndU",
++	"I32AtomicRmwOr",
++	"I64AtomicRmwOr",
++	"I32AtomicRmw8OrU",
++	"I32AtomicRmw16OrU",
++	"I64AtomicRmw8OrU",
++	"I64AtomicRmw16OrU",
++	"I64AtomicRmw32OrU",
++	"I32AtomicRmwXor",
++	"I64AtomicRmwXor",
++	"I32AtomicRmw8XorU",
++	"I32AtomicRmw16XorU",
++	"I64AtomicRmw8XorU",
++	"I64AtomicRmw16XorU",
++	"I64AtomicRmw32XorU",
++	"I32AtomicRmwXchg",
++	"I64AtomicRmwXchg",
++	"I32AtomicRmw8XchgU",
++	"I32AtomicRmw16XchgU",
++	"I64AtomicRmw8XchgU",
++	"I64AtomicRmw16XchgU",
++	"I64AtomicRmw32XchgU",
++	"I32AtomicRmwCmpxchg",
++	"I64AtomicRmwCmpxchg",
++	"I32AtomicRmw8CmpxchgU",
++	"I32AtomicRmw16CmpxchgU",
++	"I64AtomicRmw8CmpxchgU",
++	"I64AtomicRmw16CmpxchgU",
++	"I64AtomicRmw32CmpxchgU",
+ 	"Last",
+ 	"RESUMEPOINT",
+ 	"CALLNORESUME",
+diff --git a/src/cmd/internal/obj/wasm/wasmobj.go b/src/cmd/internal/obj/wasm/wasmobj.go
+index 9b940d3..af1f78b 100644
+--- a/src/cmd/internal/obj/wasm/wasmobj.go
++++ b/src/cmd/internal/obj/wasm/wasmobj.go
+@@ -1030,6 +1030,7 @@ var notUsePC_B = map[string]bool{
+ 	"_rt0_wasm_js":            true,
+ 	"_rt0_wasm_wasip1":        true,
+ 	"_rt0_wasm_wasip1_lib":    true,
++	"wasi_thread_start":       true,
+ 	"wasm_export_run":         true,
+ 	"wasm_export_resume":      true,
+ 	"wasm_export_getsp":       true,
+@@ -1086,7 +1087,7 @@ func assemble(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
+ 	// Function starts with declaration of locals: numbers and types.
+ 	// Some functions use a special calling convention.
+ 	switch s.Name {
+-	case "_rt0_wasm_js", "_rt0_wasm_wasip1", "_rt0_wasm_wasip1_lib",
++	case "_rt0_wasm_js", "_rt0_wasm_wasip1", "_rt0_wasm_wasip1_lib", "wasi_thread_start",
+ 		"wasm_export_run", "wasm_export_resume", "wasm_export_getsp",
+ 		"wasm_pc_f_loop", "runtime.wasmDiv", "runtime.wasmTruncS", "runtime.wasmTruncU", "memeqbody":
+ 		varDecls = []*varDecl{}
+@@ -1362,6 +1363,19 @@ func assemble(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
+ 			w.WriteByte(0x00)
+ 			w.WriteByte(0x00)
+ 
++		case AAtomicFence:
++			w.WriteByte(0x00)
++
++		default:
++			if p.As >= AAtomicNotify && p.As < ALast {
++				// An atomic memory instruction: the natural alignment
++				// of its access and the constant offset it was given.
++				if p.From.Type != obj.TYPE_CONST || p.From.Offset < 0 || p.From.Offset > math.MaxUint32 {
++					ctxt.Diag("bad offset in %v", p)
++				}
++				writeUleb128(w, atomicAlign(p.As))
++				writeUleb128(w, uint64(p.From.Offset))
++			}
+ 		}
+ 	}
+ 
+@@ -1370,6 +1384,21 @@ func assemble(ctxt *obj.Link, s *obj.LSym, newprog obj.ProgAlloc) {
+ 	s.P = w.Bytes()
+ }
+ 
++// atomicAlign is the log2 of the access width of an atomic memory
++// instruction, which the threads proposal requires as its alignment.
++func atomicAlign(as obj.As) uint64 {
++	switch as {
++	case AAtomicNotify, AI32AtomicWait:
++		return 2
++	case AI64AtomicWait:
++		return 3
++	}
++	// From the loads on, each group of seven instructions is the i32 and
++	// i64 forms, then the 8- and 16-bit i32 forms and the 8-, 16- and
++	// 32-bit i64 forms.
++	return [7]uint64{2, 3, 0, 1, 0, 1, 2}[(as-AI32AtomicLoad)%7]
++}
++
+ func updateLocalSP(w *bytes.Buffer) {
+ 	writeOpcode(w, AGlobalGet)
+ 	writeUleb128(w, 0) // global SP
+@@ -1391,9 +1420,12 @@ func writeOpcode(w *bytes.Buffer, as obj.As) {
+ 		w.WriteByte(byte(as - ALocalGet + 0x20))
+ 	case as < AI32TruncSatF32S:
+ 		w.WriteByte(byte(as - AI32Load + 0x28))
+-	case as < ALast:
++	case as < AAtomicNotify:
+ 		w.WriteByte(0xFC)
+ 		w.WriteByte(byte(as - AI32TruncSatF32S + 0x00))
++	case as < ALast:
++		w.WriteByte(0xFE)
++		w.WriteByte(byte(as - AAtomicNotify + 0x00))
+ 	default:
+ 		panic(fmt.Sprintf("unexpected assembler op: %s", as))
+ 	}

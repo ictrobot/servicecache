@@ -1,21 +1,27 @@
 Go guests are built with the Go release pinned in ../sources/go/default.nix
-and the patch series beside it, which gives Go's wasip1 port sockets and
-name resolution over WASIX behind the wasix build tag. default.nix and
-go.sh build that tree with Go's own make.bash, bootstrapped by nixpkgs' Go,
-into a Go installation.
+and the patch series beside it. default.nix and go.sh build that tree with
+Go's own make.bash, bootstrapped by nixpkgs' Go, into a Go installation.
 
-A program built with it is a wasip1 module that listens on the port it asks
-for, dials out where the runtime's policy allows, and resolves names. Its
-goroutines run on one thread, which blocks in poll_oneoff when idle, as a
-freeze needs it to.
+Two settings select what the series adds to Go's wasip1 port. The wasix
+build tag is the WASIX ABI: sockets, name resolution and an epoll poller.
+GOWASM=threads adds WASIX threads: a runtime on OS threads through
+thread_spawn and futexes, in a module with shared memory and atomic
+instructions. The toolchain's environment sets both.
+
+A program built with both is a wasip1 module that listens on the port it
+asks for, dials out where the runtime's policy allows, resolves names, and
+runs its goroutines on as many threads as GOMAXPROCS says, by default the
+count the runtime reports. Its threads block in WASIX futexes and epoll
+when idle, as a freeze needs them to.
 
 A Go service's package passes `toolchain = sc.goToolchain` to
 sc.mkGuestBuild and declares two sources: its upstream tree, and the
 modules that tree's go.mod names, vendored by sc.fetchGoModules. Its
 build.sh copies the modules to vendor/ inside the tree and runs the go
 command through sc_go, which keeps the build cache inside the build
-directory. The toolchain's environment sets GOOS, GOARCH, the wasix tag and
-vendor mode, and turns fetching off, so an untouched tree builds with
+directory. The toolchain's environment sets GOOS, GOARCH, GOWASM, the wasix
+tag and vendor mode, and turns fetching off, so an untouched tree builds
+with
 
     sc_go -C "$tree" build -o "$SC_BUILD_DIR/server.wasm" ./cmd/server
 
@@ -24,10 +30,12 @@ library for wasip1 into its own cache.
 
 `./x go` links the installation at work/build/go-toolchain, for building a
 tree by hand. Its servicecache.env holds the environment a service build
-sets; a tree that fetches its modules needs only the target and the tag:
+sets; a tree that fetches its modules needs only the target and the two
+settings:
 
     export PATH="$PWD/work/build/go-toolchain/bin:$PATH"
-    GOOS=wasip1 GOARCH=wasm go build -tags wasix -o server.wasm ./cmd/server
+    export GOOS=wasip1 GOARCH=wasm GOWASM=threads
+    go build -tags wasix -o server.wasm ./cmd/server
     toolchain/run-wasix.sh server.wasm
 
 `./x go --test` runs Go's own tests of the packages the series changes,

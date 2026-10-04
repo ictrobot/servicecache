@@ -18,11 +18,13 @@ let
       ../guest_artifacts.py
     ];
   };
-  # Every guest is a wasip1 module built with the wasix tag; modules are
-  # resolved from the vendor tree beside its sources and nothing is fetched.
+  # Every guest is a wasip1 module built with the wasix tag and threads
+  # enabled; modules are resolved from the vendor tree beside its sources
+  # and nothing is fetched.
   environment = {
     GOOS = "wasip1";
     GOARCH = "wasm";
+    GOWASM = "threads";
     GOFLAGS = "-tags=wasix -mod=vendor -trimpath -buildvcs=false";
     GOTOOLCHAIN = "local";
     GOPROXY = "off";

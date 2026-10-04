@@ -1,0 +1,315 @@
+Subject: cmd/link: emit a module with shared memory when the runtime has OS
+ threads
+Last-Update: 2026-10-04
+
+A runtime with OS threads, which defines wasi_thread_start, runs each
+thread as another instance of the module over one memory. For such a
+runtime the linker imports the memory as env.memory, shared and with a
+4 GiB maximum, rather than defining it; writes the data segments
+passive, with a data count section; and adds a start function that
+places them once, guarded by an atomic swap on a word the runtime
+provides, so that the instances that are threads do not write them
+again. wasi_thread_start is exported, with the type the WASIX runtime
+calls it with, and kept through dead-code elimination, as is the guard
+word, which nothing but the start function refers to. A runtime without
+threads links as before.
+
+A passive segment costs a memory.init sequence in the start function
+as well as its header, so the split that omits runs of zeroes between
+segments omits only runs of 32 bytes or more for passive segments,
+against 8 for active ones. Go's data has many short zero runs, in the
+pcln and type tables among others, and at 8 bytes a large program
+exceeds the number of segments an engine accepts, with a start function
+to match.
+
+diff --git a/src/cmd/link/internal/ld/deadcode.go b/src/cmd/link/internal/ld/deadcode.go
+index 055b4ef..80602eb 100644
+--- a/src/cmd/link/internal/ld/deadcode.go
++++ b/src/cmd/link/internal/ld/deadcode.go
+@@ -82,6 +82,13 @@ func (d *deadcodePass) init() {
+ 	// runtime.unreachableMethod is a function that will throw if called.
+ 	// We redirect unreachable methods to it.
+ 	names = append(names, "runtime.unreachableMethod")
++	if d.ctxt.IsWasm() {
++		// The entry of a new thread on a runtime with OS threads, called
++		// by the host through an export, never by Go code, and the word
++		// the module's start function guards memory initialization with,
++		// which only that function references.
++		names = append(names, "wasi_thread_start", "runtime.wasmInitMemoryFlag")
++	}
+ 	if d.ctxt.BuildMode == BuildModePlugin {
+ 		names = append(names, objabi.PathToPrefix(*flagPluginPath)+"..inittask", objabi.PathToPrefix(*flagPluginPath)+".main", "go:plugin.tabs")
+ 
+diff --git a/src/cmd/link/internal/wasm/asm.go b/src/cmd/link/internal/wasm/asm.go
+index 947f2da..89ce77c 100644
+--- a/src/cmd/link/internal/wasm/asm.go
++++ b/src/cmd/link/internal/wasm/asm.go
+@@ -41,6 +41,10 @@ const (
+ 	sectionData     = 11
+ )
+ 
++// The data count section of the bulk memory proposal, which passive
++// segments require.
++const sectionDataCount = 12
++
+ // funcValueOffset is the offset between the PC_F value of a function and the index of the function in WebAssembly
+ const funcValueOffset = 0x1000 // TODO(neelance): make function addresses play nice with heap addresses
+ 
+@@ -69,6 +73,7 @@ var wasmFuncTypes = map[string]*wasmFuncType{
+ 	"_rt0_wasm_js":            {Params: []byte{}},                                         //
+ 	"_rt0_wasm_wasip1":        {Params: []byte{}},                                         //
+ 	"_rt0_wasm_wasip1_lib":    {Params: []byte{}},                                         //
++	"wasi_thread_start":       {Params: []byte{I32, I32}},                                 // tid, start
+ 	"wasm_export__start":      {},                                                         //
+ 	"wasm_export_run":         {Params: []byte{I32, I32}},                                 // argc, argv
+ 	"wasm_export_resume":      {Params: []byte{}},                                         //
+@@ -236,6 +241,28 @@ func asmb2(ctxt *ld.Link, ldr *loader.Loader) {
+ 		fns[i] = &wasmFunc{Name: name, Type: typ, Code: wfn.Bytes()}
+ 	}
+ 
++	// A runtime with OS threads, which defines wasi_thread_start, runs each
++	// thread as another instance of the module over one memory. That
++	// memory is imported shared rather than defined, the data segments
++	// are passive, and a start function initializes them once, guarded by
++	// a word the runtime provides, so that the instances that are threads
++	// do not write them again.
++	threaded := ldr.Lookup("wasi_thread_start", 0) != 0
++	segments := dataSegments(threaded)
++	var initMemoryIdx uint64
++	if threaded {
++		flag := ldr.Lookup("runtime.wasmInitMemoryFlag", 0)
++		if flag == 0 || !ldr.AttrReachable(flag) || ldr.SymValue(flag) == 0 {
++			ld.Errorf("runtime.wasmInitMemoryFlag not defined or not laid out")
++		}
++		fns = append(fns, &wasmFunc{
++			Name: "wasm_init_memory",
++			Type: lookupType(&wasmFuncType{}, &types),
++			Code: initMemoryCode(int32(ldr.SymValue(flag)), segments),
++		})
++		initMemoryIdx = uint64(len(hostImports) + len(fns) - 1)
++	}
++
+ 	ctxt.Out.Write([]byte{0x00, 0x61, 0x73, 0x6d}) // magic
+ 	ctxt.Out.Write([]byte{0x01, 0x00, 0x00, 0x00}) // version
+ 
+@@ -245,15 +272,23 @@ func asmb2(ctxt *ld.Link, ldr *loader.Loader) {
+ 	}
+ 
+ 	writeTypeSec(ctxt, types)
+-	writeImportSec(ctxt, hostImports)
++	writeImportSec(ctxt, hostImports, threaded, memoryPages(ldr))
+ 	writeFunctionSec(ctxt, fns)
+ 	writeTableSec(ctxt, fns)
+-	writeMemorySec(ctxt, ldr)
++	if !threaded {
++		writeMemorySec(ctxt, ldr)
++	}
+ 	writeGlobalSec(ctxt)
+-	writeExportSec(ctxt, ldr, len(hostImports))
++	writeExportSec(ctxt, ldr, len(hostImports), threaded)
++	if threaded {
++		writeStartSec(ctxt, initMemoryIdx)
++	}
+ 	writeElementSec(ctxt, uint64(len(hostImports)), uint64(len(fns)))
++	if threaded {
++		writeDataCountSec(ctxt, uint64(len(segments)))
++	}
+ 	writeCodeSec(ctxt, fns)
+-	writeDataSec(ctxt)
++	writeDataSec(ctxt, segments, threaded)
+ 	writeProducerSec(ctxt)
+ 	if !*ld.FlagS {
+ 		writeNameSec(ctxt, len(hostImports), fns)
+@@ -315,10 +350,24 @@ func writeTypeSec(ctxt *ld.Link, types []*wasmFuncType) {
+ 
+ // writeImportSec writes the section that lists the functions that get
+ // imported from the WebAssembly host, usually JavaScript.
+-func writeImportSec(ctxt *ld.Link, hostImports []*wasmFunc) {
++func writeImportSec(ctxt *ld.Link, hostImports []*wasmFunc, threaded bool, pages uint64) {
+ 	sizeOffset := writeSecHeader(ctxt, sectionImport)
+ 
+-	writeUleb128(ctxt.Out, uint64(len(hostImports))) // number of imports
++	imports := uint64(len(hostImports))
++	if threaded {
++		imports++
++	}
++	writeUleb128(ctxt.Out, imports) // number of imports
++	if threaded {
++		// The one memory, shared between the instances that are threads:
++		// the runtime creates it from this type and imports it into each.
++		writeName(ctxt.Out, "env")
++		writeName(ctxt.Out, "memory")
++		ctxt.Out.WriteByte(0x02)          // memory import
++		ctxt.Out.WriteByte(0x03)          // limits with a maximum, shared
++		writeUleb128(ctxt.Out, pages)     // minimum (initial) memory size
++		writeUleb128(ctxt.Out, 1<<32>>16) // maximum: all a 32-bit memory addresses
++	}
+ 	for _, fn := range hostImports {
+ 		if fn.Module != "" {
+ 			writeName(ctxt.Out, fn.Module)
+@@ -361,23 +410,68 @@ func writeTableSec(ctxt *ld.Link, fns []*wasmFunc) {
+ 	writeSecSize(ctxt, sizeOffset)
+ }
+ 
++// memoryPages is the initial size of the linear memory in pages: the data
++// plus 1 MB, for runtime init allocating a few pages.
++func memoryPages(ldr *loader.Loader) uint64 {
++	dataEnd := uint64(ldr.SymValue(ldr.Lookup("runtime.end", 0)))
++	const wasmPageSize = 64 << 10 // 64KB
++	return (dataEnd + 1<<20) / wasmPageSize
++}
++
+ // writeMemorySec writes the section that declares linear memories. Currently one linear memory is being used.
+ // Linear memory always starts at address zero. More memory can be requested with the GrowMemory instruction.
+ func writeMemorySec(ctxt *ld.Link, ldr *loader.Loader) {
+ 	sizeOffset := writeSecHeader(ctxt, sectionMemory)
+ 
+-	dataEnd := uint64(ldr.SymValue(ldr.Lookup("runtime.end", 0)))
+-	var initialSize = dataEnd + 1<<20 // 1 MB, for runtime init allocating a few pages
++	writeUleb128(ctxt.Out, 1)                // number of memories
++	ctxt.Out.WriteByte(0x00)                 // no maximum memory size
++	writeUleb128(ctxt.Out, memoryPages(ldr)) // minimum (initial) memory size
+ 
+-	const wasmPageSize = 64 << 10 // 64KB
++	writeSecSize(ctxt, sizeOffset)
++}
+ 
+-	writeUleb128(ctxt.Out, 1)                        // number of memories
+-	ctxt.Out.WriteByte(0x00)                         // no maximum memory size
+-	writeUleb128(ctxt.Out, initialSize/wasmPageSize) // minimum (initial) memory size
++// writeStartSec names the function the runtime calls when it instantiates
++// the module, before anything else.
++func writeStartSec(ctxt *ld.Link, funcidx uint64) {
++	sizeOffset := writeSecHeader(ctxt, sectionStart)
++	writeUleb128(ctxt.Out, funcidx)
++	writeSecSize(ctxt, sizeOffset)
++}
+ 
++// writeDataCountSec declares the number of data segments ahead of the code
++// that initializes them with memory.init.
++func writeDataCountSec(ctxt *ld.Link, count uint64) {
++	sizeOffset := writeSecHeader(ctxt, sectionDataCount)
++	writeUleb128(ctxt.Out, count)
+ 	writeSecSize(ctxt, sizeOffset)
+ }
+ 
++// initMemoryCode is the body of the start function of a module with
++// shared memory: the first instance to swap the runtime's flag from 0 to
++// 1 copies every passive data segment into place; the instances that are
++// threads, created later, find the flag set and do nothing.
++func initMemoryCode(flag int32, segments []*dataSegment) []byte {
++	w := new(bytes.Buffer)
++	writeUleb128(w, 0) // number of sets of locals
++	writeI32Const(w, flag)
++	writeI32Const(w, 0)
++	writeI32Const(w, 1)
++	w.Write([]byte{0xFE, 0x48, 0x02, 0x00}) // i32.atomic.rmw.cmpxchg, 4-byte aligned, offset 0
++	w.WriteByte(0x45)                       // i32.eqz
++	w.Write([]byte{0x04, 0x40})             // if, no result
++	for i, seg := range segments {
++		writeI32Const(w, seg.offset)           // destination
++		writeI32Const(w, 0)                    // offset within the segment
++		writeI32Const(w, int32(len(seg.data))) // length
++		w.Write([]byte{0xFC, 0x08})            // memory.init
++		writeUleb128(w, uint64(i))             // segment
++		w.WriteByte(0x00)                      // memory
++	}
++	w.WriteByte(0x0b) // end if
++	w.WriteByte(0x0b) // end
++	return w.Bytes()
++}
++
+ // writeGlobalSec writes the section that declares global variables.
+ func writeGlobalSec(ctxt *ld.Link) {
+ 	sizeOffset := writeSecHeader(ctxt, sectionGlobal)
+@@ -413,12 +507,24 @@ func writeGlobalSec(ctxt *ld.Link) {
+ // writeExportSec writes the section that declares exports.
+ // Exports can be accessed by the WebAssembly host, usually JavaScript.
+ // The wasm_export_* functions and the linear memory get exported.
+-func writeExportSec(ctxt *ld.Link, ldr *loader.Loader, lenHostImports int) {
++func writeExportSec(ctxt *ld.Link, ldr *loader.Loader, lenHostImports int, threaded bool) {
+ 	sizeOffset := writeSecHeader(ctxt, sectionExport)
+ 
+ 	switch buildcfg.GOOS {
+ 	case "wasip1":
+-		writeUleb128(ctxt.Out, uint64(2+len(ldr.WasmExports))) // number of exports
++		exports := uint64(2 + len(ldr.WasmExports))
++		if threaded {
++			exports++
++		}
++		writeUleb128(ctxt.Out, exports) // number of exports
++		if threaded {
++			// The entry the runtime calls on a new thread's instance.
++			s := ldr.Lookup("wasi_thread_start", 0)
++			idx := uint32(lenHostImports) + uint32(ldr.SymValue(s)>>16) - funcValueOffset
++			writeName(ctxt.Out, "wasi_thread_start")
++			ctxt.Out.WriteByte(0x00)            // func export
++			writeUleb128(ctxt.Out, uint64(idx)) // funcidx
++		}
+ 		var entry, entryExpName string
+ 		switch ctxt.BuildMode {
+ 		case ld.BuildModeExe:
+@@ -508,18 +614,27 @@ func writeCodeSec(ctxt *ld.Link, fns []*wasmFunc) {
+ }
+ 
+ // writeDataSec writes the section that provides data that will be used to initialize the linear memory.
+-func writeDataSec(ctxt *ld.Link) {
+-	sizeOffset := writeSecHeader(ctxt, sectionData)
+-
+-	type dataSegment struct {
+-		offset int32
+-		data   []byte
+-	}
++type dataSegment struct {
++	offset int32
++	data   []byte
++}
+ 
++// dataSegments splits the data sections into the segments the module
++// carries, active or passive.
++func dataSegments(passive bool) []*dataSegment {
+ 	// Omit blocks of zeroes and instead emit data segments with offsets skipping the zeroes.
+ 	// This reduces the size of the WebAssembly binary. We use 8 bytes as an estimate for the
+ 	// overhead of adding a new segment (same as wasm-opt's memory-packing optimization uses).
+-	const segmentOverhead = 8
++	//
++	// A passive segment also costs the memory.init sequence that places it, about 16 bytes of
++	// code, and one bulk-memory operation when the module starts, so omitting a run of zeroes
++	// shorter than 32 bytes would cost more than it saves. Go's data has many such runs, in
++	// the pcln and type tables among others, so at 8 bytes a large program has many times
++	// the segments it has at 32, and a start function to match, for the same module size.
++	segmentOverhead := int32(8)
++	if passive {
++		segmentOverhead = 32
++	}
+ 
+ 	// Generate at most this many segments. A higher number of segments gets rejected by some WebAssembly runtimes.
+ 	const maxNumSegments = 100000
+@@ -568,12 +683,24 @@ func writeDataSec(ctxt *ld.Link) {
+ 			offset += zeroEnd
+ 		}
+ 	}
++	return segments
++}
++
++// writeDataSec writes the data segments: active, placed at instantiation,
++// or passive for a module with shared memory, placed by its start
++// function.
++func writeDataSec(ctxt *ld.Link, segments []*dataSegment, passive bool) {
++	sizeOffset := writeSecHeader(ctxt, sectionData)
+ 
+ 	writeUleb128(ctxt.Out, uint64(len(segments))) // number of data entries
+ 	for _, seg := range segments {
+-		writeUleb128(ctxt.Out, 0) // memidx
+-		writeI32Const(ctxt.Out, seg.offset)
+-		ctxt.Out.WriteByte(0x0b) // end
++		if passive {
++			writeUleb128(ctxt.Out, 1) // passive
++		} else {
++			writeUleb128(ctxt.Out, 0) // memidx
++			writeI32Const(ctxt.Out, seg.offset)
++			ctxt.Out.WriteByte(0x0b) // end
++		}
+ 		writeUleb128(ctxt.Out, uint64(len(seg.data)))
+ 		ctxt.Out.Write(seg.data)
+ 	}

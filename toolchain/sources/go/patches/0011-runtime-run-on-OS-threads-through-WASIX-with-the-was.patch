@@ -1,0 +1,604 @@
+Subject: runtime: run on OS threads through WASIX with the wasix tag and
+ GOWASM=threads
+Last-Update: 2026-10-04
+
+With the wasix tag and GOWASM=threads a wasip1 module runs its
+goroutines on OS threads. newosproc spawns a thread with
+thread_spawn_v2, which WASIX runs as another instance of the module
+over the shared memory, entered at wasi_thread_start on the M's g0
+stack. Go's locks sleep on WASIX futexes, each M records its WASIX
+thread id as its procid, and the scheduler's wasm special cases, no
+sysmon and one P among them, hold only for the single-threaded builds,
+so GOMAXPROCS above one works. Asynchronous preemption stays off.
+
+A thread that exits stores a word that lets another thread free and
+reuse its g0 stack, and then its M, at once. exitThread therefore
+switches to a static exit stack before the store and ends the thread
+from there.
+
+NumCPU and the default GOMAXPROCS come from WASIX's thread_parallelism,
+which is what wasix-libc reports for sysconf(_SC_NPROCESSORS_ONLN), so
+a Go guest sees the count a C guest does. GOMAXPROCS in the environment
+overrides it, and the count is one when the call fails.
+
+procyield returned at once on wasm, so the spin phases of the runtime's
+mutex and of sync.Mutex ran their attempts back to back and gave up
+within nanoseconds, after which a waiter sleeps in a futex, a call into
+WASIX. With OS threads the holder is often on another thread and about
+to release, so the threaded runtime pauses for the cycles asked, one
+atomic fence each, as other ports spend a PAUSE instruction. The
+single-threaded builds keep returning at once.
+
+publicationBarrier, a return on the single-threaded port, is an atomic
+fence on OS threads: mallocgc needs the stores that initialize an object
+ordered before the store that publishes it on a machine with weak memory
+ordering, and the fence is the one barrier wasm has.
+
+diff --git a/src/runtime/asm_wasm.s b/src/runtime/asm_wasm.s
+index c46cb4a..c1c645c 100644
+--- a/src/runtime/asm_wasm.s
++++ b/src/runtime/asm_wasm.s
+@@ -197,12 +197,6 @@ TEXT runtime·asminit(SB), NOSPLIT, $0-0
+ 	// No per-thread init.
+ 	RET
+ 
+-TEXT ·publicationBarrier(SB), NOSPLIT, $0-0
+-	RET
+-
+-TEXT runtime·procyieldAsm(SB), NOSPLIT, $0-0 // FIXME
+-	RET
+-
+ TEXT runtime·breakpoint(SB), NOSPLIT, $0-0
+ 	UNDEF
+ 
+diff --git a/src/runtime/debug.go b/src/runtime/debug.go
+index 56b766f..3f70e12 100644
+--- a/src/runtime/debug.go
++++ b/src/runtime/debug.go
+@@ -68,7 +68,7 @@ import (
+ //
+ // [default]: https://go.dev/doc/godebug#default
+ func GOMAXPROCS(n int) int {
+-	if GOARCH == "wasm" && n > 1 {
++	if GOARCH == "wasm" && !wasixThreads && n > 1 {
+ 		n = 1 // WebAssembly has no threads yet, so only one CPU is possible.
+ 	}
+ 
+diff --git a/src/runtime/lock_futex.go b/src/runtime/lock_futex.go
+index 1cf146b..9042ca4 100644
+--- a/src/runtime/lock_futex.go
++++ b/src/runtime/lock_futex.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build dragonfly || freebsd || linux
++//go:build dragonfly || freebsd || linux || (wasip1 && wasix && wasm.threads)
+ 
+ package runtime
+ 
+diff --git a/src/runtime/lock_spinbit.go b/src/runtime/lock_spinbit.go
+index 039ea6f..ee71f15 100644
+--- a/src/runtime/lock_spinbit.go
++++ b/src/runtime/lock_spinbit.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !wasm
++//go:build !wasm || (wasip1 && wasix && wasm.threads)
+ 
+ package runtime
+ 
+diff --git a/src/runtime/lock_wasip1.go b/src/runtime/lock_wasip1.go
+index f0c0885..79d104f 100644
+--- a/src/runtime/lock_wasip1.go
++++ b/src/runtime/lock_wasip1.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build wasip1
++//go:build wasip1 && !(wasix && wasm.threads)
+ 
+ package runtime
+ 
+diff --git a/src/runtime/os_wasix.go b/src/runtime/os_wasix.go
+new file mode 100644
+index 0000000..75c3501
+--- /dev/null
++++ b/src/runtime/os_wasix.go
+@@ -0,0 +1,155 @@
++//go:build wasip1 && wasix && wasm.threads
++
++package runtime
++
++import (
++	"internal/runtime/atomic"
++	"unsafe"
++)
++
++// With the wasix tag and GOWASM=threads the program runs on OS threads.
++// newosproc spawns a WASIX thread, which the runtime runs as another
++// instance of the module over the same memory, entering wasi_thread_start
++// (rt0_wasix_wasm.s); the runtime's locks sleep on WASIX futexes; and the
++// poller has a descriptor another thread can wake it through.
++const (
++	wasixThreads    = true
++	wasixThreadsInt = 1 // wasixThreads as an integer, for sizes
++)
++
++// wasmInitMemoryFlag is the word the module's start function swaps from
++// 0 to 1 when it places the data segments in the shared memory: the main
++// instance does the placing, and the instances that are threads find the
++// flag set. It must start zero and never be reused, which a variable in
++// BSS is.
++var wasmInitMemoryFlag uint32
++
++//go:wasmimport wasix_32v1 thread_spawn_v2
++//go:noescape
++func thread_spawn_v2(start unsafe.Pointer, tid unsafe.Pointer) errno
++
++//go:wasmimport wasix_32v1 futex_wait
++//go:noescape
++func futex_wait(addr unsafe.Pointer, expected uint32, timeout unsafe.Pointer, woken unsafe.Pointer) errno
++
++//go:wasmimport wasix_32v1 futex_wake
++//go:noescape
++func futex_wake(addr unsafe.Pointer, woken unsafe.Pointer) errno
++
++//go:wasmimport wasix_32v1 futex_wake_all
++//go:noescape
++func futex_wake_all(addr unsafe.Pointer, woken unsafe.Pointer) errno
++
++//go:wasmimport wasix_32v1 thread_parallelism
++//go:noescape
++func thread_parallelism(count unsafe.Pointer) errno
++
++//go:wasmimport wasi_snapshot_preview1 sched_yield
++func sched_yield() errno
++
++//go:wasmimport wasix_32v1 thread_exit
++func thread_exit(code int32)
++
++//go:wasmimport wasix_32v1 thread_id
++//go:noescape
++func thread_id(tid unsafe.Pointer) errno
++
++// minit records the thread's WASIX thread id as the M's procid, as the
++// other ports record their thread ids.
++func minit() {
++	var tid uint32
++	if thread_id(unsafe.Pointer(&tid)) == 0 {
++		getg().m.procid = uint64(tid)
++	}
++}
++
++// getCPUCount is the parallelism the runtime offers, which is what
++// wasix-libc's sysconf(_SC_NPROCESSORS_ONLN) reports too; GOMAXPROCS in
++// the environment overrides it. One when the runtime cannot say.
++func getCPUCount() int32 {
++	var count uint32
++	if thread_parallelism(unsafe.Pointer(&count)) != 0 || count == 0 || count > 1<<16 {
++		return 1
++	}
++	return int32(count)
++}
++
++//go:nosplit
++func osyield() {
++	sched_yield()
++}
++
++// exitThread ends the calling thread once it has stored 0 in *wait, as
++// mexit asks; it is in rt0_wasix_wasm.s, since the store frees the M's
++// g0 stack, and then the M, and the thread must touch neither
++// afterwards. The runtime frees nothing else of the thread's but its own
++// handle.
++func exitThread(wait *atomic.Uint32)
++
++// wasixThreadStart is WASIX's thread_start block: what thread_spawn
++// reads, and what the new thread's wasi_thread_start is given.
++type wasixThreadStart struct {
++	stackUpper uint32
++	tlsBase    uint32
++	startFunct uint32
++	startArgs  uint32
++	reserved   [10]uint32
++	stackSize  uint32
++	guardSize  uint32
++}
++
++// wasixOptionTimestamp is WASIX's option_timestamp: a tag, padding to
++// the alignment of the value, and the value in nanoseconds.
++type wasixOptionTimestamp struct {
++	tag uint8
++	_   [7]uint8
++	ns  uint64
++}
++
++// newosproc starts an OS thread for mp, on mp's g0 stack. The start
++// block outlives this call: the runtime reads it when it spawns the
++// thread and the thread reads it on entry, so it is never freed.
++//
++// May run with m.p==nil, so write barriers are not allowed.
++//
++//go:nowritebarrier
++func newosproc(mp *m) {
++	start := (*wasixThreadStart)(persistentalloc(unsafe.Sizeof(wasixThreadStart{}), 8, &memstats.other_sys))
++	start.stackUpper = uint32(mp.g0.stack.hi)
++	start.stackSize = uint32(mp.g0.stack.hi - mp.g0.stack.lo)
++	// The runtime enters the module's wasi_thread_start export, not a
++	// function this names; the linker keeps that export.
++	start.startArgs = uint32(uintptr(unsafe.Pointer(mp)))
++	var tid uint32
++	if e := thread_spawn_v2(unsafe.Pointer(start), unsafe.Pointer(&tid)); e != 0 {
++		print("runtime: thread_spawn failed with errno ", e, "\n")
++		throw("newosproc")
++	}
++}
++
++// futexsleep waits while *addr == val, for at most ns nanoseconds when ns
++// is not negative.
++//
++//go:nosplit
++func futexsleep(addr *uint32, val uint32, ns int64) {
++	var timeout wasixOptionTimestamp
++	if ns >= 0 {
++		timeout.tag = 1
++		timeout.ns = uint64(ns)
++	}
++	var woken uint8
++	futex_wait(unsafe.Pointer(addr), val, unsafe.Pointer(&timeout), unsafe.Pointer(&woken))
++}
++
++// futexwakeup wakes cnt threads waiting on addr; every waiter when cnt is
++// more than one, since WASIX wakes one or all.
++//
++//go:nosplit
++func futexwakeup(addr *uint32, cnt uint32) {
++	var woken uint8
++	if cnt == 1 {
++		futex_wake(unsafe.Pointer(addr), unsafe.Pointer(&woken))
++		return
++	}
++	futex_wake_all(unsafe.Pointer(addr), unsafe.Pointer(&woken))
++}
+diff --git a/src/runtime/os_wasm.go b/src/runtime/os_wasm.go
+index e7a9a13..252f62a 100644
+--- a/src/runtime/os_wasm.go
++++ b/src/runtime/os_wasm.go
+@@ -4,10 +4,7 @@
+ 
+ package runtime
+ 
+-import (
+-	"internal/runtime/atomic"
+-	"unsafe"
+-)
++import "unsafe"
+ 
+ func osinit() {
+ 	// https://webassembly.github.io/spec/core/exec/runtime.html#memory-instances
+@@ -18,10 +15,6 @@ func osinit() {
+ 	getg().m.procid = 2
+ }
+ 
+-func getCPUCount() int32 {
+-	return 1
+-}
+-
+ const _SIGSEGV = 0xb
+ 
+ func sigpanic() {
+@@ -35,13 +28,9 @@ func sigpanic() {
+ 	panicmem()
+ }
+ 
+-// func exitThread(wait *uint32)
+-// FIXME: wasm doesn't have atomic yet
+-func exitThread(wait *atomic.Uint32)
+-
+-type mOS struct{}
+-
+-func osyield()
++type mOS struct {
++	waitsema uint32 // semaphore for parking on locks, with wasixThreads
++}
+ 
+ //go:nosplit
+ func osyield_no_g() {
+@@ -79,11 +68,6 @@ func clearSignalHandlers() {
+ func sigblock(exiting bool) {
+ }
+ 
+-// Called to initialize a new m (including the bootstrap m).
+-// Called on the new thread, cannot allocate memory.
+-func minit() {
+-}
+-
+ // Called from dropm to undo the effect of an minit.
+ func unminit() {
+ }
+@@ -107,13 +91,6 @@ func crash() {
+ func initsig(preinit bool) {
+ }
+ 
+-// May run with m.p==nil, so write barriers are not allowed.
+-//
+-//go:nowritebarrier
+-func newosproc(mp *m) {
+-	throw("newosproc: not implemented")
+-}
+-
+ // Do nothing on WASM platform, always return EPIPE to caller.
+ //
+ //go:linkname os_sigpipe os.sigpipe
+diff --git a/src/runtime/os_wasm_nothreads.go b/src/runtime/os_wasm_nothreads.go
+new file mode 100644
+index 0000000..6422f32
+--- /dev/null
++++ b/src/runtime/os_wasm_nothreads.go
+@@ -0,0 +1,34 @@
++// Copyright 2018 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build wasm && !(wasip1 && wasix && wasm.threads)
++
++package runtime
++
++import "internal/runtime/atomic"
++
++// Without the wasix tag and GOWASM=threads together the program runs on
++// one thread: there is no way to start another, and none to yield to or
++// exit; the bodies in sys_wasm_nothreads.s are unreachable.
++
++// FIXME: wasm doesn't have atomic yet
++func exitThread(wait *atomic.Uint32)
++
++func osyield()
++
++// May run with m.p==nil, so write barriers are not allowed.
++//
++//go:nowritebarrier
++func newosproc(mp *m) {
++	throw("newosproc: not implemented")
++}
++
++func getCPUCount() int32 {
++	return 1
++}
++
++// Called to initialize a new m (including the bootstrap m).
++// Called on the new thread, cannot allocate memory.
++func minit() {
++}
+diff --git a/src/runtime/proc.go b/src/runtime/proc.go
+index 005c875..4c589b9 100644
+--- a/src/runtime/proc.go
++++ b/src/runtime/proc.go
+@@ -2933,7 +2933,7 @@ func newm1(mp *m) {
+ //
+ // The calling thread must itself be in a known-good state.
+ func startTemplateThread() {
+-	if GOARCH == "wasm" { // no threads on wasm yet
++	if GOARCH == "wasm" && !wasixThreads { // no threads on wasm yet
+ 		return
+ 	}
+ 
+@@ -4538,7 +4538,7 @@ func gdestroy(gp *g) {
+ 
+ 	dropg()
+ 
+-	if GOARCH == "wasm" { // no threads yet on wasm
++	if GOARCH == "wasm" && !wasixThreads { // no threads yet on wasm
+ 		gfput(pp, gp)
+ 		return
+ 	}
+@@ -5596,7 +5596,7 @@ func Breakpoint() {
+ //
+ //go:nosplit
+ func dolockOSThread() {
+-	if GOARCH == "wasm" {
++	if GOARCH == "wasm" && !wasixThreads {
+ 		return // no threads on wasm yet
+ 	}
+ 	gp := getg()
+@@ -5648,7 +5648,7 @@ func lockOSThread() {
+ //
+ //go:nosplit
+ func dounlockOSThread() {
+-	if GOARCH == "wasm" {
++	if GOARCH == "wasm" && !wasixThreads {
+ 		return // no threads on wasm yet
+ 	}
+ 	gp := getg()
+@@ -6478,7 +6478,7 @@ var forcegcperiod int64 = 2 * 60 * 1e9
+ // haveSysmon indicates whether there is sysmon thread support.
+ //
+ // No threads on wasm yet, so no sysmon.
+-const haveSysmon = GOARCH != "wasm"
++const haveSysmon = GOARCH != "wasm" || wasixThreads
+ 
+ // Always runs without a P, so write barriers are not allowed.
+ //
+diff --git a/src/runtime/rt0_wasix_wasm.s b/src/runtime/rt0_wasix_wasm.s
+new file mode 100644
+index 0000000..79c1b1d
+--- /dev/null
++++ b/src/runtime/rt0_wasix_wasm.s
+@@ -0,0 +1,93 @@
++//go:build wasip1 && wasix && wasm.threads
++
++#include "go_asm.h"
++#include "textflag.h"
++
++// wasi_thread_start is the entry of a new thread, called by the runtime
++// on the thread's own instance of the module with the thread id and the
++// address of the start block newosproc filled in: the top of the M's g0
++// stack and, as the argument, the M. It runs on that stack as that M's
++// g0, the way _rt0_wasm_wasip1 runs on m0's, and never returns while the
++// program runs.
++TEXT wasi_thread_start(SB),NOSPLIT,$0
++	// SP = the block's stack_upper, less the words rt0 leaves too.
++	Get R1
++	I32Load $0
++	I32Const $16
++	I32Sub
++	Set SP
++
++	// g = mp.g0, mp being the block's start_args.
++	Get R1
++	I32Load $12
++	I64Load $m_g0
++	Set g
++
++	I32Const $0 // entry PC_B
++	Call runtime·mstart(SB)
++	Drop
++	Call wasm_pc_f_loop(SB)
++
++	Return
++
++// func procyieldAsm(cycles uint32)
++//
++// The pause a spin loop takes between its attempts, as other ports spend
++// a PAUSE instruction: one atomic fence per cycle, tens of cycles each,
++// so that the thread holding the lock has time to release it before the
++// spinner gives up and sleeps in a futex, which is a call into the
++// runtime here.
++TEXT runtime·procyieldAsm(SB), NOSPLIT, $0-4
++	I32Load cycles+0(FP)
++	I64ExtendI32U
++	Set R0
++loop:
++	Loop
++		AtomicFence
++		Get R0
++		I64Const $1
++		I64Sub
++		Set R0
++		Get R0
++		I64Eqz
++		I32Eqz
++		BrIf loop
++	End
++	RET
++
++// publicationBarrier orders the stores that initialize an object before
++// the store that publishes it, which mallocgc requires on a machine with
++// weak memory ordering. The fence is the one barrier wasm has.
++TEXT runtime·publicationBarrier(SB), NOSPLIT, $0-0
++	AtomicFence
++	RET
++
++// The stack exitThread runs on once it has freed its M's g0 stack: the
++// call that ends the thread writes its argument at SP and its return
++// address below SP. Every exiting thread writes the same two words, so
++// one area serves them all.
++GLOBL runtime·exitStack(SB), NOPTR, $64
++
++// func exitThread(wait *atomic.Uint32)
++//
++// Storing 0 to *wait lets another thread free and reuse this M's g0
++// stack at once, and the M itself once nothing refers to it, so the
++// store and the call that follows run on the static exit stack.
++TEXT runtime·exitThread(SB), NOSPLIT|NOFRAME, $0-8
++	I64Load wait+0(FP)
++	Set R0
++	MOVD $runtime·exitStack(SB), R1
++	Get R1
++	I32WrapI64
++	I32Const $56 // the argument takes the area's last 8 bytes
++	I32Add
++	Set SP
++	Get R0
++	I32WrapI64
++	I32Const $0
++	I32AtomicStore $0
++	Get SP
++	I32Const $0
++	I32Store $0
++	CALLNORESUME runtime·thread_exit(SB)
++	UNDEF
+diff --git a/src/runtime/runtime2.go b/src/runtime/runtime2.go
+index be33932..860c2fc 100644
+--- a/src/runtime/runtime2.go
++++ b/src/runtime/runtime2.go
+@@ -734,8 +734,9 @@ type mPadded struct {
+ 	// Size the runtime.m structure so it fits in the 2048-byte size class, and
+ 	// not in the next-smallest (1792-byte) size class. That leaves the 11 low
+ 	// bits of muintptr values available for flags, as required by
+-	// lock_spinbit.go.
+-	_ [(1 - goarch.IsWasm) * (2048 - mallocHeaderSize - mRedZoneSize - unsafe.Sizeof(m{}))]byte
++	// lock_spinbit.go. A wasm program on one thread has no such mutex and
++	// no such padding.
++	_ [(1 - goarch.IsWasm*(1-wasixThreadsInt)) * (2048 - mallocHeaderSize - mRedZoneSize - unsafe.Sizeof(m{}))]byte
+ }
+ 
+ // mWeakPointer is a "weak" pointer to an M. A weak pointer for each M is
+diff --git a/src/runtime/sys_wasm.s b/src/runtime/sys_wasm.s
+index 95c162e..f8a5480 100644
+--- a/src/runtime/sys_wasm.s
++++ b/src/runtime/sys_wasm.s
+@@ -22,12 +22,6 @@ TEXT runtime·wasmDiv(SB), NOSPLIT, $0-0
+ 	I64DivS
+ 	Return
+ 
+-TEXT runtime·exitThread(SB), NOSPLIT, $0-0
+-	UNDEF
+-
+-TEXT runtime·osyield(SB), NOSPLIT, $0-0
+-	UNDEF
+-
+ TEXT runtime·currentMemory(SB), NOSPLIT, $0
+ 	Get SP
+ 	CurrentMemory
+diff --git a/src/runtime/sys_wasm_nothreads.s b/src/runtime/sys_wasm_nothreads.s
+new file mode 100644
+index 0000000..9623fc2
+--- /dev/null
++++ b/src/runtime/sys_wasm_nothreads.s
+@@ -0,0 +1,24 @@
++// Copyright 2018 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build wasm && !(wasip1 && wasix && wasm.threads)
++
++#include "go_asm.h"
++#include "textflag.h"
++
++// On one thread there is no other thread to yield to or to exit.
++
++TEXT runtime·exitThread(SB), NOSPLIT, $0-0
++	UNDEF
++
++TEXT runtime·osyield(SB), NOSPLIT, $0-0
++	UNDEF
++
++// One thread has nothing to yield to within a spin.
++TEXT runtime·procyieldAsm(SB), NOSPLIT, $0-0
++	RET
++
++// One thread publishes to no other.
++TEXT runtime·publicationBarrier(SB), NOSPLIT, $0-0
++	RET
+diff --git a/src/runtime/wasix_off.go b/src/runtime/wasix_off.go
+new file mode 100644
+index 0000000..85f422e
+--- /dev/null
++++ b/src/runtime/wasix_off.go
+@@ -0,0 +1,11 @@
++//go:build !(wasip1 && wasix && wasm.threads)
++
++package runtime
++
++// wasixThreads is whether a wasm program runs on OS threads through
++// WASIX, which only the wasip1 port with the wasix build tag and
++// GOWASM=threads does; the scheduler's wasm special cases ask it.
++const (
++	wasixThreads    = false
++	wasixThreadsInt = 0 // wasixThreads as an integer, for sizes
++)

@@ -25,7 +25,10 @@ guest_packages=(
   context
   internal/poll
   internal/runtime/atomic
+  internal/sync
   net
+  net/http
+  net/http/httptest
   os
   runtime
   sync
