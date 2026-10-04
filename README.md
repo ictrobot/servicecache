@@ -66,8 +66,9 @@ ServiceCache is designed to be generic: the manager knows how to run, freeze, sn
 | PostgreSQL | 18.6                              |
 | Valkey     | 7.2.14, 8.1.9, 9.1.1              |
 | beanstalkd | 1.13                              |
+| NATS       | 2.15.0                            |
 
-Each service is built from an exact upstream release plus a small patch series for WASIX. PostgreSQL's series targets WASIX with the ictrobot_shm_v1 shared memory extension.
+Each service is built from an exact upstream release, with a small patch series for WASIX where it needs one. PostgreSQL's series targets WASIX with the ictrobot_shm_v1 shared memory extension. Go services are built with a Go toolchain patched for WASIX.
 
 ## Trust model and scope
 
@@ -112,6 +113,7 @@ ServiceCache is an independent project. It is not affiliated with, sponsored by,
 
 - Go and the Go logo are trademarks of Google.
 - MariaDB is a registered trademark of MariaDB plc.
+- NATS is a trademark of The Linux Foundation.
 - Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its affiliates.
 - Postgres, PostgreSQL and the Slonik Logo are trademarks or registered trademarks of the PostgreSQL Community Association of Canada.
 - Valkey and the Valkey logo are trademarks of LF Projects, LLC.

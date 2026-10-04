@@ -41,6 +41,7 @@ include = [
     "services/beanstalkd/smoke/adapter",
     "services/mariadb/smoke/adapter",
     "services/mysql/smoke/adapter",
+    "services/nats-server/smoke/adapter",
     "services/postgresql/smoke/adapter",
     "services/valkey/smoke/adapter",
     "toolchain",

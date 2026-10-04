@@ -1,0 +1,9 @@
+[service]
+name = "nats-server"
+version = "{version}"
+
+[guest]
+module = "nats-server.wasm"
+args = ["-a", "127.0.0.1", "-p", "4222", "-js", "-sd", "/jetstream"]
+listen_port = 4222
+ready = { matches = '^INFO ' }

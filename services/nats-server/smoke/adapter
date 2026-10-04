@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Test adapter for nats-server, spoken over its own protocol.
+
+usage: adapter recipe
+       adapter check-initialized HOST PORT
+       adapter check-working HOST PORT
+       adapter diverge HOST PORT TAG
+       adapter check-diverged HOST PORT TAG
+       adapter blocking-request HOST PORT
+
+Every verb exits 0 on success and non-zero with a message on stderr
+otherwise. `recipe` prints the initializer's stdin (empty: nats-server has
+no initializer). `blocking-request` runs a request that blocks in the
+server until something else happens and prints how it ended.
+
+State that outlives a connection needs JetStream: `diverge` puts a key in
+a key-value bucket and `check-diverged` reads it back. Both go through the
+JetStream API over core NATS request/reply with JSON bodies.
+"""
+
+import base64
+import json
+import socket
+import sys
+import time
+
+
+class Client:
+    def __init__(self, host, port, timeout=5):
+        self.sock = socket.create_connection((host, int(port)), timeout=5)
+        self.sock.settimeout(timeout)
+        self.reader = self.sock.makefile("rb")
+        info = self.line()
+        if not info.startswith("INFO "):
+            raise SystemExit(f"expected INFO, got {info!r}")
+        self.info = json.loads(info[5:])
+        # Protocol 0: the server sends its INFO once, at the start, and none
+        # later, where a reader expects a message.
+        self.send('CONNECT {"verbose":false,"pedantic":false,"protocol":0}')
+        self.next_sid = 1
+
+    def line(self):
+        line = self.reader.readline()
+        if not line:
+            raise ConnectionError("disconnected")
+        return line.decode().rstrip("\r\n")
+
+    def send(self, text):
+        self.sock.sendall((text + "\r\n").encode())
+
+    def ping(self):
+        self.send("PING")
+        reply = self.line()
+        if reply != "PONG":
+            raise SystemExit(f"expected PONG, got {reply!r}")
+
+    def subscribe(self, subject):
+        sid = self.next_sid
+        self.next_sid += 1
+        self.send(f"SUB {subject} {sid}")
+        return sid
+
+    def publish(self, subject, payload, reply=None):
+        header = (
+            f"PUB {subject} {reply} {len(payload)}" if reply else f"PUB {subject} {len(payload)}"
+        )
+        self.sock.sendall(header.encode() + b"\r\n" + payload + b"\r\n")
+
+    def message(self):
+        """The next MSG: (subject, sid, reply, payload)."""
+        while True:
+            line = self.line()
+            if line == "PING":
+                self.send("PONG")
+                continue
+            if not line.startswith("MSG "):
+                raise SystemExit(f"expected MSG, got {line!r}")
+            parts = line.split(" ")
+            if len(parts) == 5:
+                _, subject, sid, reply, size = parts
+            else:
+                _, subject, sid, size = parts
+                reply = None
+            payload = self.reader.read(int(size) + 2)[: int(size)]
+            return subject, sid, reply, payload
+
+    def request(self, subject, payload):
+        inbox = f"_INBOX.adapter.{time.time_ns()}"
+        self.subscribe(inbox)
+        self.publish(subject, payload, reply=inbox)
+        _, _, _, response = self.message()
+        return response
+
+    def js(self, api, body=None):
+        response = json.loads(self.request(f"$JS.API.{api}", json.dumps(body or {}).encode()))
+        if "error" in response:
+            raise SystemExit(f"{api}: {response['error']}")
+        return response
+
+
+BUCKET = "lifecycle"
+
+
+def kv_stream(client):
+    body = {
+        "name": f"KV_{BUCKET}",
+        "subjects": [f"$KV.{BUCKET}.>"],
+        "retention": "limits",
+        "max_msgs_per_subject": 1,
+        "storage": "file",
+        "num_replicas": 1,
+        "allow_direct": True,
+        "deny_delete": True,
+        "allow_rollup_hdrs": True,
+    }
+    client.js(f"STREAM.CREATE.KV_{BUCKET}", body)
+
+
+def kv_put(client, key, value):
+    response = json.loads(client.request(f"$KV.{BUCKET}.{key}", value.encode()))
+    if "error" in response:
+        raise SystemExit(f"put {key}: {response['error']}")
+
+
+def kv_get(client, key):
+    response = client.js(f"STREAM.MSG.GET.KV_{BUCKET}", {"last_by_subj": f"$KV.{BUCKET}.{key}"})
+    return base64.b64decode(response["message"]["data"]).decode()
+
+
+def check_initialized(host, port):
+    client = Client(host, port)
+    if not client.info.get("jetstream"):
+        raise SystemExit("the server does not advertise JetStream")
+    client.ping()
+
+
+def check_working(host, port):
+    client = Client(host, port)
+    sid = client.subscribe("lifecycle.echo")
+    client.publish("lifecycle.echo", b"round trip")
+    subject, got_sid, _, payload = client.message()
+    if (subject, got_sid, payload) != ("lifecycle.echo", str(sid), b"round trip"):
+        raise SystemExit(f"unexpected message {subject} {got_sid} {payload!r}")
+    client.ping()
+
+
+def diverge(host, port, tag):
+    client = Client(host, port)
+    kv_stream(client)
+    kv_put(client, "tag", tag)
+    if kv_get(client, "tag") != tag:
+        raise SystemExit("the value did not read back")
+
+
+def check_diverged(host, port, tag):
+    client = Client(host, port)
+    got = kv_get(client, "tag")
+    if got != tag:
+        raise SystemExit(f"expected tag {tag!r}, found {got!r}")
+
+
+def blocking_request(host, port):
+    """A subscriber waiting for a message that never comes: the server holds
+    the connection open until it is shut down."""
+    client = Client(host, port, timeout=60)
+    client.subscribe("lifecycle.never")
+    client.ping()
+    try:
+        client.message()
+        print("received a message")
+    except (TimeoutError, ConnectionError, OSError) as error:
+        print(f"disconnected: {error}")
+
+
+def main(argv):
+    verbs = {
+        "recipe": lambda: None,
+        "check-initialized": check_initialized,
+        "check-working": check_working,
+        "diverge": diverge,
+        "check-diverged": check_diverged,
+        "blocking-request": blocking_request,
+    }
+    if len(argv) < 2 or argv[1] not in verbs:
+        raise SystemExit(__doc__)
+    verbs[argv[1]](*argv[2:])
+
+
+if __name__ == "__main__":
+    main(sys.argv)
